@@ -16,7 +16,10 @@ use tea_tools::ToolName;
 use crate::config::CodingSettings;
 use crate::{CodingError, CodingErrorCode};
 
-pub(crate) fn coding_profile(settings: &CodingSettings) -> Result<AgentProfile, CodingError> {
+pub(crate) fn coding_profile(
+    settings: &CodingSettings,
+    execution_surface: ExecutionSurface,
+) -> Result<AgentProfile, CodingError> {
     let mut builder = AgentProfile::builder(
         ProfileId::from_str("coding-agent").map_err(|_| invalid())?,
         ProfileDisplayName::new("Coding Agent").map_err(|_| invalid())?,
@@ -31,7 +34,7 @@ pub(crate) fn coding_profile(settings: &CodingSettings) -> Result<AgentProfile, 
             .map_err(|_| invalid())?,
     )
     .environment(PolicyEnvironment::new(
-        ExecutionSurface::Cli,
+        execution_surface,
         PolicyExecutionTarget::Native,
         ProtocolMetadata::default(),
     ))
@@ -77,11 +80,12 @@ fn invalid() -> CodingError {
 mod tests {
     use super::coding_profile;
     use crate::config::CodingSettings;
+    use tea_policy::ExecutionSurface;
     use tea_profile::ProfileRuleId;
 
     #[test]
     fn coding_profile_registers_external_source_policy_chain() {
-        let profile = coding_profile(&CodingSettings::default()).unwrap();
+        let profile = coding_profile(&CodingSettings::default(), ExecutionSurface::Cli).unwrap();
         let rule_ids = profile
             .policy_rule_ids()
             .iter()
@@ -96,5 +100,13 @@ mod tests {
                 "product.coding_workspace",
             ]
         );
+    }
+
+    #[test]
+    fn coding_profile_preserves_embedding_surface() {
+        let profile =
+            coding_profile(&CodingSettings::default(), ExecutionSurface::Desktop).unwrap();
+
+        assert_eq!(profile.environment().surface(), ExecutionSurface::Desktop);
     }
 }

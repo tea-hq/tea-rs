@@ -7,17 +7,17 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use tea_coding::config::{
-    CodingSettings, ModelDefinition, ProviderConfig, ProviderValueResolver, ProvidersConfigLoad,
-    SettingsLayer, WebFetchBackend, WebFetchSettings, WebSearchClientBackend, WebSearchSettings,
-    load_providers_file, load_settings_file, merge_settings,
+    CodingSettings, ProviderConfig, ProvidersConfigLoad, SettingsLayer, WebFetchBackend,
+    WebFetchSettings, WebSearchClientBackend, WebSearchSettings, load_providers_file,
+    load_settings_file, merge_settings, resolve_openai_compatible_provider,
 };
 use tea_coding::mcp_config::{
     McpEnvironmentValue, ProcessMcpEnvironmentResolver, resolve_mcp_environment,
 };
 use tea_coding::resources::ResourceCatalog;
 use tea_coding::{
-    AppPaths, CodingAgentBuilder, CodingAgentService, CodingCredentialResolver, InteractionMode,
-    McpEnvironmentResolver, PersistedTrustDecision, ProjectAccess, ProjectTrustStore, TrustRequest,
+    AppPaths, CodingAgentBuilder, CodingAgentService, InteractionMode, McpEnvironmentResolver,
+    PersistedTrustDecision, ProjectAccess, ProjectTrustStore, TrustRequest,
 };
 use tea_coding_tools::{
     BashConfig, BashOutputDirectory, BashShell, FetchCacheConfig, FetchCacheScope, FetchProvider,
@@ -28,7 +28,7 @@ use tea_mcp::{MAX_MCP_STARTUP_CONCURRENCY, McpManager, McpServerConfig, McpServe
 use tea_model::{
     BoxModelStream, ModelCancellation, ModelCapabilities, ModelDisplayName, ModelEvent,
     ModelFailure, ModelFailureCode, ModelProvider, ModelRequest, ModelResponseInfo, ModelSpec,
-    ProviderId, ReasoningEffort, ReasoningProfile,
+    ProviderId,
 };
 use tea_policy::{ActorId, WorkspaceId};
 use tea_protocol::ProtocolTimestamp;
@@ -38,7 +38,6 @@ use tea_provider_anthropic::{
     MapCredentialResolver as AnthropicCredentialResolver,
 };
 use tea_provider_http::{ProviderHttpConfig, UserAgent};
-use tea_provider_openai::{MapCredentialResolver, OpenAiProviderBuilder, OpenAiReasoningEffortMap};
 use tea_session_sqlite::SqliteSessionStore;
 use tea_tools::{ToolName, ToolTrust};
 
@@ -1033,80 +1032,17 @@ fn custom_openai_provider(
     environment: &BootstrapEnvironment,
     http_config: ProviderHttpConfig,
 ) -> Result<Arc<dyn ModelProvider>, CliFailure> {
-    let provider_id = ProviderId::from_str(provider_id)
-        .map_err(|_| config_failure("provider selector is invalid"))?;
-    let value_resolver = ProviderValueResolver::new(provider_environment(environment));
-    let mut values = environment.values.clone();
-    values.insert("TEA_OPENAI_MODEL".to_owned(), model_id.to_owned());
-    insert_provider_value(
-        &mut values,
-        "TEA_OPENAI_BASE_URL",
-        provider.base_url.as_deref(),
-    );
-    insert_provider_value(
-        &mut values,
-        "TEA_OPENAI_API_KEY_HEADER",
-        provider.api_key_header.as_deref(),
-    );
-    insert_provider_value(
-        &mut values,
-        "TEA_OPENAI_API_KEY_PREFIX",
-        provider.api_key_prefix.as_deref(),
-    );
-    insert_provider_value(
-        &mut values,
-        "TEA_OPENAI_API_MODE",
-        provider.api_mode.as_deref(),
-    );
-    insert_provider_value(&mut values, "TEA_OPENAI_ORG_ID", provider.org_id.as_deref());
-    insert_provider_value(
-        &mut values,
-        "TEA_OPENAI_PROJECT_ID",
-        provider.project_id.as_deref(),
-    );
-    insert_provider_value(
-        &mut values,
-        "TEA_OPENAI_REASONING_EFFORT",
-        provider.reasoning_effort.as_deref(),
-    );
-    if let Some(vision) = provider.vision {
-        values.insert("TEA_OPENAI_VISION".to_owned(), vision.to_string());
-    }
-    if let Some(timeout_millis) = provider.timeout_millis {
-        values.insert(
-            "TEA_OPENAI_REQUEST_TIMEOUT_MS".to_owned(),
-            timeout_millis.to_string(),
-        );
-    }
-    if let Some(api_key) = cli_api_key {
-        values.insert("TEA_OPENAI_API_KEY".to_owned(), api_key.as_str().to_owned());
-    } else if let Some(api_key) = &provider.api_key {
-        values.insert(
-            "TEA_OPENAI_API_KEY".to_owned(),
-            value_resolver.resolve(api_key).ok_or_else(|| {
-                provider_failure("configured provider API key could not be resolved")
-            })?,
-        );
-    }
-    let config = CodingCredentialResolver::new(Arc::new(MapCredentialResolver::for_provider(
-        provider_id.clone(),
-        values,
-    )))
-    .resolve()
+    let resolved = resolve_openai_compatible_provider(
+        provider_id,
+        model_id,
+        Some(provider),
+        cli_api_key.map(tea_provider_openai::ApiKey::as_str),
+        environment.values.clone(),
+    )
     .map_err(CliFailure::from)?;
-    let catalog = custom_model_specs(&provider_id, provider)?;
-    if !catalog
-        .models
-        .iter()
-        .any(|model| model.model_id().as_str() == model_id)
-    {
-        return Err(config_failure("model is not configured for provider"));
-    }
     Ok(Arc::new(
-        OpenAiProviderBuilder::new()
-            .with_config(Arc::new(config))
-            .with_catalog(catalog.models)
-            .with_reasoning_effort_maps(catalog.reasoning_effort_maps)
+        resolved
+            .provider_builder()
             .with_http_config(http_config)
             .build()
             .map_err(|_| provider_failure("provider configuration failed"))?,
@@ -1126,20 +1062,17 @@ fn builtin_openai_provider(
     environment: &BootstrapEnvironment,
     http_config: ProviderHttpConfig,
 ) -> Result<Arc<dyn ModelProvider>, CliFailure> {
-    let mut values = environment.values.clone();
-    values.insert("TEA_OPENAI_MODEL".to_owned(), model_id.to_owned());
-    if let Some(api_key) = cli_api_key {
-        values.insert("TEA_OPENAI_API_KEY".to_owned(), api_key.as_str().to_owned());
-    }
-    let config = CodingCredentialResolver::new(Arc::new(MapCredentialResolver::new(values)))
-        .resolve()
-        .map_err(CliFailure::from)?;
-    let catalog = tea_provider_openai::catalog::default_catalog(&config)
-        .map_err(|_| provider_failure("provider model catalog failed"))?;
+    let resolved = resolve_openai_compatible_provider(
+        "openai",
+        model_id,
+        None,
+        cli_api_key.map(tea_provider_openai::ApiKey::as_str),
+        environment.values.clone(),
+    )
+    .map_err(CliFailure::from)?;
     Ok(Arc::new(
-        OpenAiProviderBuilder::new()
-            .with_config(Arc::new(config))
-            .with_catalog(catalog)
+        resolved
+            .provider_builder()
             .with_http_config(http_config)
             .build()
             .map_err(|_| provider_failure("provider configuration failed"))?,
@@ -1170,10 +1103,6 @@ fn builtin_anthropic_provider(
             .build()
             .map_err(|_| provider_failure("provider configuration failed"))?,
     ))
-}
-
-fn provider_environment(environment: &BootstrapEnvironment) -> BTreeMap<String, String> {
-    environment.values.clone()
 }
 
 fn client_web_search_provider(
@@ -1232,109 +1161,6 @@ fn client_web_fetch_provider(
         WebFetchBackend::Http => Arc::new(HttpFetchProvider::production(scope, cache, http)),
     };
     Ok(Some(provider))
-}
-
-fn insert_provider_value(values: &mut BTreeMap<String, String>, key: &str, value: Option<&str>) {
-    if let Some(value) = value {
-        values.insert(key.to_owned(), value.to_owned());
-    }
-}
-
-struct CustomModelCatalog {
-    models: Vec<ModelSpec>,
-    reasoning_effort_maps: BTreeMap<ModelId, OpenAiReasoningEffortMap>,
-}
-
-fn custom_model_specs(
-    provider_id: &ProviderId,
-    provider: &ProviderConfig,
-) -> Result<CustomModelCatalog, CliFailure> {
-    if provider.models.is_empty() {
-        return Err(config_failure("configured provider has no models"));
-    }
-    let mut models = Vec::with_capacity(provider.models.len());
-    let mut reasoning_effort_maps = BTreeMap::new();
-    for model in &provider.models {
-        let (spec, map) = custom_model_spec(provider_id, provider, model)?;
-        if let Some(map) = map {
-            reasoning_effort_maps.insert(spec.model_id().clone(), map);
-        }
-        models.push(spec);
-    }
-    Ok(CustomModelCatalog {
-        models,
-        reasoning_effort_maps,
-    })
-}
-
-fn custom_model_spec(
-    provider_id: &ProviderId,
-    provider: &ProviderConfig,
-    model: &ModelDefinition,
-) -> Result<(ModelSpec, Option<OpenAiReasoningEffortMap>), CliFailure> {
-    let reasoning = custom_model_reasoning(provider, model)?;
-    let mut capabilities = ModelCapabilities::text().with_tools(true);
-    if provider.vision.unwrap_or(false) {
-        capabilities = capabilities.with_image_input();
-    }
-    if reasoning.is_some() {
-        capabilities = capabilities.with_reasoning();
-    }
-    for hosted_tool in &model.capabilities.hosted_tools {
-        capabilities = capabilities.with_hosted_tool(hosted_tool.kind());
-    }
-    let spec = ModelSpec::new(
-        ModelId::from_str(&model.id)
-            .map_err(|_| config_failure("configured model identifier is invalid"))?,
-        provider_id.clone(),
-        ModelDisplayName::from_str(model.display_name.as_deref().unwrap_or(&model.id))
-            .map_err(|_| config_failure("configured model name is invalid"))?,
-        TokenCount::new(model.context_window_tokens.unwrap_or(128_000))
-            .map_err(|_| config_failure("configured model context window is invalid"))?,
-        TokenCount::new(model.max_output_tokens.unwrap_or(16_384))
-            .map_err(|_| config_failure("configured model output limit is invalid"))?,
-        capabilities,
-    )
-    .map_err(|_| config_failure("configured model limits are invalid"))?;
-    let Some((profile, map)) = reasoning else {
-        return Ok((spec, None));
-    };
-    Ok((spec.with_reasoning_profile(profile), Some(map)))
-}
-
-fn custom_model_reasoning(
-    provider: &ProviderConfig,
-    model: &ModelDefinition,
-) -> Result<Option<(ReasoningProfile, OpenAiReasoningEffortMap)>, CliFailure> {
-    if let Some(reasoning) = &model.capabilities.reasoning {
-        let (profile, entries) = reasoning
-            .resolved()
-            .ok_or_else(|| config_failure("configured model reasoning profile is invalid"))?;
-        let map = OpenAiReasoningEffortMap::new(entries)
-            .map_err(|_| config_failure("configured model reasoning wire map is invalid"))?;
-        return Ok(Some((profile, map)));
-    }
-    let Some(default_effort) = provider
-        .reasoning_effort
-        .as_deref()
-        .and_then(|value| ReasoningEffort::from_str(value).ok())
-    else {
-        return Ok(None);
-    };
-    let provisional =
-        ReasoningProfile::new(ReasoningEffort::Medium, ReasoningEffort::SHORTCUT_LEVELS)
-            .map_err(|_| config_failure("legacy reasoning default is invalid"))?;
-    let default_effort = provisional.resolve(default_effort).effective();
-    let profile = ReasoningProfile::new(default_effort, ReasoningEffort::SHORTCUT_LEVELS)
-        .map_err(|_| config_failure("legacy reasoning default is invalid"))?;
-    let map = OpenAiReasoningEffortMap::new(
-        ReasoningEffort::SHORTCUT_LEVELS
-            .into_iter()
-            .filter(|effort| *effort != ReasoningEffort::Off)
-            .map(|effort| (effort, effort.as_str().to_owned())),
-    )
-    .map_err(|_| config_failure("legacy reasoning wire map is invalid"))?;
-    Ok(Some((profile, map)))
 }
 
 fn client_user_agent(surface: ClientSurface, environment: &BootstrapEnvironment) -> UserAgent {
@@ -1452,6 +1278,7 @@ fn internal_failure(message: &'static str) -> CliFailure {
 mod tests {
     use super::*;
     use clap::Parser as _;
+    use tea_model::ReasoningEffort;
 
     fn model_ref(provider_id: &str, model_id: &str) -> tea_protocol::ModelRef {
         tea_protocol::ModelRef::new(provider_id.parse().unwrap(), model_id.parse().unwrap())
