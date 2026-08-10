@@ -373,6 +373,7 @@ async fn client_steers_queries_disconnects_and_resumes_from_durable_cursor() {
         assert!(!page["records"].as_array().unwrap().is_empty());
         let tail = page["tailSequence"].as_str().unwrap().to_owned();
         client_input.shutdown().await.unwrap();
+        drain_output(&mut output).await;
         (session_id, tail)
     };
     let (server_result, (session_id, tail)) = tokio::join!(server, client);
@@ -406,6 +407,7 @@ async fn client_steers_queries_disconnects_and_resumes_from_durable_cursor() {
                 .is_empty()
         );
         client_input.shutdown().await.unwrap();
+        drain_output(&mut output).await;
     };
     let (server_result, ()) = tokio::join!(server, client);
     server_result.unwrap();

@@ -12,7 +12,9 @@ use tea_context::{SkillMetadataProvider, WorkspaceInstructionProvider};
 use tea_kernel::ModelRetryPolicy;
 use tea_mcp::McpManager;
 use tea_model::{HostedToolOptions, ModelProvider, ReasoningEffort};
-use tea_policy::{ActorId, CodingWorkspacePolicy, ExternalSourcePolicy, WorkspaceId};
+use tea_policy::{
+    ActorId, CodingWorkspacePolicy, ExecutionSurface, ExternalSourcePolicy, WorkspaceId,
+};
 use tea_profile::ProfileRuleId;
 use tea_session::{SessionCatalog, SessionStore};
 use tea_tools::{
@@ -40,6 +42,7 @@ pub struct CodingAgentBuilder {
     settings: CodingSettings,
     actor: ActorId,
     workspace_id: WorkspaceId,
+    execution_surface: ExecutionSurface,
     compaction_summarizer: Option<Arc<dyn tea_kernel::CompactionSummarizer>>,
     mcp_manager: Option<Arc<McpManager>>,
     search_provider: Option<Arc<dyn SearchProvider>>,
@@ -75,11 +78,23 @@ impl CodingAgentBuilder {
             settings,
             actor,
             workspace_id,
+            execution_surface: ExecutionSurface::Cli,
             compaction_summarizer: None,
             mcp_manager: None,
             search_provider: None,
             fetch_provider: None,
         }
+    }
+
+    /// Selects the outward product surface used for policy evaluation.
+    ///
+    /// The default remains [`ExecutionSurface::Cli`] for compatibility with
+    /// existing coding CLI hosts. Desktop and IDE embeddings must set their
+    /// actual surface before building the service.
+    #[must_use]
+    pub const fn execution_surface(mut self, execution_surface: ExecutionSurface) -> Self {
+        self.execution_surface = execution_surface;
+        self
     }
 
     /// Registers an additional model provider in the immutable runtime generation.
@@ -138,7 +153,7 @@ impl CodingAgentBuilder {
     /// Returns a bounded product error for any invalid contract or registration.
     pub fn build(self) -> Result<CodingAgentService, CodingError> {
         crate::config::validate(&self.settings)?;
-        let profile = coding_profile(&self.settings)?;
+        let profile = coding_profile(&self.settings, self.execution_surface)?;
         let retry_attempts = self.settings.max_retries.saturating_add(1);
         let default_reasoning_effort =
             ReasoningEffort::from_str(&self.settings.thinking).map_err(|_| invalid_settings())?;
