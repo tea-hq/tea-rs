@@ -1832,7 +1832,9 @@ fn committed_assistant_output_bytes(
 fn checked_content_bytes(initial: usize, content: &[ContentBlock]) -> Result<usize, KernelError> {
     content.iter().try_fold(initial, |total, block| {
         let bytes = match block {
-            ContentBlock::Text { text } | ContentBlock::Thinking { text } => text.len(),
+            ContentBlock::Text { text }
+            | ContentBlock::ContextualText { text }
+            | ContentBlock::Thinking { text } => text.len(),
             ContentBlock::Image { .. } | ContentBlock::ToolCall { .. } => 0,
             ContentBlock::HostedTool { .. } | ContentBlock::Citation { .. } => {
                 serde_json::to_vec(block)

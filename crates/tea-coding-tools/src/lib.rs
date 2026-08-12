@@ -33,7 +33,10 @@ mod write;
 pub use bash::{BashConfig, BashOutputDirectory, BashShell, BashTool};
 pub use edit::EditTool;
 pub use error::{MAX_WORKSPACE_ERROR_MESSAGE_BYTES, WorkspacePathError, WorkspacePathErrorCode};
-pub use file::{DEFAULT_READ_LINE_LIMIT, MAX_READ_BYTES, MAX_READ_LINE_LIMIT, MAX_WRITE_BYTES};
+pub use file::{
+    DEFAULT_READ_LINE_LIMIT, MAX_READ_BYTES, MAX_READ_LINE_LIMIT, MAX_WRITE_BYTES,
+    read_bounded_utf8,
+};
 pub use file_error::{FileToolError, FileToolErrorCode};
 pub use path::{MAX_WORKSPACE_PATH_BYTES, MAX_WORKSPACE_PATH_COMPONENTS};
 pub use read::ReadTool;

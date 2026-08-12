@@ -11,7 +11,7 @@ use tea_tools::{
 };
 
 use crate::edit_diff::code_change;
-use crate::file::{atomic_write_if_unchanged, read_utf8};
+use crate::file::{atomic_write_if_unchanged, read_bounded_utf8};
 use crate::output::{failure, success};
 use crate::read::string_argument;
 use crate::{FileToolError, FileToolErrorCode, WorkspaceRoot};
@@ -82,7 +82,7 @@ impl EditTool {
         let new_text = string_argument(invocation, "newText")?;
         let expected = expected_replacements(invocation)?;
         let existing = self.workspace.resolve_existing(path)?;
-        let source = read_utf8(&self.workspace, &existing, crate::MAX_WRITE_BYTES)?;
+        let source = read_bounded_utf8(&self.workspace, &existing, crate::MAX_WRITE_BYTES)?;
         let matches = source.match_indices(old_text).count();
         if matches == 0 {
             return Err(FileToolError::new(FileToolErrorCode::NoMatch));
@@ -137,7 +137,7 @@ impl EditTool {
         let new_text = string_argument(invocation, "newText")?;
         let expected = expected_replacements(invocation)?;
         let existing = self.workspace.resolve_existing(path)?;
-        let source = read_utf8(&self.workspace, &existing, crate::MAX_WRITE_BYTES)?;
+        let source = read_bounded_utf8(&self.workspace, &existing, crate::MAX_WRITE_BYTES)?;
         let matches = source.match_indices(old_text).count();
         if matches == 0 {
             return Err(FileToolError::new(FileToolErrorCode::NoMatch));

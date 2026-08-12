@@ -712,7 +712,8 @@ impl InteractiveApp<'_> {
                     .into_iter()
                     .next()
                 {
-                    self.editor = Editor::with_limit(completion, super::MAX_EDITOR_BYTES)
+                    let draft = self.commands.completion_draft(&completion);
+                    self.editor = Editor::with_limit(draft, super::MAX_EDITOR_BYTES)
                         .expect("bounded command completion");
                     true
                 } else {
@@ -840,11 +841,17 @@ impl InteractiveApp<'_> {
     async fn handle_binding(&mut self, action: BindingAction) -> Result<(), CliFailure> {
         match action {
             BindingAction::Submit | BindingAction::Steer => {
+                let Ok(skill) = self.commands.parse_skill_mention(self.editor.text()) else {
+                    self.notify("skill invocation is invalid").await?;
+                    return Ok(());
+                };
                 let Some(text) = self.editor.submit() else {
                     return Ok(());
                 };
                 self.sync_editor().await?;
-                if text.starts_with('/') {
+                if let Some(command) = skill {
+                    self.handle_skill_invocation(&command, &text).await?;
+                } else if text.starts_with('/') {
                     self.handle_command(&text).await?;
                 } else if !self.state.attachments().is_empty()
                     && (self.owns_current_run() || self.state.running)
@@ -864,11 +871,17 @@ impl InteractiveApp<'_> {
                 }
             }
             BindingAction::FollowUp => {
+                let Ok(skill) = self.commands.parse_skill_mention(self.editor.text()) else {
+                    self.notify("skill invocation is invalid").await?;
+                    return Ok(());
+                };
                 let Some(text) = self.editor.submit() else {
                     return Ok(());
                 };
                 self.sync_editor().await?;
-                if !self.state.attachments().is_empty()
+                if let Some(command) = skill {
+                    self.handle_skill_invocation(&command, &text).await?;
+                } else if !self.state.attachments().is_empty()
                     && (self.owns_current_run() || self.state.running)
                 {
                     self.restore_failed_input(text, "image attachments require an idle session")
@@ -998,10 +1011,11 @@ impl InteractiveApp<'_> {
             }
             SlashCommand::ImageClear => self.apply(Action::ClearAttachments).await?,
             SlashCommand::Mcp => self.show_mcp_health().await?,
+            SlashCommand::Skills => self.show_skills().await?,
             SlashCommand::McpReconnect(server_id) => self.reconnect_mcp(server_id).await?,
             SlashCommand::Help => {
                 self.notify(
-                    "/new /resume /session /name /model /reasoning /compact /tree /fork /copy /image /mcp /help /quit",
+                    "/new /resume /session /name /model /reasoning /compact /tree /fork /copy /image /mcp /skills /help /quit",
                 )
                 .await?;
             }
@@ -1017,18 +1031,8 @@ impl InteractiveApp<'_> {
                     .ok_or_else(|| CliFailure::usage("prompt template is unavailable"))?;
                 self.submit_generated(prompt).await?;
             }
-            SlashCommand::Skill(invocation) => {
-                let skill = self
-                    .service
-                    .resources()
-                    .invoke_skill(&invocation)
-                    .map_err(CliFailure::from)?;
-                let prompt = if skill.arguments().is_empty() {
-                    skill.content().to_owned()
-                } else {
-                    format!("{}\n\nArguments: {}", skill.content(), skill.arguments())
-                };
-                self.submit_generated(prompt).await?;
+            SlashCommand::Skill(command) => {
+                self.handle_skill_invocation(&command, input).await?;
             }
         }
         Ok(())
@@ -1118,6 +1122,15 @@ impl InteractiveApp<'_> {
     }
 
     async fn handle_command_completion_key(&mut self, key: KeyEvent) -> Result<(), CliFailure> {
+        let tab_accepts = self
+            .state
+            .overlay
+            .as_ref()
+            .and_then(Overlay::command_completion)
+            .and_then(CommandCompletion::selected)
+            .is_some_and(|selected| {
+                selected.kind() == super::commands::CommandCompletionKind::Skill
+            });
         match key.code {
             KeyCode::Esc => self.apply(Action::SetOverlay(None)).await?,
             KeyCode::Up | KeyCode::BackTab => {
@@ -1130,7 +1143,7 @@ impl InteractiveApp<'_> {
                 self.state.bump_generation();
                 self.render()?;
             }
-            KeyCode::Down | KeyCode::Tab => {
+            code if code == KeyCode::Down || (code == KeyCode::Tab && !tab_accepts) => {
                 self.state
                     .overlay
                     .as_mut()
@@ -1140,17 +1153,18 @@ impl InteractiveApp<'_> {
                 self.state.bump_generation();
                 self.render()?;
             }
-            KeyCode::Enter => {
+            KeyCode::Enter | KeyCode::Tab => {
                 let selected = self
                     .state
                     .overlay
                     .as_ref()
                     .and_then(Overlay::command_completion)
                     .and_then(CommandCompletion::selected)
-                    .map(str::to_owned);
+                    .cloned();
                 self.apply(Action::SetOverlay(None)).await?;
                 if let Some(selected) = selected {
-                    self.editor = Editor::with_limit(selected, super::MAX_EDITOR_BYTES)
+                    let draft = self.commands.completion_draft(&selected);
+                    self.editor = Editor::with_limit(draft, super::MAX_EDITOR_BYTES)
                         .expect("catalog completion remains bounded");
                     self.sync_editor().await?;
                 }
@@ -1678,6 +1692,57 @@ impl InteractiveApp<'_> {
         }
     }
 
+    async fn submit_skill(
+        &mut self,
+        invocation: &str,
+        instructions: String,
+    ) -> Result<(), CliFailure> {
+        let invocation = invocation.to_owned();
+        let mut content = vec![
+            ContentBlock::text(invocation.clone())
+                .map_err(|_| CliFailure::usage("skill invocation is invalid"))?,
+            ContentBlock::contextual_text(instructions)
+                .map_err(|_| CliFailure::usage("skill instructions are invalid"))?,
+        ];
+        if self.owns_current_run() || self.state.running {
+            if !self.state.attachments().is_empty() {
+                return self
+                    .restore_failed_input(invocation, "image attachments require an idle session")
+                    .await;
+            }
+            self.service
+                .follow_up_content(self.session_id, content)
+                .await
+                .map_err(CliFailure::from)?;
+            self.apply(Action::QueueFollowUp(invocation)).await
+        } else {
+            if !self.state.attachments().is_empty() {
+                self.ensure_image_capability()?;
+                content.extend(self.state.attachment_blocks());
+            }
+            self.service
+                .prompt_content(self.session_id, content)
+                .map_err(CliFailure::from)?;
+            self.owned_runs.insert(self.session_id);
+            self.apply(Action::ClearAttachments).await?;
+            self.apply(Action::StartRunActivity).await?;
+            self.apply(Action::ShowPendingUserPrompt(invocation)).await
+        }
+    }
+
+    async fn handle_skill_invocation(
+        &mut self,
+        command: &tea::context::SkillCommand,
+        invocation: &str,
+    ) -> Result<(), CliFailure> {
+        let skill = self
+            .service
+            .resources()
+            .load_skill(command)
+            .map_err(CliFailure::from)?;
+        self.submit_skill(invocation, skill.prompt_fragment()).await
+    }
+
     async fn ensure_idle(&mut self) -> Result<bool, CliFailure> {
         if self.owns_current_run() || self.state.running {
             self.notify("command is unavailable while a run is active")
@@ -1720,6 +1785,20 @@ impl InteractiveApp<'_> {
         .await
     }
 
+    async fn show_skills(&mut self) -> Result<(), CliFailure> {
+        let rows = if self.service.resources().skills().is_empty() {
+            vec!["no skills loaded".to_owned()]
+        } else {
+            self.service
+                .resources()
+                .skills()
+                .iter()
+                .map(skill_catalog_row)
+                .collect::<Vec<_>>()
+        };
+        self.apply(Action::SetSkillCatalog(rows)).await
+    }
+
     async fn reconnect_mcp(&mut self, server_id: McpServerId) -> Result<(), CliFailure> {
         match self.service.reconnect_mcp(&server_id).await {
             Ok(health) => {
@@ -1742,8 +1821,12 @@ impl InteractiveApp<'_> {
     }
 
     async fn sync_editor(&mut self) -> Result<(), CliFailure> {
-        self.apply(Action::SetEditor(self.editor.text().to_owned()))
-            .await?;
+        let mention = self.commands.skill_mention_token(self.editor.text());
+        self.apply(Action::SetComposer {
+            text: self.editor.text().to_owned(),
+            skill_mention: mention,
+        })
+        .await?;
         self.sync_command_completion().await
     }
 
@@ -1759,7 +1842,7 @@ impl InteractiveApp<'_> {
         }
         let editor = self.editor.text();
         let completion = if self.state.approval().is_none()
-            && editor.starts_with('/')
+            && matches!(editor.as_bytes().first(), Some(b'/' | b'$'))
             && !editor.chars().any(char::is_whitespace)
         {
             let completion = CommandCompletion::new(self.commands.complete(editor, 16));
@@ -1879,7 +1962,7 @@ fn is_stream_delta(action: &Action) -> bool {
 }
 
 fn command_catalog(service: &CodingAgentService) -> Result<CommandCatalog, CliFailure> {
-    CommandCatalog::new(
+    let catalog = CommandCatalog::new(
         service
             .resources()
             .prompts()
@@ -1891,7 +1974,15 @@ fn command_catalog(service: &CodingAgentService) -> Result<CommandCatalog, CliFa
             .iter()
             .map(|skill| skill.metadata().id().as_str()),
     )
-    .map_err(|_| CliFailure::new(ExitCategory::TrustOrConfig, "command catalog is invalid"))
+    .map_err(|_| CliFailure::new(ExitCategory::TrustOrConfig, "command catalog is invalid"))?;
+    Ok(
+        catalog.with_skill_descriptions(service.resources().skills().iter().map(|skill| {
+            (
+                skill.metadata().id().as_str(),
+                skill.metadata().description(),
+            )
+        })),
+    )
 }
 
 fn mcp_failure(error: tea_mcp::McpError) -> CliFailure {
@@ -1940,6 +2031,20 @@ fn mcp_health_row(server: &crate::session_views::McpServerView) -> String {
     )
 }
 
+fn skill_catalog_row(skill: &tea_coding::resources::DiscoveredSkill) -> String {
+    let visibility = if skill.model_invocable() {
+        skill.source().label().to_owned()
+    } else {
+        format!("{}; explicit-only", skill.source().label())
+    };
+    format!(
+        "{} [{}] - {}",
+        skill.metadata().id(),
+        visibility,
+        skill.metadata().description()
+    )
+}
+
 fn assistant_text(message: &CanonicalMessage) -> Option<String> {
     let CanonicalMessage::Assistant { content, .. } = message else {
         return None;
@@ -1948,7 +2053,8 @@ fn assistant_text(message: &CanonicalMessage) -> Option<String> {
         .iter()
         .filter_map(|block| match block {
             ContentBlock::Text { text } => Some(text.as_str()),
-            ContentBlock::Thinking { .. }
+            ContentBlock::ContextualText { .. }
+            | ContentBlock::Thinking { .. }
             | ContentBlock::Image { .. }
             | ContentBlock::ToolCall { .. }
             | ContentBlock::HostedTool { .. }

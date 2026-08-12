@@ -18,6 +18,7 @@ mod paths;
 mod profile;
 pub mod resources;
 mod service;
+mod skill_tool;
 mod trust;
 
 pub use builder::CodingAgentBuilder;
@@ -27,6 +28,7 @@ pub use mcp::{McpCatalogEntry, McpServiceSnapshot};
 pub use mcp_config::McpEnvironmentResolver;
 pub use paths::AppPaths;
 pub use service::{CodingAgentService, CommandAcceptance};
+pub use skill_tool::{READ_SKILL_RESOURCE_TOOL_NAME, ReadSkillResourceTool, SkillResourceResolver};
 pub use trust::{
     InteractionMode, PersistedTrustDecision, ProjectAccess, ProjectTrustStore, TrustRequest,
 };

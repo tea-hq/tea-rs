@@ -26,9 +26,7 @@ use super::presentation::{
     LifecycleStatus, OutputFormat, PlanStep, PlanStepStatus, TimelineDetail, TimelineDetailKind,
     TimelineSource,
 };
-use super::render_output::RenderedLine;
-#[cfg(test)]
-use super::render_output::RenderedSpan;
+use super::render_output::{RenderedLine, RenderedSpan};
 use super::state::{ApprovalChoice, TuiState};
 use super::status::StatusIndicator;
 use super::theme::Theme;
@@ -527,10 +525,22 @@ fn modal_surface(state: &TuiState, width: usize, theme: &Theme) -> Vec<RenderedL
         }
         Overlay::CommandCompletion(completion) => {
             let mut rows = Vec::new();
+            let skill_completion = completion
+                .options()
+                .first()
+                .is_some_and(|option| option.value().starts_with('$'));
             push_wrapped(
                 &mut rows,
-                "commands",
-                "select command",
+                if skill_completion {
+                    "skills"
+                } else {
+                    "completions"
+                },
+                if skill_completion {
+                    "select skill"
+                } else {
+                    "select item"
+                },
                 width,
                 theme.footer,
                 theme,
@@ -545,13 +555,28 @@ fn modal_surface(state: &TuiState, width: usize, theme: &Theme) -> Vec<RenderedL
                 })
                 .unwrap_or(0);
             let range = modal_option_range(completion.options().len(), selected);
-            for option in &completion.options()[range] {
-                let marker = if completion.selected() == Some(option.as_str()) {
+            let visible_options = &completion.options()[range];
+            let name_width = visible_options
+                .iter()
+                .map(|option| option.value().width())
+                .max()
+                .unwrap_or(0);
+            for option in visible_options {
+                let marker = if completion.selected() == Some(option) {
                     "›"
                 } else {
                     " "
                 };
-                push_wrapped(&mut rows, marker, option, width, theme.editor, theme);
+                let padding = " ".repeat(name_width.saturating_sub(option.value().width()));
+                let description = option
+                    .description()
+                    .map_or_else(String::new, |description| format!(" {description}"));
+                let label = format!(
+                    "{}{padding}  [{}]{description}",
+                    option.value(),
+                    option.kind().label()
+                );
+                push_truncated(&mut rows, marker, &label, width, theme.editor, theme);
             }
             rows
         }
@@ -578,12 +603,14 @@ fn composer_frame(
     let attachment_rows = attachment_lines.len();
     let editor_lines = composer_content_lines(
         &state.editor,
+        state.editor_skill_mention(),
         composer_content_width(width),
         theme.composer,
         theme,
     );
     let cursor_lines = composer_content_lines(
         &state.editor[..cursor_byte],
+        None,
         composer_content_width(width),
         theme.composer,
         theme,
@@ -709,20 +736,59 @@ fn composer_placeholder_line(width: usize, style: Style) -> RenderedLine {
 
 fn fill_composer_line(line: &RenderedLine, width: usize) -> RenderedLine {
     let padding = " ".repeat(width.saturating_sub(line.text.width()));
-    RenderedLine::new(format!("{}{padding}", line.text), line.style)
+    if line.rendered_spans().is_empty() {
+        return RenderedLine::new(format!("{}{padding}", line.text), line.style);
+    }
+    let mut spans = line.rendered_spans().to_vec();
+    if !padding.is_empty() {
+        spans.push(RenderedSpan::new(padding, line.style));
+    }
+    RenderedLine::from_spans(line.style, spans)
 }
 
 fn composer_content_lines(
     text: &str,
+    skill_mention: Option<&str>,
     width: usize,
     style: Style,
     theme: &Theme,
 ) -> Vec<RenderedLine> {
-    component_lines(
+    let mut lines = component_lines(
         Text::new(text, style).with_prefixes(COMPOSER_PROMPT_PREFIX, "  "),
         width,
         theme,
-    )
+    );
+    let Some(mention) = skill_mention.filter(|mention| text.starts_with(*mention)) else {
+        return lines;
+    };
+    let mention_style = style.patch(theme.editor);
+    let mut remaining = mention.len();
+    for (index, line) in lines.iter_mut().enumerate() {
+        if remaining == 0 {
+            break;
+        }
+        let prefix = if index == 0 {
+            COMPOSER_PROMPT_PREFIX
+        } else {
+            "  "
+        };
+        let Some(content) = line.text().strip_prefix(prefix) else {
+            break;
+        };
+        let highlighted_bytes = remaining.min(content.len());
+        let highlighted = &content[..highlighted_bytes];
+        let rest = &content[highlighted_bytes..];
+        let mut spans = vec![
+            RenderedSpan::new(prefix.to_owned(), style),
+            RenderedSpan::new(highlighted.to_owned(), mention_style),
+        ];
+        if !rest.is_empty() {
+            spans.push(RenderedSpan::new(rest.to_owned(), style));
+        }
+        *line = RenderedLine::from_spans(style, spans);
+        remaining -= highlighted_bytes;
+    }
+    lines
 }
 
 const fn composer_content_width(width: usize) -> usize {

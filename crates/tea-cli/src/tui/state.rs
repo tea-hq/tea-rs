@@ -15,6 +15,8 @@ use super::selectors::Selector;
 pub const MAX_NOTIFICATIONS: usize = 32;
 /// Maximum configured MCP server rows retained in the terminal projection.
 pub const MAX_MCP_HEALTH_ROWS: usize = 64;
+/// Maximum discovered skill rows retained in the terminal projection.
+pub const MAX_SKILL_CATALOG_ROWS: usize = 128;
 /// Maximum steering or follow-up entries retained for rendering.
 pub const MAX_VISIBLE_QUEUE_ITEMS: usize = 64;
 /// Maximum event identities retained for duplicate observational-event detection.
@@ -392,7 +394,9 @@ pub struct TuiState {
     pub(crate) attachments: Vec<ComposerAttachment>,
     pub(crate) notifications: VecDeque<String>,
     pub(crate) mcp_health: Vec<String>,
+    pub(crate) skill_catalog: Vec<String>,
     pub(crate) editor: String,
+    pub(crate) editor_skill_mention: Option<String>,
     pub(crate) overlay: Option<Overlay>,
     pub(crate) viewport_width: u16,
     pub(crate) viewport_height: u16,
@@ -453,7 +457,9 @@ impl TuiState {
             attachments: Vec::new(),
             notifications: VecDeque::new(),
             mcp_health: Vec::new(),
+            skill_catalog: Vec::new(),
             editor: String::new(),
+            editor_skill_mention: None,
             overlay: None,
             viewport_width: 80,
             viewport_height: 24,
@@ -597,6 +603,12 @@ impl TuiState {
         &self.editor
     }
 
+    /// Returns the selected skill mention styled in the local editor.
+    #[must_use]
+    pub fn editor_skill_mention(&self) -> Option<&str> {
+        self.editor_skill_mention.as_deref()
+    }
+
     /// Returns whether a model/tool run is currently active.
     #[must_use]
     pub const fn is_running(&self) -> bool {
@@ -619,6 +631,12 @@ impl TuiState {
     #[must_use]
     pub fn attachments(&self) -> &[ComposerAttachment] {
         &self.attachments
+    }
+
+    /// Returns the currently displayed frozen skill catalog rows.
+    #[must_use]
+    pub fn skill_catalog(&self) -> &[String] {
+        &self.skill_catalog
     }
 
     /// Clones the canonical image blocks in submission order.
@@ -822,6 +840,14 @@ impl TuiState {
         self.mcp_health = rows
             .into_iter()
             .take(MAX_MCP_HEALTH_ROWS)
+            .map(|row| sanitize_summary(&row))
+            .collect();
+    }
+
+    pub(crate) fn set_skill_catalog(&mut self, rows: Vec<String>) {
+        self.skill_catalog = rows
+            .into_iter()
+            .take(MAX_SKILL_CATALOG_ROWS)
             .map(|row| sanitize_summary(&row))
             .collect();
     }

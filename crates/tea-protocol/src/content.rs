@@ -27,6 +27,11 @@ pub enum ContentBlock {
         /// UTF-8 text.
         text: String,
     },
+    /// Model-visible contextual text hidden by presentation surfaces.
+    ContextualText {
+        /// UTF-8 contextual text.
+        text: String,
+    },
     /// Model reasoning content that products may choose to hide.
     Thinking {
         /// UTF-8 reasoning text.
@@ -73,6 +78,20 @@ impl ContentBlock {
         let text = text.into();
         validate_text(&text)?;
         Ok(Self::Text { text })
+    }
+
+    /// Creates a validated model-visible contextual text block.
+    ///
+    /// Presentation surfaces must not render this block as user-authored text.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContentValidationError::InvalidText`] when the text is empty,
+    /// contains a null character, or exceeds [`MAX_TEXT_BLOCK_BYTES`].
+    pub fn contextual_text(text: impl Into<String>) -> Result<Self, ContentValidationError> {
+        let text = text.into();
+        validate_text(&text)?;
+        Ok(Self::ContextualText { text })
     }
 
     /// Creates a validated thinking block.
@@ -216,7 +235,9 @@ impl ContentBlock {
 
     pub(crate) fn validate(&self) -> Result<(), ContentValidationError> {
         match self {
-            Self::Text { text } | Self::Thinking { text } => validate_text(text),
+            Self::Text { text } | Self::ContextualText { text } | Self::Thinking { text } => {
+                validate_text(text)
+            }
             Self::Image { mime_type, source } => {
                 validate_mime_type(mime_type)?;
                 match source {
@@ -261,7 +282,10 @@ impl ContentBlock {
     }
 
     pub(crate) const fn valid_for_user(&self) -> bool {
-        matches!(self, Self::Text { .. } | Self::Image { .. })
+        matches!(
+            self,
+            Self::Text { .. } | Self::ContextualText { .. } | Self::Image { .. }
+        )
     }
 
     pub(crate) const fn valid_for_assistant(&self) -> bool {
@@ -296,6 +320,9 @@ enum SerializableContentBlock<'a> {
     Text {
         text: &'a str,
     },
+    ContextualText {
+        text: &'a str,
+    },
     Thinking {
         text: &'a str,
     },
@@ -325,6 +352,7 @@ impl<'a> From<&'a ContentBlock> for SerializableContentBlock<'a> {
     fn from(value: &'a ContentBlock) -> Self {
         match value {
             ContentBlock::Text { text } => Self::Text { text },
+            ContentBlock::ContextualText { text } => Self::ContextualText { text },
             ContentBlock::Thinking { text } => Self::Thinking { text },
             ContentBlock::Image { mime_type, source } => Self::Image { mime_type, source },
             ContentBlock::ToolCall {
@@ -348,6 +376,9 @@ impl<'a> From<&'a ContentBlock> for SerializableContentBlock<'a> {
 #[serde(tag = "type", rename_all = "snake_case")]
 enum RawContentBlock {
     Text {
+        text: String,
+    },
+    ContextualText {
         text: String,
     },
     Thinking {
@@ -383,6 +414,7 @@ impl<'de> Deserialize<'de> for ContentBlock {
         let raw = RawContentBlock::deserialize(deserializer)?;
         let result = match raw {
             RawContentBlock::Text { text } => Self::text(text),
+            RawContentBlock::ContextualText { text } => Self::contextual_text(text),
             RawContentBlock::Thinking { text } => Self::thinking(text),
             RawContentBlock::Image { mime_type, source } => match source {
                 ImageSource::InlineBase64 { data } => Self::inline_image(mime_type, data),

@@ -14,7 +14,7 @@ use tea_tools::{
     ToolTimeout, ToolVersion, ValidatedToolInvocation,
 };
 
-use crate::file::read_utf8;
+use crate::file::read_bounded_utf8;
 use crate::output::{failure, success};
 use crate::read::string_argument;
 use crate::{FileToolError, FileToolErrorCode, WorkspaceRoot};
@@ -137,7 +137,7 @@ impl GrepTool {
             let Ok(target) = self.workspace.resolve_existing(&relative) else {
                 continue;
             };
-            let source = match read_utf8(&self.workspace, &target, MAX_SEARCH_FILE_BYTES) {
+            let source = match read_bounded_utf8(&self.workspace, &target, MAX_SEARCH_FILE_BYTES) {
                 Ok(source) => source,
                 Err(error)
                     if matches!(

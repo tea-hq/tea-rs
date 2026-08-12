@@ -50,7 +50,7 @@ impl CommandAcceptance {
 pub struct CodingAgentService {
     runtime: Arc<AgentRuntime>,
     workspace: WorkspaceRoot,
-    resources: ResourceCatalog,
+    resources: Arc<ResourceCatalog>,
     settings: CodingSettings,
     workspace_id: WorkspaceId,
     runs: Mutex<
@@ -64,7 +64,7 @@ impl CodingAgentService {
     pub(crate) fn new(
         runtime: AgentRuntime,
         workspace: WorkspaceRoot,
-        resources: ResourceCatalog,
+        resources: Arc<ResourceCatalog>,
         settings: CodingSettings,
         workspace_id: WorkspaceId,
         mcp_manager: Option<Arc<McpManager>>,
@@ -92,8 +92,8 @@ impl CodingAgentService {
     }
     /// Returns the immutable resource catalog.
     #[must_use]
-    pub const fn resources(&self) -> &ResourceCatalog {
-        &self.resources
+    pub fn resources(&self) -> &ResourceCatalog {
+        self.resources.as_ref()
     }
     /// Returns the resolved secret-free product settings snapshot.
     #[must_use]
@@ -334,13 +334,27 @@ impl CodingAgentService {
         session_id: SessionId,
         text: impl Into<String>,
     ) -> Result<RuntimeCommandOutcome, CodingError> {
-        let timestamp = now()?;
-        let message = CanonicalMessage::user(
-            new_id::<MessageId>()?,
+        self.follow_up_content(
+            session_id,
             vec![ContentBlock::text(text.into()).map_err(|_| invalid())?],
-            timestamp,
         )
-        .map_err(|_| invalid())?;
+        .await
+    }
+
+    /// Queues typed user content as a follow-up message.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the content cannot form a canonical user message
+    /// or the active run's follow-up queue rejects it.
+    pub async fn follow_up_content(
+        &self,
+        session_id: SessionId,
+        content: Vec<ContentBlock>,
+    ) -> Result<RuntimeCommandOutcome, CodingError> {
+        let timestamp = now()?;
+        let message = CanonicalMessage::user(new_id::<MessageId>()?, content, timestamp)
+            .map_err(|_| invalid())?;
         self.send_at(session_id, AgentCommand::FollowUp { message }, timestamp)
             .await
     }

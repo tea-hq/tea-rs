@@ -33,7 +33,9 @@ pub use attachment::{
     AttachmentError, ComposerAttachment, MAX_COMPOSER_ATTACHMENTS, MAX_COMPOSER_IMAGE_BASE64_BYTES,
 };
 pub use clipboard::{Clipboard, MemoryClipboard, SystemClipboard};
-pub use commands::{CommandCatalog, CommandError, SlashCommand};
+pub use commands::{
+    CommandCatalog, CommandCompletionItem, CommandCompletionKind, CommandError, SlashCommand,
+};
 pub use editor::{Editor, EditorError, MAX_EDITOR_BYTES, MAX_EDITOR_HISTORY};
 pub use input::{InputEvent, InputPump, spawn_input_pump};
 pub use keymap::{BindingAction, KeyMap, KeyMapError};
@@ -54,8 +56,9 @@ pub use render_output::RenderedLine;
 pub use selectors::{Selector, SelectorError, SelectorItem, SelectorValue};
 pub use state::{
     ApprovalChoice, ApprovalView, MAX_MCP_HEALTH_ROWS, MAX_NOTIFICATIONS, MAX_OBSERVED_EVENT_IDS,
-    MAX_VISIBLE_QUEUE_ITEMS, ModelRetryView, StartupContext, StreamingBlock, StreamingMessage,
-    ToolProgressView, ToolView, TranscriptViewport, TuiState, ViewPreferences,
+    MAX_SKILL_CATALOG_ROWS, MAX_VISIBLE_QUEUE_ITEMS, ModelRetryView, StartupContext,
+    StreamingBlock, StreamingMessage, ToolProgressView, ToolView, TranscriptViewport, TuiState,
+    ViewPreferences,
 };
 pub use terminal::{
     ColorCapability, CrosstermDriver, TerminalCapabilities, TerminalDriver, TerminalGuard,

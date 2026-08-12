@@ -7,6 +7,8 @@ use crate::SkillId;
 
 /// Maximum UTF-8 bytes in one skill description.
 pub const MAX_SKILL_DESCRIPTION_BYTES: usize = 4096;
+/// Maximum UTF-8 bytes in explicit skill arguments.
+pub const MAX_SKILL_ARGUMENT_BYTES: usize = 16 * 1024;
 
 /// Bounded declarative skill metadata; it does not execute the skill.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -48,6 +50,12 @@ impl SkillMetadata {
             skill_id: self.id.clone(),
         }
     }
+
+    /// Returns the canonical slash command without explicit arguments.
+    #[must_use]
+    pub fn command(&self) -> SkillCommand {
+        self.invocation().command()
+    }
 }
 
 /// Parsed explicit `@skill <skill-id>` invocation.
@@ -61,6 +69,13 @@ impl SkillInvocation {
     #[must_use]
     pub const fn skill_id(&self) -> &SkillId {
         &self.skill_id
+    }
+
+    /// Converts the legacy metadata invocation to a typed command without
+    /// arguments.
+    #[must_use]
+    pub fn command(&self) -> SkillCommand {
+        self.clone().into()
     }
 }
 
@@ -84,6 +99,79 @@ impl fmt::Display for SkillInvocation {
     }
 }
 
+/// Typed canonical `/skill:<skill-id> [args]` command.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SkillCommand {
+    skill_id: SkillId,
+    arguments: String,
+}
+
+impl SkillCommand {
+    /// Creates a validated skill command.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for null-containing or oversized arguments.
+    pub fn new(skill_id: SkillId, arguments: impl Into<String>) -> Result<Self, SkillError> {
+        let arguments = arguments.into();
+        if arguments.len() > MAX_SKILL_ARGUMENT_BYTES || arguments.contains('\0') {
+            return Err(SkillError::InvalidArguments);
+        }
+        Ok(Self {
+            skill_id,
+            arguments,
+        })
+    }
+
+    /// Returns the invoked skill.
+    #[must_use]
+    pub const fn skill_id(&self) -> &SkillId {
+        &self.skill_id
+    }
+
+    /// Returns uninterpreted invocation arguments.
+    #[must_use]
+    pub fn arguments(&self) -> &str {
+        &self.arguments
+    }
+}
+
+impl From<SkillInvocation> for SkillCommand {
+    fn from(invocation: SkillInvocation) -> Self {
+        Self {
+            skill_id: invocation.skill_id,
+            arguments: String::new(),
+        }
+    }
+}
+
+impl FromStr for SkillCommand {
+    type Err = SkillError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let remaining = value
+            .strip_prefix("/skill:")
+            .ok_or(SkillError::InvalidCommand)?;
+        let (skill_id, arguments) = remaining
+            .split_once(' ')
+            .map_or((remaining, ""), |(skill_id, arguments)| {
+                (skill_id, arguments.trim_start())
+            });
+        let skill_id = skill_id.parse().map_err(|_| SkillError::InvalidCommand)?;
+        Self::new(skill_id, arguments)
+    }
+}
+
+impl fmt::Display for SkillCommand {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "/skill:{}", self.skill_id)?;
+        if !self.arguments.is_empty() {
+            write!(formatter, " {}", self.arguments)?;
+        }
+        Ok(())
+    }
+}
+
 /// Invalid skill metadata or invocation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
 pub enum SkillError {
@@ -93,4 +181,10 @@ pub enum SkillError {
     /// Invocation is not exact explicit skill syntax.
     #[error("skill invocation must use exact '@skill <skill-id>' syntax")]
     InvalidInvocation,
+    /// Slash command is not canonical skill command syntax.
+    #[error("skill command must use '/skill:<skill-id> [args]' syntax")]
+    InvalidCommand,
+    /// Explicit arguments violate their byte or null bound.
+    #[error("skill command arguments are invalid")]
+    InvalidArguments,
 }

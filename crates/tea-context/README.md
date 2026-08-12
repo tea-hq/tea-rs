@@ -12,7 +12,7 @@ Each `PromptSegment` carries a canonical segment ID, non-empty bounded content, 
 
 ## Provider contract
 
-`ContextProvider` is object-safe and returns a project-owned boxed standard Future. It receives an immutable `ContextRequest` snapshot of the active profile, session, run, canonical active tools, and bounded metadata. Built-in providers perform no I/O: `ToolHintProvider` renders active `ToolSpec::prompt_hint()` guidance, `WorkspaceInstructionProvider` carries caller-supplied documents, `SessionSummaryProvider` inserts an optional durable summary, and `SkillMetadataProvider` exposes metadata with one explicit `@skill <id>` invocation syntax.
+`ContextProvider` is object-safe and returns a project-owned boxed standard Future. It receives an immutable `ContextRequest` snapshot of the active profile, session, run, canonical active tools, and bounded metadata. Built-in providers perform no I/O: `ToolHintProvider` renders active `ToolSpec::prompt_hint()` guidance, `WorkspaceInstructionProvider` carries caller-supplied documents, `SessionSummaryProvider` inserts an optional durable summary, and `SkillMetadataProvider` exposes skill metadata with canonical `/skill:<id> [args]` commands. The legacy `@skill <id>` parser remains available as a compatibility library API; this pure crate does not load skill files or execute skills.
 
 ## Compiler
 

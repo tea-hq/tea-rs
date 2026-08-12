@@ -457,6 +457,7 @@ pub(crate) fn declared_tool_calls(
                 ..
             } => Some((*tool_call_id, tool_name.as_str(), arguments)),
             ContentBlock::Text { .. }
+            | ContentBlock::ContextualText { .. }
             | ContentBlock::Thinking { .. }
             | ContentBlock::Image { .. }
             | ContentBlock::HostedTool { .. }

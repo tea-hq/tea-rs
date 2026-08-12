@@ -30,9 +30,12 @@ tea-session = { version = "=0.1.0", path = "../tea-session" }
 tea-session-sqlite = { version = "=0.1.0", path = "../tea-session-sqlite" }
 tea-tools = { version = "=0.1.0", path = "../tea-tools" }
 chrono.workspace = true
+futures-util.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+serde_yaml.workspace = true
 thiserror.workspace = true
+ignore.workspace = true
 tokio = { workspace = true, features = ["io-util", "rt", "sync", "time"] }
 uuid.workspace = true
 

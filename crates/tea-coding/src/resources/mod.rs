@@ -7,10 +7,10 @@ mod skills;
 
 use std::path::{Path, PathBuf};
 
-use tea_context::{SkillMetadata, WorkspaceInstruction};
+use tea_context::{SkillCommand, SkillMetadata, WorkspaceInstruction};
 
 pub use prompts::PromptTemplate;
-pub use skills::{DiscoveredSkill, LoadedSkill};
+pub use skills::{DiscoveredSkill, LoadedSkill, SkillResourceContent, SkillRoot, SkillSource};
 
 use crate::{CodingError, ProjectAccess};
 
@@ -19,13 +19,23 @@ use crate::{CodingError, ProjectAccess};
 pub struct ResourceDiagnostic {
     code: &'static str,
     subject: String,
+    source: Option<SkillSource>,
 }
 
 impl ResourceDiagnostic {
     pub(crate) fn new(code: &'static str, subject: &str) -> Self {
         Self {
             code,
-            subject: subject.to_owned(),
+            subject: bounded_subject(subject),
+            source: None,
+        }
+    }
+
+    pub(crate) fn skill(code: &'static str, source: SkillSource, subject: &str) -> Self {
+        Self {
+            code,
+            subject: bounded_subject(subject),
+            source: Some(source),
         }
     }
     /// Returns the machine-readable diagnostic code.
@@ -37,6 +47,50 @@ impl ResourceDiagnostic {
     #[must_use]
     pub fn subject(&self) -> &str {
         &self.subject
+    }
+
+    /// Returns the skill source associated with this diagnostic, when present.
+    #[must_use]
+    pub const fn source(&self) -> Option<SkillSource> {
+        self.source
+    }
+}
+
+const MAX_RESOURCE_DIAGNOSTICS: usize = 256;
+const MAX_RESOURCE_DIAGNOSTIC_SUBJECT_BYTES: usize = 512;
+
+fn bounded_subject(subject: &str) -> String {
+    let mut bounded = String::new();
+    for character in subject.chars().filter(|character| !character.is_control()) {
+        if bounded.len() + character.len_utf8() > MAX_RESOURCE_DIAGNOSTIC_SUBJECT_BYTES {
+            break;
+        }
+        bounded.push(character);
+    }
+    bounded
+}
+
+fn append_diagnostics(
+    target: &mut Vec<ResourceDiagnostic>,
+    incoming: impl IntoIterator<Item = ResourceDiagnostic>,
+) {
+    let mut truncated = false;
+    for diagnostic in incoming {
+        if target.len() < MAX_RESOURCE_DIAGNOSTICS - 1 {
+            target.push(diagnostic);
+        } else {
+            truncated = true;
+        }
+    }
+    if truncated
+        && !target
+            .iter()
+            .any(|diagnostic| diagnostic.code() == "resource_diagnostics_truncated")
+    {
+        target.push(ResourceDiagnostic::new(
+            "resource_diagnostics_truncated",
+            "catalog",
+        ));
     }
 }
 
@@ -65,12 +119,53 @@ impl ResourceCatalog {
         global_prompt_root: Option<&Path>,
         project_prompt_root: Option<&Path>,
     ) -> Result<Self, CodingError> {
-        let (context, diagnostics) = context_files::discover(boundary, workspace, access)?;
-        let mut skill_roots = global_skill_roots.to_vec();
-        if access == ProjectAccess::Trusted {
-            skill_roots.extend_from_slice(project_skill_roots);
+        let mut skill_roots =
+            Vec::with_capacity(global_skill_roots.len() + project_skill_roots.len());
+        for path in global_skill_roots {
+            skill_roots.push(SkillRoot::new(path, SkillSource::UserTea)?);
         }
-        let skills = skills::discover(&skill_roots)?;
+        for path in project_skill_roots {
+            skill_roots.push(SkillRoot::new(path, SkillSource::ProjectTea)?);
+        }
+        Self::discover_with_skill_roots(
+            boundary,
+            workspace,
+            access,
+            &skill_roots,
+            global_prompt_root,
+            project_prompt_root,
+        )
+    }
+
+    /// Discovers resources from typed, ordered skill roots.
+    ///
+    /// Project roots are filtered before canonicalization or filesystem
+    /// traversal unless the workspace is trusted. Roots are then merged by
+    /// [`SkillSource`] precedence.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid explicit roots, trusted boundary failures,
+    /// or invalid configured prompt resources.
+    #[allow(clippy::too_many_arguments)]
+    pub fn discover_with_skill_roots(
+        boundary: &Path,
+        workspace: &Path,
+        access: ProjectAccess,
+        skill_roots: &[SkillRoot],
+        global_prompt_root: Option<&Path>,
+        project_prompt_root: Option<&Path>,
+    ) -> Result<Self, CodingError> {
+        let (context, mut diagnostics) = context_files::discover(boundary, workspace, access)?;
+        let allowed_roots = skill_roots
+            .iter()
+            .filter(|root| {
+                access == ProjectAccess::Trusted || !root.source().requires_project_trust()
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        let (skills, skill_diagnostics) = skills::discover(&allowed_roots)?;
+        append_diagnostics(&mut diagnostics, skill_diagnostics);
         let prompts = prompts::discover(
             global_prompt_root,
             (access == ProjectAccess::Trusted)
@@ -133,8 +228,25 @@ impl ResourceCatalog {
     pub fn skill_metadata(&self) -> Vec<SkillMetadata> {
         self.skills
             .iter()
+            .filter(|skill| skill.model_invocable())
             .map(|skill| skill.metadata().clone())
             .collect()
+    }
+
+    /// Loads the winning skill for a typed explicit command.
+    ///
+    /// # Errors
+    ///
+    /// Rejects unknown skills, changed manifests, and unsafe content.
+    pub fn load_skill(&self, command: &SkillCommand) -> Result<LoadedSkill, CodingError> {
+        let skill = self
+            .skills
+            .iter()
+            .find(|skill| skill.metadata().id() == command.skill_id())
+            .ok_or_else(|| {
+                crate::CodingError::new(crate::CodingErrorCode::NotFound, "skill is not registered")
+            })?;
+        skill.load(command)
     }
     /// Loads an explicitly invoked skill.
     ///
@@ -142,26 +254,35 @@ impl ResourceCatalog {
     ///
     /// Rejects unknown or invalid invocation syntax.
     pub fn invoke_skill(&self, invocation: &str) -> Result<LoadedSkill, CodingError> {
-        let name = invocation
-            .strip_prefix("/skill:")
-            .map(|remaining| {
-                remaining
-                    .split_once(' ')
-                    .map_or(remaining, |(name, _)| name)
-            })
-            .filter(|name| !name.is_empty())
-            .ok_or_else(|| {
-                crate::CodingError::new(
-                    crate::CodingErrorCode::InvalidInput,
-                    "skill invocation is invalid",
-                )
-            })?;
-        self.skills
+        let command = invocation.parse::<SkillCommand>().map_err(|_| {
+            crate::CodingError::new(
+                crate::CodingErrorCode::InvalidInput,
+                "skill invocation is invalid",
+            )
+        })?;
+        self.load_skill(&command)
+    }
+
+    /// Reads bounded text from the selected winning skill's resource tree.
+    ///
+    /// # Errors
+    ///
+    /// Rejects unknown skills, invalid relative paths, directories, binary or
+    /// oversized files, changed targets, and resource paths outside the skill.
+    pub fn read_skill_resource(
+        &self,
+        skill_id: &tea_context::SkillId,
+        path: &str,
+        offset: Option<usize>,
+        limit: Option<usize>,
+    ) -> Result<SkillResourceContent, CodingError> {
+        let skill = self
+            .skills
             .iter()
-            .find(|skill| skill.metadata().id().as_str() == name)
+            .find(|skill| skill.metadata().id() == skill_id)
             .ok_or_else(|| {
                 crate::CodingError::new(crate::CodingErrorCode::NotFound, "skill is not registered")
-            })?
-            .invoke(invocation)
+            })?;
+        skill.read_resource(skill_id, path, offset, limit)
     }
 }

@@ -66,6 +66,17 @@ fn user(text: &str) -> CanonicalMessage {
     )
     .unwrap()
 }
+fn user_with_context(text: &str, context: &str) -> CanonicalMessage {
+    CanonicalMessage::user(
+        MessageId::from_str("0195a0b1-5e52-74b2-8c25-0aa7aa000025").unwrap(),
+        vec![
+            ContentBlock::text(text).unwrap(),
+            ContentBlock::contextual_text(context).unwrap(),
+        ],
+        now(),
+    )
+    .unwrap()
+}
 fn assistant_text(text: &str) -> CanonicalMessage {
     CanonicalMessage::assistant(
         MessageId::from_str("0195a0b1-5e53-74b2-8c25-0aa7aa000026").unwrap(),
@@ -169,6 +180,34 @@ fn maps_system_prompt_as_first_message() {
     let messages = body["messages"].as_array().unwrap();
     assert_eq!(messages[0]["role"], "system");
     assert_eq!(messages[0]["content"], "you are helpful");
+}
+
+#[test]
+fn maps_contextual_user_text_to_both_openai_request_shapes() {
+    let request = ModelRequest::new(
+        ModelId::from_str("gpt-4o-mini").unwrap(),
+        vec![user_with_context(
+            "/skill:review src",
+            "private review instructions",
+        )],
+    )
+    .unwrap();
+
+    let chat = build_chat_completions_body(&request, &config()).unwrap();
+    assert_eq!(
+        chat["messages"][0]["content"],
+        "/skill:review srcprivate review instructions"
+    );
+
+    let responses = build_responses_body(&request, &responses_config()).unwrap();
+    assert_eq!(
+        responses["input"][0]["content"][0]["text"],
+        "/skill:review src"
+    );
+    assert_eq!(
+        responses["input"][0]["content"][1]["text"],
+        "private review instructions"
+    );
 }
 
 #[test]

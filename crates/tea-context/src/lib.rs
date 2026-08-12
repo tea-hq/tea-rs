@@ -42,4 +42,7 @@ pub use providers::{
 pub use segment::{
     BudgetBehavior, ConflictClaim, ConflictMode, MAX_SEGMENT_BYTES, PromptSegment, SegmentError,
 };
-pub use skill::{MAX_SKILL_DESCRIPTION_BYTES, SkillError, SkillInvocation, SkillMetadata};
+pub use skill::{
+    MAX_SKILL_ARGUMENT_BYTES, MAX_SKILL_DESCRIPTION_BYTES, SkillCommand, SkillError,
+    SkillInvocation, SkillMetadata,
+};

@@ -232,7 +232,9 @@ fn map_assistant(
                     items.push(ResponsesInputItem::ProviderContinuation(item));
                 }
             }
-            ContentBlock::Thinking { .. } | ContentBlock::Image { .. } => {}
+            ContentBlock::ContextualText { .. }
+            | ContentBlock::Thinking { .. }
+            | ContentBlock::Image { .. } => {}
         }
     }
     flush_assistant_message(
@@ -437,7 +439,9 @@ fn map_input_content(content: &[ContentBlock]) -> Vec<ResponsesContentItem> {
     content
         .iter()
         .filter_map(|block| match block {
-            ContentBlock::Text { text } | ContentBlock::Thinking { text } => {
+            ContentBlock::Text { text }
+            | ContentBlock::ContextualText { text }
+            | ContentBlock::Thinking { text } => {
                 Some(ResponsesContentItem::InputText { text: text.clone() })
             }
             ContentBlock::Image { mime_type, source } => Some(ResponsesContentItem::InputImage {
@@ -461,7 +465,9 @@ fn map_tool_output(content: &[ContentBlock]) -> FunctionCallOutputPayload {
     let text = content
         .iter()
         .filter_map(|block| match block {
-            ContentBlock::Text { text } | ContentBlock::Thinking { text } => Some(text.as_str()),
+            ContentBlock::Text { text }
+            | ContentBlock::ContextualText { text }
+            | ContentBlock::Thinking { text } => Some(text.as_str()),
             _ => None,
         })
         .collect::<Vec<_>>()

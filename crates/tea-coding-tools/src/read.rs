@@ -10,7 +10,7 @@ use tea_tools::{
     ToolTimeout, ToolVersion, ValidatedToolInvocation,
 };
 
-use crate::file::{DEFAULT_READ_LINE_LIMIT, MAX_READ_LINE_LIMIT, read_utf8};
+use crate::file::{DEFAULT_READ_LINE_LIMIT, MAX_READ_LINE_LIMIT, read_bounded_utf8};
 use crate::output::{failure, success};
 use crate::{FileToolError, FileToolErrorCode, WorkspaceRoot};
 
@@ -81,7 +81,7 @@ impl ReadTool {
         let offset = integer_argument(invocation, "offset")?.unwrap_or(1);
         let limit = integer_argument(invocation, "limit")?.unwrap_or(DEFAULT_READ_LINE_LIMIT);
         let target = self.workspace.resolve_existing(path)?;
-        let source = read_utf8(&self.workspace, &target, crate::MAX_READ_BYTES)?;
+        let source = read_bounded_utf8(&self.workspace, &target, crate::MAX_READ_BYTES)?;
         let lines = source.split_inclusive('\n').collect::<Vec<_>>();
         let start_index = offset.saturating_sub(1).min(lines.len());
         let end_index = start_index.saturating_add(limit).min(lines.len());

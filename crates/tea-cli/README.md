@@ -21,9 +21,12 @@ tea --continue --trust once "inspect the current changes"
 Interactive mode is selected when stdin and stdout are terminals; piped stdin selects print mode automatically. Its bounded Unicode multiline editor supports grapheme-safe movement/deletion, atomic bracketed paste, undo, local history, command completion, streaming updates, steering, follow-up queues, cancellation, and model/session/tree selectors. Enter submits while idle and steers while running, Alt+Enter queues a follow-up, Escape aborts, Shift+Enter inserts a newline, and Ctrl+D exits. All bindings are configurable in nested TUI settings and ambiguous configurations fail closed.
 
 Built-ins are `/new`, `/resume`, `/session`, `/name`, `/model`, `/reasoning`,
-`/compact`, `/tree`, `/fork`, `/image`, `/copy`, `/mcp`, `/help`, and `/quit`.
-Trusted prompt templates are exposed as slash commands and trusted skills as
-`/skill:<name>`. Clipboard writes use an explicit host adapter and never enter
+`/compact`, `/tree`, `/fork`, `/image`, `/copy`, `/mcp`, `/skills`, `/help`, and
+`/quit`. Trusted prompt templates are exposed as slash commands and trusted
+skills as `/skill:<id> [args]`. `/skills` is a read-only view of the immutable
+startup catalog; it shows every winning skill, including
+`disable-model-invocation: true` skills, with source provenance and no manifest
+paths. Clipboard writes use an explicit host adapter and never enter
 an inward runtime crate. Session and tree selectors are projections of the
 catalog and canonical append-only branch records. Switching sessions replaces
 the event subscription and rebuilds durable state; steering/follow-up display
@@ -46,6 +49,32 @@ Prompt arguments, workspace-confined `@file` content, and piped UTF-8 stdin are 
 Shared options cover cwd, provider/model/profile, an invocation-local redacted `--api-key`, tools, explicit context files, new/continue/explicit/in-memory sessions, application state paths, project trust, and verbosity. Non-interactive default trust fails closed only when project-local resources exist and no saved decision applies; `--trust once`, `persist`, `reject`, and `ignore` are explicit alternatives. Project settings and declarative resources remain workspace-confined even when trusted.
 
 Stable non-zero process categories are: usage `2`, trust/config `3`, provider `4`, policy/approval `5`, cancellation `6`, and internal/persistence `70`. `SIGINT` cooperatively cancels the owned run and leaves stdout empty.
+
+## Skill resources
+
+The catalog considers these roots from highest to lowest precedence:
+
+1. explicitly configured `resources.skillPaths`, in configured order;
+2. the trusted workspace `.tea/skills` directory;
+3. the trusted workspace `.agents/skills` directory;
+4. the user Tea config `skills` directory, normally `~/.tea/skills`;
+5. the user `.agents/skills` directory; and
+6. the Tea data `skills` directory.
+
+Directory roots recursively discover `SKILL.md`, honoring `.gitignore`,
+`.ignore`, and `.fdignore`, skipping hidden directories and `node_modules`, and
+stopping below a directory that already contains a skill manifest. Ordinary
+root-level `.md` files are accepted only through an explicit
+`resources.skillPaths` entry. Both project roots are trust-gated, and only the
+workspace-root `.agents/skills` is scanned; ancestor directories are not
+searched.
+
+`read_skill_resource` is the dedicated read-only capability for files beneath
+the winning skill directory. It enforces relative-path containment, bounded
+UTF-8 reads, and race-checked file identity. It cannot write, install, or
+execute a skill's scripts; the existing `bash` capability remains
+workspace-rooted. The catalog is a startup snapshot, so filesystem changes are
+observed after rebuilding or restarting the service.
 
 Select built-in `openai` or `anthropic`, or an OpenAI-compatible provider from `<config-dir>/providers.json` or trusted `.tea/providers.json`, with `--provider` or `TEA_PROVIDER`; `--model` takes precedence over environment/global/project/default configuration. OpenAI-compatible connections use configured fields with `TEA_OPENAI_*` fallback; Anthropic Messages connections use `TEA_ANTHROPIC_API_KEY` and optional `TEA_ANTHROPIC_BASE_URL`. API keys are resolved through redacting credential ports and are not persisted. See the public [configuration guide](https://github.com/tea-hq/tea-docs/blob/main/src/content/docs/configuration/settings.md) for the settings precedence, trust boundary, and credential references.
 

@@ -28,6 +28,7 @@ use crate::config::{
 use crate::mcp_policy::CodingMcpPolicy;
 use crate::profile::{coding_identity_provider, coding_profile};
 use crate::resources::ResourceCatalog;
+use crate::skill_tool::{ReadSkillResourceTool, SkillResourceResolver};
 use crate::{CodingAgentService, CodingError, CodingErrorCode};
 
 /// Product builder assembling one mode-neutral coding service.
@@ -35,7 +36,7 @@ use crate::{CodingAgentService, CodingError, CodingErrorCode};
 pub struct CodingAgentBuilder {
     providers: Vec<Arc<dyn ModelProvider>>,
     workspace: WorkspaceRoot,
-    resources: ResourceCatalog,
+    resources: Arc<ResourceCatalog>,
     store: Arc<dyn SessionStore>,
     catalog: Arc<dyn SessionCatalog>,
     bash: BashConfig,
@@ -71,7 +72,7 @@ impl CodingAgentBuilder {
         Self {
             providers: vec![provider],
             workspace,
-            resources,
+            resources: Arc::new(resources),
             store: session_store,
             catalog: session_catalog,
             bash,
@@ -153,7 +154,8 @@ impl CodingAgentBuilder {
     /// Returns a bounded product error for any invalid contract or registration.
     pub fn build(self) -> Result<CodingAgentService, CodingError> {
         crate::config::validate(&self.settings)?;
-        let profile = coding_profile(&self.settings, self.execution_surface)?;
+        let has_skills = !self.resources.skills().is_empty();
+        let profile = coding_profile(&self.settings, self.execution_surface, has_skills)?;
         let retry_attempts = self.settings.max_retries.saturating_add(1);
         let default_reasoning_effort =
             ReasoningEffort::from_str(&self.settings.thinking).map_err(|_| invalid_settings())?;
@@ -206,7 +208,12 @@ impl CodingAgentBuilder {
                 Arc::new(CodingMcpPolicy),
             )
             .map_err(|_| runtime_error())?;
-        builder = register_native_tools(builder, &self.workspace, self.bash)?;
+        builder = register_native_tools(
+            builder,
+            &self.workspace,
+            self.bash,
+            Arc::clone(&self.resources),
+        )?;
         builder = register_web_search(builder, &self.settings.web_search, self.search_provider)?;
         builder = register_web_fetch(
             builder,
@@ -301,6 +308,7 @@ fn register_native_tools(
     mut builder: AgentRuntimeBuilder,
     workspace: &WorkspaceRoot,
     bash: BashConfig,
+    resources: Arc<ResourceCatalog>,
 ) -> Result<AgentRuntimeBuilder, CodingError> {
     builder = builder
         .tool(
@@ -346,7 +354,7 @@ fn register_native_tools(
             Arc::new(EditTool::new(workspace.clone())),
         )
         .map_err(|_| runtime_error())?;
-    builder
+    builder = builder
         .tool(
             BashTool::spec().map_err(|_| runtime_error())?,
             Arc::new(
@@ -357,7 +365,17 @@ fn register_native_tools(
             ),
             Arc::new(BashTool::new(workspace.clone(), bash)),
         )
-        .map_err(|_| runtime_error())
+        .map_err(|_| runtime_error())?;
+    if !resources.skills().is_empty() {
+        builder = builder
+            .tool(
+                ReadSkillResourceTool::spec().map_err(|_| runtime_error())?,
+                Arc::new(SkillResourceResolver),
+                Arc::new(ReadSkillResourceTool::new(resources)),
+            )
+            .map_err(|_| runtime_error())?;
+    }
+    Ok(builder)
 }
 
 fn register_mcp_tools(

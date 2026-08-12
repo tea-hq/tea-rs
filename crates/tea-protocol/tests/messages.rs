@@ -14,6 +14,7 @@ const TIMESTAMP: &str = "2026-07-23T09:30:12.124Z";
 #[test]
 fn content_blocks_use_internal_type_tags() {
     let text = ContentBlock::text("hello").unwrap();
+    let context = ContentBlock::contextual_text("hidden instructions").unwrap();
     let thinking = ContentBlock::thinking("checking").unwrap();
     let image = ContentBlock::inline_image("image/png", "aGVsbG8=").unwrap();
     let reference = ContentBlock::image_reference("image/jpeg", "artifact:image-1").unwrap();
@@ -34,6 +35,14 @@ fn content_blocks_use_internal_type_tags() {
     assert_eq!(
         serde_json::to_value(text).unwrap(),
         json!({"type":"text","text":"hello"})
+    );
+    assert_eq!(
+        serde_json::to_value(&context).unwrap(),
+        json!({"type":"contextual_text","text":"hidden instructions"})
+    );
+    assert_eq!(
+        serde_json::from_value::<ContentBlock>(serde_json::to_value(&context).unwrap()).unwrap(),
+        context
     );
     assert_eq!(
         serde_json::to_value(thinking).unwrap(),
@@ -190,6 +199,34 @@ fn hosted_content_is_assistant_only() {
 
     assert!(CanonicalMessage::user(message_id, vec![block.clone()], timestamp).is_err());
     CanonicalMessage::assistant(message_id, vec![block], StopReason::Completed, timestamp).unwrap();
+}
+
+#[test]
+fn contextual_content_is_user_only() {
+    let timestamp = ProtocolTimestamp::from_str(TIMESTAMP).unwrap();
+    let message_id = MessageId::from_str(MESSAGE_ID).unwrap();
+    let block = ContentBlock::contextual_text("model-visible hidden context").unwrap();
+
+    CanonicalMessage::user(message_id, vec![block.clone()], timestamp).unwrap();
+    assert!(
+        CanonicalMessage::assistant(
+            message_id,
+            vec![block.clone()],
+            StopReason::Completed,
+            timestamp
+        )
+        .is_err()
+    );
+    assert!(
+        CanonicalMessage::tool_result_success(
+            message_id,
+            ToolCallId::from_str(TOOL_CALL_ID).unwrap(),
+            "read_file",
+            vec![block],
+            timestamp,
+        )
+        .is_err()
+    );
 }
 
 #[test]

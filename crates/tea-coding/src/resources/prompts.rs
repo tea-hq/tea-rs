@@ -2,10 +2,20 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use crate::resources::frontmatter::{field, parse};
+use serde::Deserialize;
+
+use crate::resources::frontmatter::parse;
 use crate::{CodingError, CodingErrorCode};
 
 const MAX_TEMPLATES: usize = 128;
+
+#[derive(Debug, Deserialize)]
+struct PromptFrontmatter {
+    name: String,
+    description: String,
+    #[serde(flatten)]
+    defaults: BTreeMap<String, String>,
+}
 
 /// Validated non-executable Markdown prompt template.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -105,18 +115,21 @@ fn load_layer(root: &Path) -> Result<Vec<PromptTemplate>, CodingError> {
     paths.sort();
     let mut layer = BTreeMap::new();
     for path in paths {
-        let document = parse(&fs::read_to_string(path).map_err(|_| not_found())?)?;
-        let name = field(&document, "name")?.to_owned();
-        let description = field(&document, "description")?.to_owned();
+        let document =
+            parse::<PromptFrontmatter>(&fs::read_to_string(path).map_err(|_| not_found())?)?;
+        let PromptFrontmatter {
+            name,
+            description,
+            defaults,
+        } = document.metadata;
         if !valid_name(&name) {
             return Err(invalid());
         }
-        let defaults = document
-            .fields
-            .iter()
+        let defaults = defaults
+            .into_iter()
             .filter_map(|(key, value)| {
                 key.strip_prefix("default_")
-                    .map(|name| (name.to_owned(), value.clone()))
+                    .map(|name| (name.to_owned(), value))
             })
             .collect();
         let template = PromptTemplate {

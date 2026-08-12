@@ -88,7 +88,9 @@ fn message_text_bytes(message: &CanonicalMessage) -> usize {
 
 fn content_block_bytes(block: &ContentBlock) -> usize {
     match block {
-        ContentBlock::Text { text } | ContentBlock::Thinking { text } => text.len(),
+        ContentBlock::Text { text }
+        | ContentBlock::ContextualText { text }
+        | ContentBlock::Thinking { text } => text.len(),
         ContentBlock::ToolCall { arguments, .. } => {
             serde_json::to_vec(arguments).map_or(0, |vec| vec.len())
         }
