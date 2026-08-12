@@ -2,7 +2,8 @@ use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::Color;
 use tea_cli::tui::{
-    Action, CommandCompletion, ComposerAttachment, Overlay, Renderer, Theme, TuiState, reduce,
+    Action, CommandCompletion, CommandCompletionItem, CommandCompletionKind, ComposerAttachment,
+    Overlay, Renderer, Theme, TuiState, reduce,
 };
 use tea_protocol::{AgentEvent, EventDelta, ReasoningEffort, RunStatus};
 use unicode_width::UnicodeWidthStr as _;
@@ -677,6 +678,57 @@ async fn composer_surface_reaches_terminal_edges_at_narrow_and_wide_sizes() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn selected_skill_mention_is_colored_inside_the_composer_surface() {
+    let snapshot = common::archive_snapshot().await;
+    let mut state = TuiState::from_snapshot(&snapshot, common::startup());
+    let _ = reduce(
+        &mut state,
+        Action::SetComposer {
+            text: "$review help me".to_owned(),
+            skill_mention: Some("$review".to_owned()),
+        },
+    );
+    let theme = Theme::default();
+    let area = Rect::new(0, 0, 40, 12);
+    let mut buffer = Buffer::empty(area);
+    Renderer::new().render(&state, area, &mut buffer, &theme);
+    let row = buffer
+        .content
+        .chunks(usize::from(area.width))
+        .find(|row| {
+            row.iter()
+                .map(ratatui::buffer::Cell::symbol)
+                .collect::<String>()
+                .contains("$review help me")
+        })
+        .expect("selected skill draft must be rendered");
+    let start = row
+        .windows("$review".len())
+        .position(|cells| {
+            cells
+                .iter()
+                .map(ratatui::buffer::Cell::symbol)
+                .collect::<String>()
+                == "$review"
+        })
+        .expect("skill mention cells must be contiguous");
+
+    assert!(
+        row[start..start + "$review".len()]
+            .iter()
+            .all(|cell| cell.style().fg == theme.editor.fg),
+        "mention styles: {:?}; expected {:?}",
+        row[start..start + "$review".len()]
+            .iter()
+            .map(|cell| (cell.symbol(), cell.style()))
+            .collect::<Vec<_>>(),
+        theme.editor
+    );
+    assert_eq!(row[start + "$review".len()].style().fg, theme.composer.fg);
+    assert!(row.iter().all(|cell| cell.style().bg == theme.composer.bg));
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn idle_composer_uses_a_muted_prompt_surface_without_a_banner_or_divider() {
     let snapshot = common::archive_snapshot().await;
     let state = TuiState::from_snapshot(&snapshot, common::startup());
@@ -794,8 +846,9 @@ async fn modal_surfaces_render_above_the_composer_with_approval_priority() {
     let _ = reduce(
         &mut state,
         Action::SetOverlay(Some(Overlay::CommandCompletion(CommandCompletion::new([
-            "/help".to_owned(),
-            "/model".to_owned(),
+            CommandCompletionItem::new("/help", CommandCompletionKind::Command),
+            CommandCompletionItem::new("/review", CommandCompletionKind::Prompt),
+            CommandCompletionItem::new("/frontend-design", CommandCompletionKind::Skill),
         ])))),
     );
     let area = Rect::new(0, 0, 80, 24);
@@ -814,13 +867,25 @@ async fn modal_surfaces_render_above_the_composer_with_approval_priority() {
         .collect::<Vec<_>>();
     let modal_row = rows
         .iter()
-        .position(|row| row.contains("commands: select command"))
+        .position(|row| row.contains("completions: select item"))
         .expect("command completion must be visible");
     let composer_row = rows
         .iter()
         .position(|row| row.contains("› preserved draft"))
         .expect("draft must remain visible");
     assert!(modal_row < composer_row, "rows: {rows:?}");
+    let completion_rows = rows
+        .iter()
+        .filter(|row| {
+            row.contains("[command]") || row.contains("[prompt]") || row.contains("[skill]")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(completion_rows.len(), 3, "completion rows: {rows:?}");
+    let type_columns = completion_rows
+        .iter()
+        .filter_map(|row| row.find('[').map(|index| row[..index].width()))
+        .collect::<Vec<_>>();
+    assert!(type_columns.windows(2).all(|pair| pair[0] == pair[1]));
 
     let pending = common::pending_snapshot().await;
     let mut approval_state = TuiState::from_snapshot(&pending, common::startup());
@@ -843,8 +908,73 @@ async fn modal_surfaces_render_above_the_composer_with_approval_priority() {
         .collect::<Vec<_>>()
         .join("\n");
     assert!(approval_frame.contains("approval required"));
-    assert!(!approval_frame.contains("commands: select command"));
+    assert!(!approval_frame.contains("completions: select item"));
     assert!(approval_frame.contains("› Ask Tea to do anything"));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn skill_completion_names_align_with_descriptions_and_stay_single_line() {
+    let snapshot = common::archive_snapshot().await;
+    let mut state = TuiState::from_snapshot(&snapshot, common::startup());
+    let _ = reduce(
+        &mut state,
+        Action::SetOverlay(Some(Overlay::CommandCompletion(CommandCompletion::new([
+            CommandCompletionItem::new("$frontend-design", CommandCompletionKind::Skill)
+                .with_description("Create distinctive,\nproduction-grade frontend interfaces."),
+            CommandCompletionItem::new("$design-taste-frontend", CommandCompletionKind::Skill)
+                .with_description("Anti-slop frontend skill for landing pages and redesigns."),
+        ])))),
+    );
+    let theme = Theme::default();
+    let mut renderer = Renderer::new();
+    let area = Rect::new(0, 0, 80, 16);
+    let mut buffer = Buffer::empty(area);
+    renderer.render(&state, area, &mut buffer, &theme);
+    let rows = buffer
+        .content
+        .chunks(usize::from(area.width))
+        .map(|row| {
+            row.iter()
+                .map(ratatui::buffer::Cell::symbol)
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>();
+    let frame = rows.join("\n");
+    assert!(frame.contains("skills: select skill"));
+    assert!(frame.contains("[skill] Create distinctive, production-grade"));
+    assert!(frame.contains("[skill] Anti-slop frontend skill"));
+    let type_columns = rows
+        .iter()
+        .filter_map(|row| row.find("[skill]").map(|index| row[..index].width()))
+        .collect::<Vec<_>>();
+    assert_eq!(type_columns.len(), 2, "skill rows: {rows:?}");
+    assert_eq!(type_columns[0], type_columns[1]);
+
+    let narrow_area = Rect::new(0, 0, 28, 16);
+    let mut narrow_buffer = Buffer::empty(narrow_area);
+    renderer.render(&state, narrow_area, &mut narrow_buffer, &theme);
+    let narrow_rows = narrow_buffer
+        .content
+        .chunks(usize::from(narrow_area.width))
+        .map(|row| {
+            row.iter()
+                .map(ratatui::buffer::Cell::symbol)
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>();
+    let option_rows = narrow_rows
+        .iter()
+        .enumerate()
+        .filter_map(|(index, row)| {
+            (row.contains("$frontend") || row.contains("$design")).then_some(index)
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(option_rows.len(), 2, "narrow rows: {narrow_rows:?}");
+    assert_eq!(
+        option_rows[1],
+        option_rows[0] + 1,
+        "descriptions must not wrap into extra menu rows: {narrow_rows:?}"
+    );
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -1226,6 +1356,31 @@ async fn mcp_health_rows_render_as_bounded_notices() {
     assert!(frame.contains("docs.search · ready"));
     assert!(frame.contains("files.read · disconnected"));
     assert!(frame.contains("•"));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn skill_catalog_rows_render_without_manifest_paths() {
+    let snapshot = common::archive_snapshot().await;
+    let mut state = TuiState::from_snapshot(&snapshot, common::startup());
+    let manifest_path = "/Users/example/.agents/skills/manual/SKILL.md";
+    let _ = reduce(
+        &mut state,
+        Action::SetSkillCatalog(vec![
+            "manual-only [project-agents; explicit-only] - Explicit invocation only".to_owned(),
+            "review [user-tea] - Review code safely".to_owned(),
+        ]),
+    );
+
+    let theme = Theme::default();
+    let frame = Renderer::new()
+        .lines(&state, 80, &theme)
+        .iter()
+        .map(tea_cli::tui::RenderedLine::text)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(frame.contains("manual-only [project-agents; explicit-only]"));
+    assert!(frame.contains("review [user-tea] - Review code safely"));
+    assert!(!frame.contains(manifest_path));
 }
 
 #[tokio::test(flavor = "current_thread")]

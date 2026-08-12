@@ -3,7 +3,7 @@ use std::sync::{Arc, Mutex};
 
 use tea_cli::tui::{
     Action, ActionLoop, ComposerAttachment, DispatchError, Effect, EffectExecutor,
-    MAX_COMPOSER_IMAGE_BASE64_BYTES, Presentation, TuiState, reduce,
+    MAX_COMPOSER_IMAGE_BASE64_BYTES, MAX_SKILL_CATALOG_ROWS, Presentation, TuiState, reduce,
 };
 use tea_protocol::{
     AgentEvent, EventDelta, HostedToolError, HostedToolOutcome, RunStatus, TokenCount, Usage,
@@ -68,6 +68,22 @@ async fn new_run_clears_transient_notifications_from_the_previous_turn() {
         ))),
     );
     assert!(Presentation::from_state(&state).notifications().is_empty());
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn skill_catalog_is_bounded_and_sanitized_as_ephemeral_state() {
+    let snapshot = common::archive_snapshot().await;
+    let mut state = TuiState::from_snapshot(&snapshot, common::startup());
+    let rows = (0..=MAX_SKILL_CATALOG_ROWS)
+        .map(|index| format!("skill-{index}\n"))
+        .collect::<Vec<_>>();
+
+    let effects = reduce(&mut state, Action::SetSkillCatalog(rows));
+
+    assert_eq!(effects, [Effect::Render]);
+    assert_eq!(state.skill_catalog().len(), MAX_SKILL_CATALOG_ROWS);
+    assert_eq!(state.skill_catalog()[0], "skill-0");
+    assert!(!state.skill_catalog().iter().any(|row| row.contains('\n')));
 }
 
 #[tokio::test(flavor = "current_thread")]

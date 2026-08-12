@@ -1,62 +1,63 @@
-use std::collections::BTreeMap;
-
 use crate::{CodingError, CodingErrorCode};
+use serde::de::DeserializeOwned;
 
 pub(crate) const MAX_RESOURCE_BYTES: usize = 128 * 1024;
 const MAX_FRONTMATTER_BYTES: usize = 16 * 1024;
 
-pub(crate) struct FrontmatterDocument {
-    pub(crate) fields: BTreeMap<String, String>,
+pub(crate) struct FrontmatterDocument<T> {
+    pub(crate) metadata: T,
     pub(crate) body: String,
 }
 
-pub(crate) fn parse(source: &str) -> Result<FrontmatterDocument, CodingError> {
-    if source.len() > MAX_RESOURCE_BYTES || !source.starts_with("---\n") {
+pub(crate) fn parse<T: DeserializeOwned>(
+    source: &str,
+) -> Result<FrontmatterDocument<T>, CodingError> {
+    if source.len() > MAX_RESOURCE_BYTES {
         return Err(invalid());
     }
-    let remaining = &source[4..];
-    let end = remaining.find("\n---\n").ok_or_else(invalid)?;
-    if end > MAX_FRONTMATTER_BYTES {
+    let opening_len = if source.starts_with("---\r\n") {
+        5
+    } else if source.starts_with("---\n") {
+        4
+    } else {
         return Err(invalid());
-    }
-    let mut fields = BTreeMap::new();
-    for line in remaining[..end].lines() {
-        let (key, value) = line.split_once(':').ok_or_else(invalid)?;
-        let key = key.trim();
-        let value = value.trim();
-        if !valid_key(key)
-            || value.is_empty()
-            || value.len() > 4096
-            || value.chars().any(char::is_control)
-            || fields.insert(key.to_owned(), value.to_owned()).is_some()
-        {
-            return Err(invalid());
+    };
+    let mut cursor = opening_len;
+    let mut closing = None;
+    while cursor < source.len() {
+        let line_end = source[cursor..]
+            .find('\n')
+            .map_or(source.len(), |offset| cursor + offset + 1);
+        let line = source[cursor..line_end]
+            .strip_suffix('\n')
+            .unwrap_or(&source[cursor..line_end])
+            .strip_suffix('\r')
+            .unwrap_or_else(|| {
+                source[cursor..line_end]
+                    .strip_suffix('\n')
+                    .unwrap_or(&source[cursor..line_end])
+            });
+        if line == "---" {
+            closing = Some((cursor, line_end));
+            break;
         }
+        cursor = line_end;
     }
-    let body = remaining[end + 5..].to_owned();
+    let (frontmatter_end, body_start) = closing.ok_or_else(invalid)?;
+    if frontmatter_end - opening_len > MAX_FRONTMATTER_BYTES {
+        return Err(invalid());
+    }
+    let frontmatter = &source[opening_len..frontmatter_end];
+    let value = serde_yaml::from_str::<serde_yaml::Value>(frontmatter).map_err(|_| invalid())?;
+    if !value.is_mapping() {
+        return Err(invalid());
+    }
+    let metadata = serde_yaml::from_value::<T>(value).map_err(|_| invalid())?;
+    let body = source[body_start..].to_owned();
     if body.is_empty() || body.contains('\0') {
         return Err(invalid());
     }
-    Ok(FrontmatterDocument { fields, body })
-}
-
-fn valid_key(value: &str) -> bool {
-    !value.is_empty()
-        && value.len() <= 64
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
-}
-
-pub(crate) fn field<'a>(
-    document: &'a FrontmatterDocument,
-    name: &str,
-) -> Result<&'a str, CodingError> {
-    document
-        .fields
-        .get(name)
-        .map(String::as_str)
-        .ok_or_else(invalid)
+    Ok(FrontmatterDocument { metadata, body })
 }
 
 pub(crate) fn invalid() -> CodingError {

@@ -14,7 +14,7 @@ use tea_coding::config::{
 use tea_coding::mcp_config::{
     McpEnvironmentValue, ProcessMcpEnvironmentResolver, resolve_mcp_environment,
 };
-use tea_coding::resources::ResourceCatalog;
+use tea_coding::resources::{ResourceCatalog, SkillRoot, SkillSource};
 use tea_coding::{
     AppPaths, CodingAgentBuilder, CodingAgentService, InteractionMode, McpEnvironmentResolver,
     PersistedTrustDecision, ProjectAccess, ProjectTrustStore, TrustRequest,
@@ -414,35 +414,53 @@ impl CliBootstrap {
             }));
         }
 
-        let mut global_skills = vec![paths.data_dir().join("skills")];
+        let mut skill_roots = Vec::with_capacity(settings.resources.skill_paths.len() + 5);
         for path in &settings.resources.skill_paths {
-            global_skills.push(
-                workspace
-                    .resolve_existing(path)
-                    .map_err(|_| config_failure("configured skill path is invalid"))?
-                    .host_path()
-                    .to_path_buf(),
+            let resolved = workspace
+                .resolve_existing(path)
+                .map_err(|_| config_failure("configured skill path is invalid"))?;
+            skill_roots.push(
+                SkillRoot::new(resolved.host_path().to_path_buf(), SkillSource::Explicit)
+                    .map_err(|_| config_failure("configured skill path is invalid"))?,
             );
         }
-        let project_skills = if access == tea_coding::ProjectAccess::Trusted {
-            optional_project_directory(&workspace, ".tea/skills")?
-                .into_iter()
-                .collect::<Vec<_>>()
-        } else {
-            Vec::new()
-        };
+        for (path, source) in [
+            (
+                workspace.host_path().join(".tea/skills"),
+                SkillSource::ProjectTea,
+            ),
+            (
+                workspace.host_path().join(".agents/skills"),
+                SkillSource::ProjectAgents,
+            ),
+            (paths.config_dir().join("skills"), SkillSource::UserTea),
+        ] {
+            skill_roots.push(
+                SkillRoot::new(path, source)
+                    .map_err(|_| config_failure("skill root is invalid"))?,
+            );
+        }
+        if let Some(home) = &self.environment.home_dir {
+            skill_roots.push(
+                SkillRoot::new(home.join(".agents/skills"), SkillSource::UserAgents)
+                    .map_err(|_| config_failure("skill root is invalid"))?,
+            );
+        }
+        skill_roots.push(
+            SkillRoot::new(paths.data_dir().join("skills"), SkillSource::TeaData)
+                .map_err(|_| config_failure("skill root is invalid"))?,
+        );
         let global_prompts = paths.data_dir().join("prompts");
         let project_prompts = if access == tea_coding::ProjectAccess::Trusted {
             optional_project_directory(&workspace, ".tea/prompts")?
         } else {
             None
         };
-        let mut resources = ResourceCatalog::discover(
+        let mut resources = ResourceCatalog::discover_with_skill_roots(
             workspace.host_path(),
             workspace.host_path(),
             access,
-            &global_skills,
-            &project_skills,
+            &skill_roots,
             Some(&global_prompts),
             project_prompts.as_deref(),
         )
@@ -647,6 +665,7 @@ impl CliBootstrap {
             workspace.host_path().join("AGENTS.md"),
             workspace.host_path().join("CLAUDE.md"),
             workspace.host_path().join(".tea"),
+            workspace.host_path().join(".agents/skills"),
         ]
         .iter()
         .any(|path| path.exists());

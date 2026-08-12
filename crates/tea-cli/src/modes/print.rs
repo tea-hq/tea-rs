@@ -215,7 +215,8 @@ fn final_assistant_text(messages: &[CanonicalMessage]) -> Option<String> {
         .iter()
         .filter_map(|block| match block {
             ContentBlock::Text { text } => Some(text.as_str()),
-            ContentBlock::Thinking { .. }
+            ContentBlock::ContextualText { .. }
+            | ContentBlock::Thinking { .. }
             | ContentBlock::Image { .. }
             | ContentBlock::ToolCall { .. }
             | ContentBlock::HostedTool { .. }

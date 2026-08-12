@@ -60,6 +60,18 @@ fn user(text: &str) -> CanonicalMessage {
     .unwrap()
 }
 
+fn user_with_context(text: &str, context: &str) -> CanonicalMessage {
+    CanonicalMessage::user(
+        MessageId::from_str("0195a0b1-5e52-74b2-8c25-0aa7aa000025").unwrap(),
+        vec![
+            ContentBlock::text(text).unwrap(),
+            ContentBlock::contextual_text(context).unwrap(),
+        ],
+        now(),
+    )
+    .unwrap()
+}
+
 fn web_search(options: WebSearchOptions) -> ModelToolDefinition {
     ModelToolDefinition::hosted(
         "Searches the public web.",
@@ -139,6 +151,28 @@ fn maps_messages_tools_and_results_to_anthropic_shape() {
         provider_call_id
     );
     assert_eq!(body["tools"][0]["input_schema"]["type"], "object");
+}
+
+#[test]
+fn maps_contextual_user_text_as_model_visible_anthropic_content() {
+    let request = ModelRequest::new(
+        ModelId::from_str("claude-sonnet-4-20250514").unwrap(),
+        vec![user_with_context(
+            "/skill:review src",
+            "private review instructions",
+        )],
+    )
+    .unwrap();
+
+    let body = build_messages_body(&request, &config()).unwrap();
+    assert_eq!(
+        body["messages"][0]["content"][0]["text"],
+        "/skill:review src"
+    );
+    assert_eq!(
+        body["messages"][0]["content"][1]["text"],
+        "private review instructions"
+    );
 }
 
 #[test]

@@ -57,3 +57,66 @@ fn project_template_overrides_global_and_expansion_is_single_pass() {
     assert_eq!(ignored.prompts()[0].description(), "global");
     fs::remove_dir_all(root).unwrap();
 }
+
+#[test]
+fn frontmatter_accepts_crlf_and_quoted_colons() {
+    let root = std::env::temp_dir().join(format!(
+        "coding-prompts-frontmatter-{}-{}",
+        std::process::id(),
+        ID.fetch_add(1, Ordering::Relaxed)
+    ));
+    let workspace = root.join("workspace");
+    let global = root.join("global");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&global).unwrap();
+    fs::write(
+        global.join("review.md"),
+        "---\r\nname: review\r\ndescription: \"Review: Rust\"\r\n---\r\nBody\r\n",
+    )
+    .unwrap();
+
+    let catalog = ResourceCatalog::discover(
+        &root,
+        &workspace,
+        ProjectAccess::Ignored,
+        &[],
+        &[],
+        Some(&global),
+        None,
+    )
+    .unwrap();
+    assert_eq!(catalog.prompts()[0].description(), "Review: Rust");
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn frontmatter_rejects_non_string_required_fields() {
+    let root = std::env::temp_dir().join(format!(
+        "coding-prompts-frontmatter-invalid-{}-{}",
+        std::process::id(),
+        ID.fetch_add(1, Ordering::Relaxed)
+    ));
+    let workspace = root.join("workspace");
+    let global = root.join("global");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&global).unwrap();
+    fs::write(
+        global.join("review.md"),
+        "---\nname: review\ndescription: true\n---\nBody\n",
+    )
+    .unwrap();
+
+    assert!(
+        ResourceCatalog::discover(
+            &root,
+            &workspace,
+            ProjectAccess::Ignored,
+            &[],
+            &[],
+            Some(&global),
+            None,
+        )
+        .is_err()
+    );
+    fs::remove_dir_all(root).unwrap();
+}

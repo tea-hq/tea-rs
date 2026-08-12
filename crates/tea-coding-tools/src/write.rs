@@ -11,7 +11,7 @@ use tea_tools::{
 };
 
 use crate::edit_diff::code_change;
-use crate::file::{atomic_write, atomic_write_if_unchanged, read_utf8};
+use crate::file::{atomic_write, atomic_write_if_unchanged, read_bounded_utf8};
 use crate::output::{failure, success};
 use crate::read::string_argument;
 use crate::{FileToolError, FileToolErrorCode, WorkspaceRoot};
@@ -84,7 +84,7 @@ impl WriteTool {
             None
         } else {
             let existing = self.workspace.resolve_existing(path)?;
-            match read_utf8(&self.workspace, &existing, crate::MAX_WRITE_BYTES) {
+            match read_bounded_utf8(&self.workspace, &existing, crate::MAX_WRITE_BYTES) {
                 Ok(source) => Some((existing, source)),
                 Err(error)
                     if matches!(
@@ -164,7 +164,7 @@ impl WriteTool {
             );
         }
         let existing = self.workspace.resolve_existing(path)?;
-        let source = read_utf8(&self.workspace, &existing, crate::MAX_WRITE_BYTES)?;
+        let source = read_bounded_utf8(&self.workspace, &existing, crate::MAX_WRITE_BYTES)?;
         code_change(
             existing.display_path(),
             &source,

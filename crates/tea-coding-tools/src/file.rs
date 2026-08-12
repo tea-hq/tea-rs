@@ -18,7 +18,17 @@ pub const MAX_READ_LINE_LIMIT: usize = 10_000;
 
 static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
 
-pub(crate) fn read_utf8(
+/// Reads a resolved file as bounded UTF-8 text through its workspace capability.
+///
+/// The target is revalidated before opening and the opened file identity is
+/// checked before its bytes are read. This is intentionally not a raw host
+/// path reader.
+///
+/// # Errors
+///
+/// Returns a bounded file-tool error when the target changes, is not a regular
+/// file, exceeds the byte limit, or is not valid UTF-8 text.
+pub fn read_bounded_utf8(
     workspace: &WorkspaceRoot,
     target: &ResolvedExistingPath,
     max_bytes: usize,
@@ -153,7 +163,7 @@ fn write_and_commit(
         .sync_all()
         .map_err(|_| FileToolError::new(FileToolErrorCode::FilesystemFailure))?;
     if let Some((existing, expected)) = expected {
-        let current = read_utf8(workspace, existing, MAX_WRITE_BYTES)?;
+        let current = read_bounded_utf8(workspace, existing, MAX_WRITE_BYTES)?;
         if current != expected {
             return Err(FileToolError::new(FileToolErrorCode::PathChanged));
         }

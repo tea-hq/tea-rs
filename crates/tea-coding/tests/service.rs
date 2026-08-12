@@ -10,7 +10,7 @@ use tea_coding::config::{
     ClientWebSearchSettingsLayer, CodingSettings, SettingsLayer, WebFetchSettingsLayer,
     WebSearchRoutePreference, WebSearchSettingsLayer, merge_settings,
 };
-use tea_coding::resources::ResourceCatalog;
+use tea_coding::resources::{ResourceCatalog, SkillRoot, SkillSource};
 use tea_coding::{CodingAgentBuilder, CodingError, CodingErrorCode, ProjectAccess};
 use tea_coding_tools::{
     BashConfig, BashOutputDirectory, BashShell, FetchFuture, FetchProvider, FetchRequest,
@@ -501,6 +501,139 @@ async fn coding_service_defaults_to_four_tools_and_can_activate_all_seven() {
     service.shutdown().await;
     drop(service);
     drop(store);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[allow(clippy::too_many_lines)]
+async fn skill_resource_tool_is_conditional_and_executes_against_the_catalog() {
+    let empty_root = std::env::temp_dir().join(format!(
+        "coding-service-empty-skills-{}-{}",
+        std::process::id(),
+        ID.fetch_add(1, Ordering::Relaxed)
+    ));
+    fs::create_dir_all(&empty_root).unwrap();
+    let empty_workspace = WorkspaceRoot::new(&empty_root).unwrap();
+    let empty_resources = ResourceCatalog::discover(
+        &empty_root,
+        &empty_root,
+        ProjectAccess::Trusted,
+        &[],
+        &[],
+        None,
+        None,
+    )
+    .unwrap();
+    let empty_store = Arc::new(
+        SqliteSessionStore::open(empty_root.join("sessions.sqlite3").to_str().unwrap()).unwrap(),
+    );
+    let empty_bash = BashConfig::new(
+        BashShell::new("/bin/sh", "-c").unwrap(),
+        BashOutputDirectory::new(&empty_root).unwrap(),
+        Duration::from_secs(5),
+    )
+    .unwrap();
+    let empty_provider = provider(vec![ScriptedModelResponse::text(["empty"])]);
+    let empty_service = build_service(
+        Arc::clone(&empty_provider),
+        empty_workspace,
+        empty_resources,
+        empty_store,
+        empty_bash,
+        fake_settings(),
+    );
+    let empty_session = empty_service.create_session().await.unwrap();
+    empty_service.prompt(empty_session, "empty").unwrap();
+    empty_service.wait(empty_session).await.unwrap();
+    assert!(
+        !empty_provider.captured_requests().unwrap()[0]
+            .tools()
+            .iter()
+            .any(|tool| tool.name() == "read_skill_resource")
+    );
+    empty_service.shutdown().await;
+    fs::remove_dir_all(&empty_root).unwrap();
+
+    let root = std::env::temp_dir().join(format!(
+        "coding-service-skill-resource-{}-{}",
+        std::process::id(),
+        ID.fetch_add(1, Ordering::Relaxed)
+    ));
+    let skill = root.join("skills/review");
+    fs::create_dir_all(skill.join("references")).unwrap();
+    fs::write(
+        skill.join("SKILL.md"),
+        "---\nname: review\ndescription: Review code\n---\nUse the checklist.\n",
+    )
+    .unwrap();
+    fs::write(skill.join("references/checklist.md"), "one\ntwo\nthree\n").unwrap();
+    let workspace = WorkspaceRoot::new(&root).unwrap();
+    let resources = ResourceCatalog::discover_with_skill_roots(
+        &root,
+        &root,
+        ProjectAccess::Trusted,
+        &[SkillRoot::new(root.join("skills"), SkillSource::UserTea).unwrap()],
+        None,
+        None,
+    )
+    .unwrap();
+    let store = Arc::new(
+        SqliteSessionStore::open(root.join("sessions.sqlite3").to_str().unwrap()).unwrap(),
+    );
+    let bash = BashConfig::new(
+        BashShell::new("/bin/sh", "-c").unwrap(),
+        BashOutputDirectory::new(&root).unwrap(),
+        Duration::from_secs(5),
+    )
+    .unwrap();
+    let provider = provider(vec![
+        tool_response(
+            "skill-resource",
+            "read_skill_resource",
+            serde_json::json!({
+                "skill":"review",
+                "path":"references/checklist.md",
+                "offset":1,
+                "limit":2
+            }),
+        ),
+        ScriptedModelResponse::text(["read"]),
+    ]);
+    let service = build_service(
+        Arc::clone(&provider),
+        workspace,
+        resources,
+        store,
+        bash,
+        fake_settings(),
+    );
+    let session = service.create_session().await.unwrap();
+    service.prompt(session, "read the checklist").unwrap();
+    let outcome = service.wait(session).await.unwrap();
+    assert!(matches!(
+        outcome,
+        tea::RuntimeCommandOutcome::RunCompleted {
+            pending_approval_id: None,
+            ..
+        }
+    ));
+    let requests = provider.captured_requests().unwrap();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(
+        requests[0]
+            .tools()
+            .iter()
+            .filter(|tool| tool.name() == "read_skill_resource")
+            .count(),
+        1
+    );
+    assert!(
+        requests[1]
+            .messages()
+            .iter()
+            .any(|message| format!("{message:?}").contains("one\\ntwo\\n"))
+    );
+    service.shutdown().await;
     fs::remove_dir_all(root).unwrap();
 }
 

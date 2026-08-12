@@ -153,7 +153,9 @@ fn map_user_content(content: &[ContentBlock]) -> Value {
     let parts: Vec<Value> = content
         .iter()
         .map(|block| match block {
-            ContentBlock::Text { text } | ContentBlock::Thinking { text } => {
+            ContentBlock::Text { text }
+            | ContentBlock::ContextualText { text }
+            | ContentBlock::Thinking { text } => {
                 json!({"type": "text", "text": text})
             }
             ContentBlock::Image { mime_type, source } => json!({
@@ -204,7 +206,8 @@ fn map_assistant(
                 }));
                 seen_index += 1;
             }
-            ContentBlock::Image { .. }
+            ContentBlock::ContextualText { .. }
+            | ContentBlock::Image { .. }
             | ContentBlock::HostedTool { .. }
             | ContentBlock::Citation { .. } => {}
         }
@@ -272,7 +275,9 @@ fn map_text_content(content: &[ContentBlock]) -> String {
     content
         .iter()
         .filter_map(|block| match block {
-            ContentBlock::Text { text } | ContentBlock::Thinking { text } => Some(text.as_str()),
+            ContentBlock::Text { text }
+            | ContentBlock::ContextualText { text }
+            | ContentBlock::Thinking { text } => Some(text.as_str()),
             _ => None,
         })
         .collect::<Vec<_>>()

@@ -1,27 +1,30 @@
+use super::commands::CommandCompletionItem;
 use super::selectors::Selector;
 
 const MAX_COMMAND_COMPLETIONS: usize = 16;
 
-/// One bounded slash-command completion menu owned by the local TUI.
+/// One bounded command or skill completion menu owned by the local TUI.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommandCompletion {
-    options: Vec<String>,
+    options: Vec<CommandCompletionItem>,
     selected: usize,
 }
 
 impl CommandCompletion {
     /// Creates a bounded deterministic completion list.
     #[must_use]
-    pub fn new<I>(options: I) -> Self
+    pub fn new<I, T>(options: I) -> Self
     where
-        I: IntoIterator<Item = String>,
+        I: IntoIterator<Item = T>,
+        T: Into<CommandCompletionItem>,
     {
         let options = options
             .into_iter()
+            .map(Into::into)
             .filter(|option| {
-                option.starts_with('/')
-                    && option.len() <= 512
-                    && !option.chars().any(char::is_control)
+                matches!(option.value().as_bytes().first(), Some(b'/' | b'$'))
+                    && option.value().len() <= 512
+                    && !option.value().chars().any(char::is_control)
             })
             .take(MAX_COMMAND_COMPLETIONS)
             .collect();
@@ -33,14 +36,14 @@ impl CommandCompletion {
 
     /// Returns all visible completion options in stable order.
     #[must_use]
-    pub fn options(&self) -> &[String] {
+    pub fn options(&self) -> &[CommandCompletionItem] {
         &self.options
     }
 
     /// Returns the explicit option currently selected by the user.
     #[must_use]
-    pub fn selected(&self) -> Option<&str> {
-        self.options.get(self.selected).map(String::as_str)
+    pub fn selected(&self) -> Option<&CommandCompletionItem> {
+        self.options.get(self.selected)
     }
 
     /// Moves to the next option with wraparound.
@@ -61,7 +64,7 @@ impl CommandCompletion {
     }
 
     pub(crate) fn should_show(&self, text: &str) -> bool {
-        self.selected().is_some() && !self.options.iter().any(|option| option == text)
+        self.selected().is_some() && !self.options.iter().any(|option| option.value() == text)
     }
 }
 
@@ -70,7 +73,7 @@ impl CommandCompletion {
 pub enum Overlay {
     /// A typed selector backed by host queries.
     Selector(Selector),
-    /// A slash-command completion menu that edits the composer draft.
+    /// A command or skill completion menu that edits the composer draft.
     CommandCompletion(CommandCompletion),
 }
 

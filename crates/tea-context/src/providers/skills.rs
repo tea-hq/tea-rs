@@ -69,7 +69,7 @@ impl ContextProvider for SkillMetadataProvider {
                             "Skill `{}`: {} Invoke explicitly with `{}`.",
                             skill.id(),
                             skill.description(),
-                            skill.invocation()
+                            skill.command()
                         ),
                         PromptProvenance::new(
                             id.clone(),

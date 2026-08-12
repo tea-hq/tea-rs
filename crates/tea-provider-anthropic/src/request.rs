@@ -155,7 +155,9 @@ fn map_user_content(content: &[ContentBlock]) -> Result<Vec<Value>, AnthropicErr
 
 fn map_user_block(block: &ContentBlock) -> Result<Value, AnthropicError> {
     match block {
-        ContentBlock::Text { text } => Ok(json!({"type": "text", "text": text})),
+        ContentBlock::Text { text } | ContentBlock::ContextualText { text } => {
+            Ok(json!({"type": "text", "text": text}))
+        }
         ContentBlock::Image { mime_type, source } => match source {
             ImageSource::InlineBase64 { data } => Ok(json!({
                 "type": "image",
@@ -206,7 +208,9 @@ fn map_assistant_block(
             "name": tool_name,
             "input": arguments,
         })),
-        ContentBlock::Thinking { .. } => Err(invalid("extended thinking is not supported")),
+        ContentBlock::ContextualText { .. } | ContentBlock::Thinking { .. } => Err(invalid(
+            "contextual or extended thinking content is not assistant output",
+        )),
         ContentBlock::Image { .. } => Err(invalid("invalid assistant content block")),
         ContentBlock::HostedTool { .. } | ContentBlock::Citation { .. } => {
             Err(invalid("invalid hosted replay content block"))
@@ -259,7 +263,8 @@ fn map_tool_result_content(content: &[ContentBlock]) -> Result<Vec<Value>, Anthr
                     Err(invalid("referenced images are not supported"))
                 }
             },
-            ContentBlock::Thinking { .. }
+            ContentBlock::ContextualText { .. }
+            | ContentBlock::Thinking { .. }
             | ContentBlock::ToolCall { .. }
             | ContentBlock::HostedTool { .. }
             | ContentBlock::Citation { .. } => Err(invalid("invalid tool result content block")),

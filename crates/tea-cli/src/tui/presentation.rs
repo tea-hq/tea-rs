@@ -326,6 +326,18 @@ fn project_active_cells(
             None,
         ));
     }
+    for (index, row) in state.skill_catalog.iter().enumerate() {
+        active.push(notice_cell(
+            CellId::Synthetic {
+                lane: CellLane::Notifications,
+                index: bounded_index(index),
+            },
+            NoticeKind::General,
+            NoticeSeverity::Information,
+            row,
+            None,
+        ));
+    }
     if let Some(approval) = &state.approval {
         active.push(project_approval(approval, state.approval_submitting));
         if let Some(preview) = state
@@ -527,7 +539,8 @@ impl<'a> HistoryProjection<'a> {
                     Cow::Owned(image_metadata(mime_type, source)),
                     OutputFormat::Plain,
                 ),
-                ContentBlock::ToolCall { .. }
+                ContentBlock::ContextualText { .. }
+                | ContentBlock::ToolCall { .. }
                 | ContentBlock::HostedTool { .. }
                 | ContentBlock::Citation { .. } => continue,
             };
@@ -602,7 +615,7 @@ impl<'a> HistoryProjection<'a> {
                     .insert(activity.tool_call_id());
                 self.cells.push(project_hosted_activity(activity));
             }
-            ContentBlock::Citation { .. } => {}
+            ContentBlock::ContextualText { .. } | ContentBlock::Citation { .. } => {}
         }
     }
 }
@@ -615,6 +628,7 @@ fn assistant_sources(content: &[ContentBlock]) -> Vec<ExternalSource> {
             ContentBlock::HostedTool { activity } => activity.sources(),
             ContentBlock::Citation { citation } => std::slice::from_ref(citation.source()),
             ContentBlock::Text { .. }
+            | ContentBlock::ContextualText { .. }
             | ContentBlock::Thinking { .. }
             | ContentBlock::Image { .. }
             | ContentBlock::ToolCall { .. } => &[],

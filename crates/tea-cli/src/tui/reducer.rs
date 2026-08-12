@@ -39,8 +39,15 @@ pub enum Action {
         /// New row height.
         height: u16,
     },
-    /// Replace local editor contents.
+    /// Replace local editor contents without a selected skill mention.
     SetEditor(String),
+    /// Replace local editor contents and its selected skill mention atomically.
+    SetComposer {
+        /// Bounded visible draft text.
+        text: String,
+        /// Selected skill token when the draft starts with one.
+        skill_mention: Option<String>,
+    },
     /// Add one validated image to the active session composer.
     AddAttachment(ComposerAttachment),
     /// Remove one image by its one-based composer index.
@@ -92,6 +99,8 @@ pub enum Action {
     Notify(String),
     /// Replace safe MCP lifecycle rows from a host projection.
     SetMcpHealth(Vec<String>),
+    /// Replace the bounded frozen skill catalog projection.
+    SetSkillCatalog(Vec<String>),
 }
 
 /// Side effects requested by the pure reducer.
@@ -288,8 +297,20 @@ pub fn reduce(state: &mut TuiState, action: Action) -> Vec<Effect> {
             state.bump_generation();
             vec![Effect::Render]
         }
-        Action::SetEditor(editor) => {
-            state.editor = bounded_text(editor, MAX_EPHEMERAL_TEXT_BYTES);
+        Action::SetEditor(text) => {
+            state.editor = bounded_text(text, MAX_EPHEMERAL_TEXT_BYTES);
+            state.editor_skill_mention = None;
+            state.bump_generation();
+            vec![Effect::Render]
+        }
+        Action::SetComposer {
+            text,
+            skill_mention,
+        } => {
+            state.editor = bounded_text(text, MAX_EPHEMERAL_TEXT_BYTES);
+            state.editor_skill_mention = skill_mention
+                .map(|mention| bounded_text(mention, 512))
+                .filter(|mention| valid_editor_skill_mention(&state.editor, mention));
             state.bump_generation();
             vec![Effect::Render]
         }
@@ -445,7 +466,21 @@ pub fn reduce(state: &mut TuiState, action: Action) -> Vec<Effect> {
             state.bump_generation();
             vec![Effect::Render]
         }
+        Action::SetSkillCatalog(rows) => {
+            state.set_skill_catalog(rows);
+            state.bump_generation();
+            vec![Effect::Render]
+        }
     }
+}
+
+fn valid_editor_skill_mention(editor: &str, mention: &str) -> bool {
+    mention.starts_with('$')
+        && mention.len() > 1
+        && !mention.chars().any(char::is_whitespace)
+        && editor.strip_prefix(mention).is_some_and(|remaining| {
+            remaining.is_empty() || remaining.chars().next().is_some_and(char::is_whitespace)
+        })
 }
 
 #[allow(clippy::too_many_lines)] // Keep the complete protocol-event grammar auditable together.

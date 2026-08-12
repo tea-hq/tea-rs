@@ -28,6 +28,8 @@ mod rpc_backpressure;
 mod secrets;
 #[path = "session_ux.rs"]
 mod session_ux;
+#[path = "skills.rs"]
+mod skills;
 #[path = "tui.rs"]
 mod tui;
 #[path = "version.rs"]
