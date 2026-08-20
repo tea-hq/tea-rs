@@ -183,6 +183,25 @@ fn maps_system_prompt_as_first_message() {
 }
 
 #[test]
+fn maps_privacy_safe_coding_prompt_to_both_openai_shapes() {
+    let prompt = "The logical working directory is `<workspace>`.\n\nProject instructions from `<workspace>/AGENTS.md`:\n\nproject rules";
+    let request = base_request().with_system_prompt(prompt).unwrap();
+
+    let chat = build_chat_completions_body(&request, &config()).unwrap();
+    let responses = build_responses_body(&request, &responses_config()).unwrap();
+
+    assert_eq!(chat["messages"][0]["content"], prompt);
+    assert_eq!(responses["instructions"], prompt);
+    for payload in [chat, responses] {
+        let snapshot = serde_json::to_string(&payload).unwrap();
+        assert!(snapshot.contains("<workspace>"));
+        assert!(!snapshot.contains("seeded-alice"));
+        assert!(!snapshot.contains("/Users/seeded-alice"));
+        assert!(!snapshot.contains("private-config"));
+    }
+}
+
+#[test]
 fn maps_contextual_user_text_to_both_openai_request_shapes() {
     let request = ModelRequest::new(
         ModelId::from_str("gpt-4o-mini").unwrap(),

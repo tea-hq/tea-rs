@@ -1,11 +1,6 @@
 use std::str::FromStr;
 use std::time::Duration;
 
-use tea_context::{
-    BudgetBehavior, CacheScope, ContextProviderId, PromptAuthority, PromptModule, PromptModuleId,
-    PromptPriority, PromptProvenance, PromptSegment, PromptSegmentId, StaticContextProvider,
-    TrustLevel,
-};
 use tea_policy::{ExecutionSurface, PolicyEnvironment, PolicyExecutionTarget};
 use tea_profile::{
     AgentProfile, ProfileDisplayName, ProfilePromptBudget, ProfileRuleId, ProfileRunLimits,
@@ -58,29 +53,6 @@ pub(crate) fn coding_profile(
         );
     }
     builder.build().map_err(|_| invalid())
-}
-
-pub(crate) fn coding_identity_provider() -> Result<StaticContextProvider, CodingError> {
-    let provider_id =
-        ContextProviderId::from_str("product.coding_identity").map_err(|_| invalid())?;
-    let segment = PromptSegment::new(
-        PromptSegmentId::from_str("product.coding.identity").map_err(|_| invalid())?,
-        "You are a coding agent. Inspect relevant workspace context, make minimal verified changes, respect approvals, and report results concisely.",
-        PromptProvenance::new(provider_id.clone(), "product_prompt", None)
-            .map_err(|_| invalid())?,
-        TrustLevel::Trusted,
-        CacheScope::Profile,
-        BudgetBehavior::Required,
-    )
-    .map_err(|_| invalid())?;
-    let module = PromptModule::new(
-        PromptModuleId::from_str("product.coding").map_err(|_| invalid())?,
-        PromptAuthority::Product,
-        PromptPriority::new(0),
-        vec![segment],
-    )
-    .map_err(|_| invalid())?;
-    Ok(StaticContextProvider::new(provider_id, vec![module]))
 }
 
 fn invalid() -> CodingError {

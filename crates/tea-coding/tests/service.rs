@@ -16,6 +16,11 @@ use tea_coding_tools::{
     BashConfig, BashOutputDirectory, BashShell, FetchFuture, FetchProvider, FetchRequest,
     FetchResult, SearchFuture, SearchProvider, SearchRequest, SearchResponse, WorkspaceRoot,
 };
+use tea_context::{
+    BudgetBehavior, CacheScope, ContextProvider, ContextProviderFuture, ContextProviderId,
+    ContextRequest, PromptAuthority, PromptModule, PromptModuleId, PromptPriority,
+    PromptProvenance, PromptSegment, PromptSegmentId, TrustLevel,
+};
 use tea_control::CancellationScope;
 use tea_model::{
     HostedToolKind, ModelCapabilities, ModelCompletion, ModelDisplayName, ModelEvent,
@@ -31,6 +36,51 @@ use tea_session_sqlite::SqliteSessionStore;
 use tea_testkit::{ScriptedModelProvider, ScriptedModelResponse};
 
 static ID: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Debug)]
+struct ServiceTurnProvider {
+    id: ContextProviderId,
+}
+
+impl ServiceTurnProvider {
+    fn new() -> Self {
+        Self {
+            id: "test.service_turn".parse().unwrap(),
+        }
+    }
+}
+
+impl ContextProvider for ServiceTurnProvider {
+    fn id(&self) -> &ContextProviderId {
+        &self.id
+    }
+
+    fn provide(&self, request: ContextRequest) -> ContextProviderFuture<'_> {
+        let text = format!("service turn {}", request.run_id().unwrap());
+        let segment = PromptSegment::new(
+            PromptSegmentId::from_str("service.turn").unwrap(),
+            text,
+            PromptProvenance::new(
+                self.id.clone(),
+                "turn_extension",
+                Some("extension:service-turn".to_owned()),
+            )
+            .unwrap(),
+            TrustLevel::Delegated,
+            CacheScope::Run,
+            BudgetBehavior::Omit,
+        )
+        .unwrap();
+        let module = PromptModule::new(
+            PromptModuleId::from_str("service.turn").unwrap(),
+            PromptAuthority::UserAddition,
+            PromptPriority::new(0),
+            vec![segment],
+        )
+        .unwrap();
+        Box::pin(async move { Ok(vec![module]) })
+    }
+}
 
 #[derive(Debug)]
 struct FakeSearchProvider;
@@ -224,6 +274,111 @@ async fn typed_prompt_content_reaches_model_and_session() {
     let reopened_snapshot = reopened.session_snapshot(session_id).await.unwrap();
     assert_persisted_image_privacy(&reopened_snapshot, &content, &local_path);
     reopened.shutdown().await;
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn service_exposes_content_free_last_prompt_inspection() {
+    let root = std::env::temp_dir().join(format!(
+        "coding-service-prompt-inspection-{}-{}",
+        std::process::id(),
+        ID.fetch_add(1, Ordering::Relaxed)
+    ));
+    fs::create_dir_all(&root).unwrap();
+    fs::write(root.join("AGENTS.md"), "PRIVATE PROJECT INSTRUCTION").unwrap();
+    let workspace = WorkspaceRoot::new(&root).unwrap();
+    let resources =
+        ResourceCatalog::discover(&root, &root, ProjectAccess::Trusted, &[], &[], None, None)
+            .unwrap();
+    let store = Arc::new(
+        SqliteSessionStore::open(root.join("sessions.sqlite3").to_str().unwrap()).unwrap(),
+    );
+    let bash = BashConfig::new(
+        BashShell::new("/bin/sh", "-c").unwrap(),
+        BashOutputDirectory::new(&root).unwrap(),
+        Duration::from_secs(5),
+    )
+    .unwrap();
+    let service = build_service(
+        provider(vec![ScriptedModelResponse::text(["done"])]),
+        workspace,
+        resources,
+        store,
+        bash,
+        fake_settings(),
+    );
+    let session = service.create_session().await.unwrap();
+    assert!(service.prompt_inspection(session).unwrap().is_none());
+
+    service.prompt(session, "inspect").unwrap();
+    service.wait(session).await.unwrap();
+    let inspection = service.prompt_inspection(session).unwrap().unwrap();
+    assert_eq!(inspection.session_id(), session);
+    assert!(inspection.run_id().is_some());
+    assert!(
+        inspection
+            .prompt()
+            .segments()
+            .iter()
+            .any(|entry| entry.module_id().as_str() == "workspace.instructions")
+    );
+    let encoded = serde_json::to_string(&inspection).unwrap();
+    assert!(!encoded.contains("PRIVATE PROJECT INSTRUCTION"));
+    assert!(!encoded.contains("byteRange"));
+    service.shutdown().await;
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn coding_builder_accepts_typed_per_turn_context_providers() {
+    let root = std::env::temp_dir().join(format!(
+        "coding-service-turn-provider-{}-{}",
+        std::process::id(),
+        ID.fetch_add(1, Ordering::Relaxed)
+    ));
+    fs::create_dir_all(&root).unwrap();
+    let workspace = WorkspaceRoot::new(&root).unwrap();
+    let resources =
+        ResourceCatalog::discover(&root, &root, ProjectAccess::Trusted, &[], &[], None, None)
+            .unwrap();
+    let store = Arc::new(
+        SqliteSessionStore::open(root.join("sessions.sqlite3").to_str().unwrap()).unwrap(),
+    );
+    let bash = BashConfig::new(
+        BashShell::new("/bin/sh", "-c").unwrap(),
+        BashOutputDirectory::new(&root).unwrap(),
+        Duration::from_secs(5),
+    )
+    .unwrap();
+    let provider = provider(vec![ScriptedModelResponse::text(["done"])]);
+    let service = service_builder(
+        Arc::clone(&provider),
+        workspace,
+        resources,
+        store,
+        bash,
+        fake_settings(),
+    )
+    .context_provider(Arc::new(ServiceTurnProvider::new()))
+    .build()
+    .unwrap();
+    let session = service.create_session().await.unwrap();
+    service.prompt(session, "turn").unwrap();
+    service.wait(session).await.unwrap();
+
+    let request = &provider.captured_requests().unwrap()[0];
+    assert!(request.system_prompt().unwrap().contains("service turn "));
+    assert!(
+        service
+            .prompt_inspection(session)
+            .unwrap()
+            .unwrap()
+            .prompt()
+            .segments()
+            .iter()
+            .any(|segment| segment.module_id().as_str() == "service.turn")
+    );
+    service.shutdown().await;
     fs::remove_dir_all(root).unwrap();
 }
 
@@ -497,6 +652,82 @@ async fn coding_service_defaults_to_four_tools_and_can_activate_all_seven() {
             vec!["bash", "edit", "find", "grep", "ls", "read", "write"],
         ]
     );
+
+    service.shutdown().await;
+    drop(service);
+    drop(store);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn coding_system_prompt_uses_logical_sources_and_tracks_active_tools() {
+    let root = std::env::temp_dir().join(format!(
+        "private-user-coding-prompt-{}-{}",
+        std::process::id(),
+        ID.fetch_add(1, Ordering::Relaxed)
+    ));
+    fs::create_dir_all(&root).unwrap();
+    fs::write(root.join("AGENTS.md"), "project rules\n").unwrap();
+    let workspace = WorkspaceRoot::new(&root).unwrap();
+    let resources =
+        ResourceCatalog::discover(&root, &root, ProjectAccess::Trusted, &[], &[], None, None)
+            .unwrap();
+    let store = Arc::new(
+        SqliteSessionStore::open(root.join("sessions.sqlite3").to_str().unwrap()).unwrap(),
+    );
+    let settings = CodingSettings {
+        active_tools: vec!["read".to_owned()],
+        ..fake_settings()
+    };
+    let bash = BashConfig::new(
+        BashShell::new("/bin/sh", "-c").unwrap(),
+        BashOutputDirectory::new(&root).unwrap(),
+        Duration::from_secs(5),
+    )
+    .unwrap();
+    let provider = provider(vec![
+        ScriptedModelResponse::text(["read"]),
+        ScriptedModelResponse::text(["write"]),
+    ]);
+    let service = build_service(
+        Arc::clone(&provider),
+        workspace,
+        resources,
+        Arc::clone(&store),
+        bash,
+        settings,
+    );
+    let session_id = service.create_session().await.unwrap();
+
+    service.prompt(session_id, "first").unwrap();
+    service.wait(session_id).await.unwrap();
+    service
+        .set_active_tools(session_id, vec!["write".parse().unwrap()])
+        .await
+        .unwrap();
+    service.prompt(session_id, "second").unwrap();
+    service.wait(session_id).await.unwrap();
+
+    let requests = provider.captured_requests().unwrap();
+    let read_prompt = requests[0].system_prompt().unwrap();
+    let write_prompt = requests[1].system_prompt().unwrap();
+    for prompt in [read_prompt, write_prompt] {
+        assert!(prompt.contains("<workspace>"));
+        assert!(prompt.contains("<workspace>/AGENTS.md"));
+        assert!(prompt.contains("project rules\n"));
+        assert!(!prompt.contains(root.to_str().unwrap()));
+        assert!(!prompt.contains("private-user"));
+    }
+    assert!(read_prompt.contains("Tool `read`"));
+    assert!(!read_prompt.contains("Tool `write`"));
+    assert!(write_prompt.contains("Tool `write`"));
+    assert!(!write_prompt.contains("Tool `read`"));
+
+    let snapshot = service.session_snapshot(session_id).await.unwrap();
+    let archive =
+        serde_json::to_string(&SessionArchive::from_snapshot(&snapshot).unwrap()).unwrap();
+    assert!(!archive.contains("<workspace>"));
+    assert!(!archive.contains("minimal verified changes"));
 
     service.shutdown().await;
     drop(service);
@@ -1153,7 +1384,7 @@ async fn coding_loop_rebuilds_between_approval_and_resolution() {
     assert!(
         provider.captured_requests().unwrap()[0]
             .system_prompt()
-            .is_some_and(|prompt| prompt.contains("minimal verified changes"))
+            .is_some_and(|prompt| prompt.contains("smallest coherent change"))
     );
     rebuilt.shutdown().await;
     fs::remove_dir_all(root).unwrap();

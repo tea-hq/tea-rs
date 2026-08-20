@@ -202,10 +202,11 @@ pub(crate) fn build_filtered_registry(
 
 /// Builds the ordered context provider list for one profile binding.
 ///
-/// Order is: workspace instructions (when present), tool hints, then
+/// Order is: workspace instructions (when present), optional tool hints, then
 /// builder-supplied providers.
 pub(crate) fn build_context_providers(
     workspace_instructions: &[ProfileWorkspaceInstruction],
+    builtin_tool_hints: bool,
     extra: &[Arc<dyn ContextProvider>],
 ) -> Result<Vec<Arc<dyn ContextProvider>>, RuntimeError> {
     let mut providers: Vec<Arc<dyn ContextProvider>> = Vec::new();
@@ -219,13 +220,15 @@ pub(crate) fn build_context_providers(
         })?;
         providers.push(Arc::new(provider));
     }
-    let tool_hints = ToolHintProvider::new().map_err(|error| {
-        RuntimeError::new(
-            RuntimeErrorCode::InvalidRequest,
-            format!("tool hint provider failed: {error}"),
-        )
-    })?;
-    providers.push(Arc::new(tool_hints));
+    if builtin_tool_hints {
+        let tool_hints = ToolHintProvider::new().map_err(|error| {
+            RuntimeError::new(
+                RuntimeErrorCode::InvalidRequest,
+                format!("tool hint provider failed: {error}"),
+            )
+        })?;
+        providers.push(Arc::new(tool_hints));
+    }
     for provider in extra {
         providers.push(Arc::clone(provider));
     }

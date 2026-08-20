@@ -1083,7 +1083,7 @@ impl InteractiveApp<'_> {
                 let value = self.state.selector().and_then(Selector::accept);
                 self.apply(Action::SetOverlay(None)).await?;
                 if let Some(value) = value {
-                    self.accept_selector(value).await?;
+                    Box::pin(self.accept_selector(value)).await?;
                 }
             }
             KeyCode::Char(character)

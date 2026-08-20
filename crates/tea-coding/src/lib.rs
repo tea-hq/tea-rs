@@ -19,6 +19,7 @@ mod profile;
 pub mod resources;
 mod service;
 mod skill_tool;
+mod system_prompt;
 mod trust;
 
 pub use builder::CodingAgentBuilder;
@@ -29,6 +30,7 @@ pub use mcp_config::McpEnvironmentResolver;
 pub use paths::AppPaths;
 pub use service::{CodingAgentService, CommandAcceptance};
 pub use skill_tool::{READ_SKILL_RESOURCE_TOOL_NAME, ReadSkillResourceTool, SkillResourceResolver};
+pub use system_prompt::CodingSystemPromptBuilder;
 pub use trust::{
     InteractionMode, PersistedTrustDecision, ProjectAccess, ProjectTrustStore, TrustRequest,
 };

@@ -28,7 +28,9 @@ pub use error::{ContextError, ContextErrorCode};
 pub use identity::{
     ConflictKey, ContextIdentityError, ContextProviderId, PromptModuleId, PromptSegmentId, SkillId,
 };
-pub use inspection::{PromptInspectionEntry, SegmentDisposition};
+pub use inspection::{
+    PromptInspection, PromptInspectionEntry, PromptInspectionSegment, SegmentDisposition,
+};
 pub use module::{MAX_MODULE_SEGMENTS, ModuleError, PromptModule, PromptPriority};
 pub use provenance::{CacheScope, PromptAuthority, PromptProvenance, ProvenanceError, TrustLevel};
 pub use provider::{

@@ -1,10 +1,15 @@
 use crate::common;
 
 use std::str::FromStr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use common::{FixedClock, TestIds, TestSessionIds, build_runtime, runtime_builder, user_message};
 use tea::{RuntimeCommandOutcome, RuntimeErrorCode};
+use tea_context::{
+    BudgetBehavior, CacheScope, ContextProvider, ContextProviderFuture, ContextProviderId,
+    ContextRequest, PromptAuthority, PromptModule, PromptModuleId, PromptPriority,
+    PromptProvenance, PromptSegment, PromptSegmentId, TrustLevel,
+};
 use tea_model::{ModelCapabilities, ModelDisplayName, ModelSpec, ProviderId};
 use tea_protocol::{
     AgentCommand, BranchId, CommandEnvelope, CommandId, ModelRef, ProtocolMetadata,
@@ -54,6 +59,135 @@ fn reasoning_provider(
         vec![model],
         scripts,
     ))
+}
+
+#[derive(Debug)]
+struct TurnPromptProvider {
+    id: ContextProviderId,
+    requests: Mutex<Vec<ContextRequest>>,
+}
+
+impl TurnPromptProvider {
+    fn new() -> Self {
+        Self {
+            id: "test.turn_prompt".parse().unwrap(),
+            requests: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn requests(&self) -> Vec<ContextRequest> {
+        self.requests.lock().unwrap().clone()
+    }
+}
+
+impl ContextProvider for TurnPromptProvider {
+    fn id(&self) -> &ContextProviderId {
+        &self.id
+    }
+
+    fn provide(&self, request: ContextRequest) -> ContextProviderFuture<'_> {
+        self.requests.lock().unwrap().push(request.clone());
+        let run_id = request.run_id().expect("prompt turns have a run id");
+        let content = format!("PRIVATE-TURN-CONTENT-{run_id}");
+        let segment = PromptSegment::new(
+            PromptSegmentId::from_str("extension.turn").unwrap(),
+            content,
+            PromptProvenance::new(
+                self.id.clone(),
+                "turn_extension",
+                Some("extension:turn".to_owned()),
+            )
+            .unwrap(),
+            TrustLevel::Delegated,
+            CacheScope::Run,
+            BudgetBehavior::Omit,
+        )
+        .unwrap();
+        let module = PromptModule::new(
+            PromptModuleId::from_str("extension.turn").unwrap(),
+            PromptAuthority::UserAddition,
+            PromptPriority::new(0),
+            vec![segment],
+        )
+        .unwrap();
+        Box::pin(async move { Ok(vec![module]) })
+    }
+}
+
+#[tokio::test]
+async fn context_provider_is_recomputed_per_turn_and_inspection_excludes_content() {
+    let provider = common::provider_with([
+        ScriptedModelResponse::text(["first response"]),
+        ScriptedModelResponse::text(["second response"]),
+    ]);
+    let extension = Arc::new(TurnPromptProvider::new());
+    let runtime = runtime_builder(
+        Arc::clone(&provider),
+        Arc::new(TestIds::default()),
+        Arc::new(TestSessionIds::default()),
+    )
+    .unwrap()
+    .context_provider(extension.clone())
+    .build()
+    .unwrap();
+    let session_id = create_session(&runtime, "coding-agent").await;
+    assert!(runtime.prompt_inspection(session_id).unwrap().is_none());
+
+    runtime
+        .send(envelope(
+            AgentCommand::Prompt {
+                message: user_message("first"),
+            },
+            Some(session_id),
+        ))
+        .await
+        .unwrap();
+    let first_inspection = runtime.prompt_inspection(session_id).unwrap().unwrap();
+
+    runtime
+        .send(envelope(
+            AgentCommand::Prompt {
+                message: user_message("second"),
+            },
+            Some(session_id),
+        ))
+        .await
+        .unwrap();
+    let second_inspection = runtime.prompt_inspection(session_id).unwrap().unwrap();
+
+    let requests = extension.requests();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[0].session_id(), session_id);
+    assert_eq!(requests[1].session_id(), session_id);
+    assert_ne!(requests[0].run_id(), requests[1].run_id());
+    assert_eq!(first_inspection.run_id(), requests[0].run_id());
+    assert_eq!(second_inspection.run_id(), requests[1].run_id());
+
+    let model_requests = provider.captured_requests().unwrap();
+    assert_eq!(model_requests.len(), 2);
+    for (request, context_request) in model_requests.iter().zip(&requests) {
+        let marker = format!("PRIVATE-TURN-CONTENT-{}", context_request.run_id().unwrap());
+        assert!(request.system_prompt().unwrap().contains(&marker));
+    }
+    let extension_segment = second_inspection
+        .prompt()
+        .segments()
+        .iter()
+        .find(|entry| entry.module_id().as_str() == "extension.turn")
+        .unwrap();
+    assert_eq!(extension_segment.authority(), PromptAuthority::UserAddition);
+    assert_eq!(extension_segment.trust(), TrustLevel::Delegated);
+    assert_eq!(extension_segment.cache_scope(), CacheScope::Run);
+    assert_eq!(
+        extension_segment.provenance().locator(),
+        Some("extension:turn")
+    );
+    let encoded = serde_json::to_string(&second_inspection).unwrap();
+    assert!(!encoded.contains("PRIVATE-TURN-CONTENT"));
+    assert!(!encoded.contains("byteRange"));
+
+    let durable = runtime.snapshot(session_id).await.unwrap();
+    assert!(!format!("{durable:?}").contains("PRIVATE-TURN-CONTENT"));
 }
 
 #[tokio::test]

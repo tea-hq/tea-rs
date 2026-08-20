@@ -8,7 +8,7 @@ use tea_coding_tools::{
     SearchProvider, WebFetchTool, WebSearchTool, WorkspaceFileResourceResolver, WorkspaceRoot,
     WriteTool,
 };
-use tea_context::{SkillMetadataProvider, WorkspaceInstructionProvider};
+use tea_context::ContextProvider;
 use tea_kernel::ModelRetryPolicy;
 use tea_mcp::McpManager;
 use tea_model::{HostedToolOptions, ModelProvider, ReasoningEffort};
@@ -26,9 +26,10 @@ use crate::config::{
     CodingSettings, WebFetchSettings, WebSearchRoutePreference, WebSearchSettings,
 };
 use crate::mcp_policy::CodingMcpPolicy;
-use crate::profile::{coding_identity_provider, coding_profile};
+use crate::profile::coding_profile;
 use crate::resources::ResourceCatalog;
 use crate::skill_tool::{ReadSkillResourceTool, SkillResourceResolver};
+use crate::system_prompt::CodingSystemPromptBuilder;
 use crate::{CodingAgentService, CodingError, CodingErrorCode};
 
 /// Product builder assembling one mode-neutral coding service.
@@ -48,6 +49,7 @@ pub struct CodingAgentBuilder {
     mcp_manager: Option<Arc<McpManager>>,
     search_provider: Option<Arc<dyn SearchProvider>>,
     fetch_provider: Option<Arc<dyn FetchProvider>>,
+    context_providers: Vec<Arc<dyn ContextProvider>>,
 }
 
 impl CodingAgentBuilder {
@@ -84,6 +86,7 @@ impl CodingAgentBuilder {
             mcp_manager: None,
             search_provider: None,
             fetch_provider: None,
+            context_providers: Vec::new(),
         }
     }
 
@@ -147,6 +150,17 @@ impl CodingAgentBuilder {
         self
     }
 
+    /// Registers a typed context provider evaluated before every prompt compilation.
+    ///
+    /// Providers receive immutable session/run/tool context and return bounded
+    /// `PromptModule` values. Registration is additive and cannot bypass the
+    /// prompt compiler or replace required coding modules.
+    #[must_use]
+    pub fn context_provider(mut self, provider: Arc<dyn ContextProvider>) -> Self {
+        self.context_providers.push(provider);
+        self
+    }
+
     /// Assembles provider, profile, policy, context, registered tools, and session ports.
     ///
     /// # Errors
@@ -174,15 +188,22 @@ impl CodingAgentBuilder {
                 .map_err(|_| runtime_error())?,
             )
             .profile(profile)
-            .context_provider(Arc::new(coding_identity_provider()?))
+            .builtin_tool_hints(false)
             .context_provider(Arc::new(
-                WorkspaceInstructionProvider::new(self.resources.context().to_vec())
-                    .map_err(|_| runtime_error())?,
-            ))
-            .context_provider(Arc::new(
-                SkillMetadataProvider::new(self.resources.skill_metadata())
-                    .map_err(|_| runtime_error())?,
+                CodingSystemPromptBuilder::new(
+                    self.resources.logical_workspace(),
+                    self.resources.context().to_vec(),
+                    self.resources.skill_metadata(),
+                )
+                .map_err(|_| runtime_error())?
+                .with_prompt_resources(
+                    self.resources.system_prompt().cloned(),
+                    self.resources.append_system_prompt().cloned(),
+                ),
             ));
+        for context_provider in self.context_providers {
+            builder = builder.context_provider(context_provider);
+        }
         for provider in self.providers {
             builder = builder.provider(provider);
         }
