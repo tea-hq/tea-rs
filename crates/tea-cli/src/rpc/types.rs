@@ -256,15 +256,23 @@ impl RpcError {
 impl From<CodingError> for RpcError {
     fn from(error: CodingError) -> Self {
         let code = match error.code() {
-            CodingErrorCode::InvalidInput => RpcErrorCode::InvalidRequest,
+            CodingErrorCode::InvalidInput | CodingErrorCode::InvalidRequest => {
+                RpcErrorCode::InvalidRequest
+            }
             CodingErrorCode::NotFound => RpcErrorCode::NotFound,
             CodingErrorCode::ProjectNotTrusted | CodingErrorCode::PolicyDenied => {
                 RpcErrorCode::PolicyDenied
             }
             CodingErrorCode::Persistence => RpcErrorCode::Persistence,
-            CodingErrorCode::Credential | CodingErrorCode::Provider => RpcErrorCode::Provider,
+            CodingErrorCode::Credential
+            | CodingErrorCode::Authentication
+            | CodingErrorCode::PermissionDenied
+            | CodingErrorCode::RateLimited
+            | CodingErrorCode::ContextOverflow
+            | CodingErrorCode::Unavailable
+            | CodingErrorCode::Transport => RpcErrorCode::Provider,
             CodingErrorCode::Cancelled => RpcErrorCode::Cancelled,
-            CodingErrorCode::Runtime => RpcErrorCode::Internal,
+            CodingErrorCode::Runtime | CodingErrorCode::Internal => RpcErrorCode::Internal,
         };
         Self::new(code, error.message())
     }

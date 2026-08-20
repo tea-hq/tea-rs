@@ -244,10 +244,17 @@ fn coding_error_code(code: crate::CodingErrorCode) -> &'static str {
         crate::CodingErrorCode::ProjectNotTrusted => "project_not_trusted",
         crate::CodingErrorCode::Persistence => "persistence",
         crate::CodingErrorCode::Credential => "credential",
-        crate::CodingErrorCode::Provider => "provider",
+        crate::CodingErrorCode::Authentication => "authentication",
+        crate::CodingErrorCode::PermissionDenied => "permission_denied",
+        crate::CodingErrorCode::RateLimited => "rate_limited",
+        crate::CodingErrorCode::ContextOverflow => "context_overflow",
+        crate::CodingErrorCode::Unavailable => "unavailable",
+        crate::CodingErrorCode::Transport => "transport",
+        crate::CodingErrorCode::InvalidRequest => "invalid_request",
         crate::CodingErrorCode::PolicyDenied => "policy_denied",
         crate::CodingErrorCode::Cancelled => "cancelled",
         crate::CodingErrorCode::Runtime => "runtime",
+        crate::CodingErrorCode::Internal => "internal",
     }
 }
 

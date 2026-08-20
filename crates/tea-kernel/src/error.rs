@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use tea_model::{ModelFailure, ModelFailureCode};
 use thiserror::Error;
 
 /// Stable machine-readable kernel failure classification.
@@ -42,6 +43,7 @@ pub enum KernelErrorCode {
 #[error("{code:?}: {message}")]
 pub struct KernelError {
     code: KernelErrorCode,
+    model_failure_code: Option<ModelFailureCode>,
     message: String,
     safe_diagnostic: bool,
 }
@@ -66,16 +68,35 @@ impl KernelError {
         message.retain(|character| character != '\0');
         Self {
             code,
+            model_failure_code: None,
             message,
             safe_diagnostic: false,
         }
     }
 
-    /// Creates a provider failure whose message was normalized by an adapter.
-    #[must_use]
-    pub fn provider_failure(code: KernelErrorCode, message: impl Into<String>) -> Self {
+    pub(crate) fn model_failure(failure: &ModelFailure, retry_exhausted: bool) -> Self {
+        let code = if failure.code() == ModelFailureCode::Cancelled {
+            KernelErrorCode::Cancelled
+        } else if retry_exhausted {
+            KernelErrorCode::RetryExhausted
+        } else {
+            KernelErrorCode::ModelFailure
+        };
+        let message = if failure.code() == ModelFailureCode::Cancelled {
+            "model request was cancelled".to_owned()
+        } else if failure.is_safe_diagnostic() && retry_exhausted {
+            format!("model retry policy was exhausted: {}", failure.message())
+        } else if failure.is_safe_diagnostic() {
+            failure.message().to_owned()
+        } else if retry_exhausted {
+            "model retry policy was exhausted".to_owned()
+        } else {
+            "model provider request failed".to_owned()
+        };
         let mut error = Self::new(code, message);
-        error.safe_diagnostic = true;
+        error.model_failure_code = Some(failure.code());
+        error.safe_diagnostic =
+            failure.is_safe_diagnostic() && failure.code() != ModelFailureCode::Cancelled;
         error
     }
 
@@ -83,6 +104,13 @@ impl KernelError {
     #[must_use]
     pub const fn code(&self) -> KernelErrorCode {
         self.code
+    }
+
+    /// Returns the provider-neutral model failure classification, when the
+    /// kernel error originated from a terminal model failure.
+    #[must_use]
+    pub const fn model_failure_code(&self) -> Option<ModelFailureCode> {
+        self.model_failure_code
     }
 
     /// Returns the bounded safe diagnostic.
@@ -95,5 +123,54 @@ impl KernelError {
     #[must_use]
     pub const fn is_safe_diagnostic(&self) -> bool {
         self.safe_diagnostic
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use tea_protocol::RetryClass;
+
+    use super::*;
+
+    #[test]
+    fn model_failure_preserves_classification_and_safe_diagnostic() {
+        let failure = ModelFailure::safe(
+            ModelFailureCode::RateLimited,
+            "HTTP 429: request quota exceeded",
+            RetryClass::AfterBackoff,
+        )
+        .unwrap();
+
+        let error = KernelError::model_failure(&failure, true);
+
+        assert_eq!(error.code(), KernelErrorCode::RetryExhausted);
+        assert_eq!(
+            error.model_failure_code(),
+            Some(ModelFailureCode::RateLimited)
+        );
+        assert!(error.is_safe_diagnostic());
+        assert_eq!(
+            error.message(),
+            "model retry policy was exhausted: HTTP 429: request quota exceeded"
+        );
+    }
+
+    #[test]
+    fn unsafe_model_failure_keeps_code_but_redacts_diagnostic() {
+        let failure = ModelFailure::new(
+            ModelFailureCode::Authentication,
+            "sk-secret-must-not-cross-the-kernel-boundary",
+            RetryClass::Never,
+        )
+        .unwrap();
+
+        let error = KernelError::model_failure(&failure, false);
+
+        assert_eq!(
+            error.model_failure_code(),
+            Some(ModelFailureCode::Authentication)
+        );
+        assert!(!error.is_safe_diagnostic());
+        assert_eq!(error.message(), "model provider request failed");
     }
 }

@@ -7,16 +7,17 @@ use std::time::Duration;
 use serde_json::Value;
 use tea_coding::config::CodingSettings;
 use tea_coding::resources::ResourceCatalog;
-use tea_coding::{CodingAgentBuilder, CodingAgentService, ProjectAccess};
+use tea_coding::{CodingAgentBuilder, CodingAgentService, CodingErrorCode, ProjectAccess};
 use tea_coding_tools::{BashConfig, BashOutputDirectory, BashShell, WorkspaceRoot};
 use tea_model::{
-    ModelCapabilities, ModelCompletion, ModelDisplayName, ModelEvent, ModelFailureCode,
-    ModelResponseInfo, ModelSpec, ModelStreamIndex, ProviderId, ProviderToolCallId,
-    ToolCallCompleted, ToolCallStarted, Utf8Delta,
+    ModelCapabilities, ModelCompletion, ModelDisplayName, ModelEvent, ModelFailure,
+    ModelFailureCode, ModelResponseInfo, ModelSpec, ModelStreamIndex, ProviderId,
+    ProviderToolCallId, ToolCallCompleted, ToolCallStarted, Utf8Delta,
 };
 use tea_policy::{ActorId, PolicyGrant, WorkspaceId};
 use tea_protocol::{
-    ApprovalDecision, MessageRole, ModelId, SessionId, SessionRecord, StopReason, TokenCount,
+    ApprovalDecision, MessageRole, ModelId, RetryClass, SessionId, SessionRecord, StopReason,
+    TokenCount,
 };
 use tea_session::{
     AppendOutcome, AppendTransaction, InMemorySessionStore, SessionArchive, SessionCatalog,
@@ -279,6 +280,71 @@ async fn provider_failures_before_and_during_stream_are_durable_and_bounded() {
                 if message.role() == MessageRole::Assistant
         )));
     }
+    service.shutdown().await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn wait_preserves_provider_neutral_terminal_failure_codes() {
+    let fixture = Fixture::new("provider-failure-codes");
+    let cases = [
+        (ModelFailureCode::RateLimited, CodingErrorCode::RateLimited),
+        (
+            ModelFailureCode::Authentication,
+            CodingErrorCode::Authentication,
+        ),
+        (
+            ModelFailureCode::PermissionDenied,
+            CodingErrorCode::PermissionDenied,
+        ),
+        (
+            ModelFailureCode::ContextOverflow,
+            CodingErrorCode::ContextOverflow,
+        ),
+        (ModelFailureCode::Unavailable, CodingErrorCode::Unavailable),
+        (ModelFailureCode::Transport, CodingErrorCode::Transport),
+        (
+            ModelFailureCode::InvalidRequest,
+            CodingErrorCode::InvalidRequest,
+        ),
+        (ModelFailureCode::Cancelled, CodingErrorCode::Cancelled),
+        (ModelFailureCode::Internal, CodingErrorCode::Internal),
+        (
+            ModelFailureCode::MalformedResponse,
+            CodingErrorCode::Internal,
+        ),
+    ];
+    let provider = provider(cases.map(|(source, _)| {
+        let retry = match source {
+            ModelFailureCode::RateLimited | ModelFailureCode::Unavailable => {
+                RetryClass::AfterBackoff
+            }
+            ModelFailureCode::Transport => RetryClass::Immediate,
+            _ => RetryClass::Never,
+        };
+        let failure =
+            ModelFailure::safe(source, format!("safe {source:?} diagnostic"), retry).unwrap();
+        ScriptedModelResponse::events([
+            ModelEvent::Started(ModelResponseInfo::new()),
+            ModelEvent::Failed(failure),
+        ])
+    }));
+    let service = fixture.service(provider, Arc::new(InMemorySessionStore::new()));
+
+    for (source, expected) in cases {
+        let session_id = service.create_session().await.unwrap();
+        service
+            .prompt(session_id, format!("exercise {source:?}"))
+            .unwrap();
+        let error = service.wait(session_id).await.unwrap_err();
+        assert_eq!(error.code(), expected, "source code: {source:?}");
+        if source == ModelFailureCode::RateLimited {
+            assert_eq!(
+                error.message(),
+                "model retry policy was exhausted: safe RateLimited diagnostic"
+            );
+        }
+    }
+
     service.shutdown().await;
 }
 

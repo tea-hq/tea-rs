@@ -94,10 +94,19 @@ impl From<tea_coding::CodingError> for CliFailure {
             CodingErrorCode::InvalidInput
             | CodingErrorCode::NotFound
             | CodingErrorCode::ProjectNotTrusted => ExitCategory::TrustOrConfig,
-            CodingErrorCode::Credential | CodingErrorCode::Provider => ExitCategory::Provider,
+            CodingErrorCode::Credential
+            | CodingErrorCode::Authentication
+            | CodingErrorCode::PermissionDenied
+            | CodingErrorCode::RateLimited
+            | CodingErrorCode::ContextOverflow
+            | CodingErrorCode::Unavailable
+            | CodingErrorCode::Transport
+            | CodingErrorCode::InvalidRequest => ExitCategory::Provider,
             CodingErrorCode::PolicyDenied => ExitCategory::PolicyDenied,
             CodingErrorCode::Cancelled => ExitCategory::Cancelled,
-            CodingErrorCode::Persistence | CodingErrorCode::Runtime => ExitCategory::Internal,
+            CodingErrorCode::Persistence | CodingErrorCode::Runtime | CodingErrorCode::Internal => {
+                ExitCategory::Internal
+            }
         };
         Self::new(category, error.message())
     }

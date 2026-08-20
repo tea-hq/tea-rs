@@ -31,6 +31,8 @@ pub enum RuntimeErrorCode {
     KernelFailure,
     /// A model provider request or retry sequence failed.
     ProviderFailure,
+    /// The compiled prompt, tools, and messages exceed the model context window.
+    ContextOverflow,
     /// An owned run was cooperatively cancelled.
     Cancelled,
     /// The command is not supported by this runtime version.
@@ -48,6 +50,7 @@ pub enum RuntimeErrorCode {
 #[error("{code:?}: {message}")]
 pub struct RuntimeError {
     code: RuntimeErrorCode,
+    model_failure_code: Option<tea_model::ModelFailureCode>,
     message: String,
     safe_diagnostic: bool,
 }
@@ -72,6 +75,7 @@ impl RuntimeError {
         }
         Self {
             code,
+            model_failure_code: None,
             message,
             safe_diagnostic: false,
         }
@@ -81,6 +85,13 @@ impl RuntimeError {
     #[must_use]
     pub const fn code(&self) -> RuntimeErrorCode {
         self.code
+    }
+
+    /// Returns the provider-neutral model failure classification, when this
+    /// runtime error originated from a terminal model request failure.
+    #[must_use]
+    pub const fn model_failure_code(&self) -> Option<tea_model::ModelFailureCode> {
+        self.model_failure_code
     }
 
     /// Returns the bounded safe diagnostic.
@@ -101,11 +112,13 @@ impl From<tea_kernel::KernelError> for RuntimeError {
         let code = match error.code() {
             tea_kernel::KernelErrorCode::ModelFailure
             | tea_kernel::KernelErrorCode::RetryExhausted => RuntimeErrorCode::ProviderFailure,
+            tea_kernel::KernelErrorCode::ContextOverflow => RuntimeErrorCode::ContextOverflow,
             tea_kernel::KernelErrorCode::PolicyFailure => RuntimeErrorCode::PolicyFailure,
             tea_kernel::KernelErrorCode::Cancelled => RuntimeErrorCode::Cancelled,
             _ => RuntimeErrorCode::KernelFailure,
         };
         let mut runtime = Self::new(code, error.message().to_owned());
+        runtime.model_failure_code = error.model_failure_code();
         runtime.safe_diagnostic = error.is_safe_diagnostic();
         runtime
     }
@@ -126,5 +139,23 @@ impl From<tea_profile::ProfileError> for RuntimeError {
 impl From<tea_context::ContextError> for RuntimeError {
     fn from(error: tea_context::ContextError) -> Self {
         Self::new(RuntimeErrorCode::KernelFailure, error.message().to_owned())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn preflight_context_overflow_keeps_its_runtime_classification() {
+        let kernel = tea_kernel::KernelError::new(
+            tea_kernel::KernelErrorCode::ContextOverflow,
+            "model context window was exceeded",
+        );
+
+        let runtime = RuntimeError::from(kernel);
+
+        assert_eq!(runtime.code(), RuntimeErrorCode::ContextOverflow);
+        assert_eq!(runtime.model_failure_code(), None);
     }
 }

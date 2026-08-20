@@ -230,31 +230,11 @@ pub(crate) async fn stream_turn(
         };
         // Non-retryable failures terminate immediately.
         if failure.code() == ModelFailureCode::Cancelled || failure.retry() == RetryClass::Never {
-            let code = if failure.code() == ModelFailureCode::Cancelled {
-                KernelErrorCode::Cancelled
-            } else {
-                KernelErrorCode::ModelFailure
-            };
-            if failure.code() == ModelFailureCode::Cancelled {
-                return Err(KernelError::new(code, "model request was cancelled"));
-            }
-            if failure.is_safe_diagnostic() {
-                return Err(KernelError::provider_failure(code, failure.message()));
-            }
-            return Err(KernelError::new(code, "model provider request failed"));
+            return Err(KernelError::model_failure(&failure, false));
         }
         // Retryable failure within the policy.
         if attempt + 1 >= retry_policy.max_attempts() {
-            if failure.is_safe_diagnostic() {
-                return Err(KernelError::provider_failure(
-                    KernelErrorCode::RetryExhausted,
-                    format!("model retry policy was exhausted: {}", failure.message()),
-                ));
-            }
-            return Err(KernelError::new(
-                KernelErrorCode::RetryExhausted,
-                "model retry policy was exhausted",
-            ));
+            return Err(KernelError::model_failure(&failure, true));
         }
         let retry_attempt = attempt + 1;
         let max_retries = retry_policy.max_attempts().saturating_sub(1);

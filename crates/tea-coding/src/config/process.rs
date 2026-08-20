@@ -451,7 +451,7 @@ fn credential(message: &'static str) -> CodingError {
 }
 
 fn provider_failure() -> CodingError {
-    CodingError::new(CodingErrorCode::Provider, "provider configuration failed")
+    CodingError::new(CodingErrorCode::Internal, "provider configuration failed")
 }
 
 #[cfg(test)]
