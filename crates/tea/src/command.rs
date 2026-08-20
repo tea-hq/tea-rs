@@ -689,6 +689,7 @@ impl AgentRuntime {
             binding.prompt_budget(),
         )
         .await?;
+        self.record_prompt_inspection(session_id, Some(run_id), &prompt)?;
         let config = self.build_run_config(binding, Some(prompt))?;
         self.append_user_message(session_id, snapshot.state().tail_sequence(), message)
             .await?;
@@ -791,17 +792,19 @@ impl AgentRuntime {
             .map_err(|error| {
                 RuntimeError::new(RuntimeErrorCode::PolicyFailure, error.to_string())
             })?;
+        let run_id = resolution.request().run_id().copied();
         let prompt = compile_prompt(
             &self.compiler,
             binding.context_providers(),
             profile_id.clone(),
             session_id,
-            resolution.request().run_id().copied(),
+            run_id,
             &active_tool_specs,
             ProtocolMetadata::default(),
             binding.prompt_budget(),
         )
         .await?;
+        self.record_prompt_inspection(session_id, run_id, &prompt)?;
         let config = self.build_run_config(binding, Some(prompt))?;
         let outcome = self
             .resume_kernel(

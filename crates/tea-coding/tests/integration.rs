@@ -12,5 +12,7 @@ mod faults;
 mod resources;
 #[path = "service.rs"]
 mod service;
+#[path = "system_prompt_privacy.rs"]
+mod system_prompt_privacy;
 #[path = "trust.rs"]
 mod trust;

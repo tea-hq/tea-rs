@@ -251,6 +251,19 @@ impl CodingAgentService {
             .map_err(CodingError::from)
     }
 
+    /// Returns content-free metadata for the session's last compiled prompt.
+    ///
+    /// The snapshot is runtime-local and unavailable before the first prompt
+    /// compilation or after rebuilding the service process.
+    pub fn prompt_inspection(
+        &self,
+        session_id: SessionId,
+    ) -> Result<Option<tea::RuntimePromptInspection>, CodingError> {
+        self.runtime
+            .prompt_inspection(session_id)
+            .map_err(CodingError::from)
+    }
+
     /// Accepts a prompt into one owned task; completion is observed separately.
     ///
     /// # Errors

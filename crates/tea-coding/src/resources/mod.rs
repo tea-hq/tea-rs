@@ -4,6 +4,7 @@ mod context_files;
 mod frontmatter;
 mod prompts;
 mod skills;
+mod system_prompts;
 
 use std::path::{Path, PathBuf};
 
@@ -11,8 +12,31 @@ use tea_context::{SkillCommand, SkillMetadata, WorkspaceInstruction};
 
 pub use prompts::PromptTemplate;
 pub use skills::{DiscoveredSkill, LoadedSkill, SkillResourceContent, SkillRoot, SkillSource};
+pub use system_prompts::{CodingPromptResource, CodingPromptResourceRoots};
 
 use crate::{CodingError, ProjectAccess};
+
+/// Resolves the bounded project root used for inherited instruction discovery.
+///
+/// Ordinary repositories use their worktree root. A linked worktree nested
+/// inside its main repository uses the main repository root so inherited
+/// instructions retain deterministic shadowing. Other linked worktrees and
+/// submodules remain scoped to their own worktree. Non-Git directories use the
+/// supplied workspace itself.
+///
+/// # Errors
+///
+/// Returns an error when the workspace is absent or is not a directory.
+pub fn project_instruction_boundary(workspace: &Path) -> Result<PathBuf, CodingError> {
+    context_files::project_instruction_boundary(workspace)
+}
+
+/// Returns whether any supported project instruction candidate exists between
+/// the resolved boundary and workspace, inclusive.
+#[must_use]
+pub fn has_project_instructions(boundary: &Path, workspace: &Path) -> bool {
+    context_files::has_project_instructions(boundary, workspace)
+}
 
 /// Bounded safe diagnostic produced while optional resources are skipped.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -98,8 +122,11 @@ fn append_diagnostics(
 #[derive(Debug, Clone)]
 pub struct ResourceCatalog {
     context: Vec<WorkspaceInstruction>,
+    logical_workspace: String,
     skills: Vec<DiscoveredSkill>,
     prompts: Vec<PromptTemplate>,
+    system_prompt: Option<Box<CodingPromptResource>>,
+    append_system_prompt: Option<Box<CodingPromptResource>>,
     diagnostics: Vec<ResourceDiagnostic>,
 }
 
@@ -156,7 +183,40 @@ impl ResourceCatalog {
         global_prompt_root: Option<&Path>,
         project_prompt_root: Option<&Path>,
     ) -> Result<Self, CodingError> {
-        let (context, mut diagnostics) = context_files::discover(boundary, workspace, access)?;
+        Self::discover_complete(
+            boundary,
+            workspace,
+            access,
+            skill_roots,
+            global_prompt_root,
+            project_prompt_root,
+            None,
+        )
+    }
+
+    /// Discovers the complete coding resource set from explicitly injected roots.
+    ///
+    /// Project-owned roots are ignored unless the project is trusted. Existing
+    /// discovery methods are convenience wrappers without coding prompt
+    /// customization roots.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid explicit roots, trusted boundary failures,
+    /// or malformed selected resources.
+    #[allow(clippy::too_many_arguments)]
+    pub fn discover_complete(
+        boundary: &Path,
+        workspace: &Path,
+        access: ProjectAccess,
+        skill_roots: &[SkillRoot],
+        global_prompt_root: Option<&Path>,
+        project_prompt_root: Option<&Path>,
+        coding_prompt_roots: Option<&CodingPromptResourceRoots>,
+    ) -> Result<Self, CodingError> {
+        let global_context_root = coding_prompt_roots.map(CodingPromptResourceRoots::global_root);
+        let (context, mut diagnostics, logical_workspace) =
+            context_files::discover(boundary, workspace, access, global_context_root)?;
         let allowed_roots = skill_roots
             .iter()
             .filter(|root| {
@@ -172,10 +232,14 @@ impl ResourceCatalog {
                 .then_some(project_prompt_root)
                 .flatten(),
         )?;
+        let system_prompts = system_prompts::discover(coding_prompt_roots, access)?;
         Ok(Self {
             context,
+            logical_workspace,
             skills,
             prompts,
+            system_prompt: system_prompts.system.map(Box::new),
+            append_system_prompt: system_prompts.append.map(Box::new),
             diagnostics,
         })
     }
@@ -190,7 +254,7 @@ impl ResourceCatalog {
         workspace: &tea_coding_tools::WorkspaceRoot,
         paths: &[String],
     ) -> Result<(), CodingError> {
-        context_files::add_explicit(workspace, paths, &mut self.context)
+        context_files::add_explicit(workspace, &self.logical_workspace, paths, &mut self.context)
     }
 
     /// Applies resolved resource feature switches without re-reading any source.
@@ -208,6 +272,11 @@ impl ResourceCatalog {
     pub fn context(&self) -> &[WorkspaceInstruction] {
         &self.context
     }
+    /// Returns the privacy-safe logical working directory.
+    #[must_use]
+    pub fn logical_workspace(&self) -> &str {
+        &self.logical_workspace
+    }
     /// Returns discovered skills sorted by ID.
     #[must_use]
     pub fn skills(&self) -> &[DiscoveredSkill] {
@@ -217,6 +286,16 @@ impl ResourceCatalog {
     #[must_use]
     pub fn prompts(&self) -> &[PromptTemplate] {
         &self.prompts
+    }
+    /// Returns the selected coding behavior replacement, when configured.
+    #[must_use]
+    pub fn system_prompt(&self) -> Option<&CodingPromptResource> {
+        self.system_prompt.as_deref()
+    }
+    /// Returns the selected appended coding prompt resource, when configured.
+    #[must_use]
+    pub fn append_system_prompt(&self) -> Option<&CodingPromptResource> {
+        self.append_system_prompt.as_deref()
     }
     /// Returns safe discovery diagnostics.
     #[must_use]

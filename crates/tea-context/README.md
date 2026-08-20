@@ -27,6 +27,11 @@ Each `PromptSegment` carries a canonical segment ID, non-empty bounded content, 
 
 ## Inspection
 
-`CompiledPrompt` exposes exact text, byte count, conservative estimated tokens, ordered diagnostics, and one `PromptInspectionEntry` per unique input segment with provenance, trust, cache scope, disposition, exact byte range, rendered bytes, and estimated tokens. Byte ranges slice exact output content; every output byte maps to an included segment or a separator.
+`CompiledPrompt` exposes exact text, byte count, conservative estimated tokens, ordered diagnostics, and one `PromptInspectionEntry` per unique input segment with authority, provenance, trust, cache scope, disposition, exact byte range, rendered bytes, and estimated tokens. Byte ranges slice exact output content; every output byte maps to an included segment or a separator.
+
+`CompiledPrompt::inspection_snapshot` creates a serializable, content-free
+`PromptInspection` for host query APIs. It retains module and segment IDs,
+authority, prompt-safe provenance, trust, cache scope, disposition, sizes, and
+compiler diagnostics while excluding prompt text and byte ranges.
 
 Trust labels describe origin for inspection and downstream policy; they do not sanitize content or claim prompt-injection prevention.

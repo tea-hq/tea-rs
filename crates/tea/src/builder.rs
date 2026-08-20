@@ -37,6 +37,7 @@ pub struct AgentRuntimeBuilder {
     tool_registrations: Vec<ToolRegistration>,
     policy_rules: Vec<RegisteredPolicyRule>,
     context_providers: Vec<Arc<dyn ContextProvider>>,
+    builtin_tool_hints: bool,
     profiles: Vec<AgentProfile>,
     default_reasoning_effort: Option<ReasoningEffort>,
 }
@@ -60,6 +61,7 @@ impl AgentRuntimeBuilder {
             tool_registrations: Vec::new(),
             policy_rules: Vec::new(),
             context_providers: Vec::new(),
+            builtin_tool_hints: true,
             profiles: Vec::new(),
             default_reasoning_effort: None,
         }
@@ -284,6 +286,15 @@ impl AgentRuntimeBuilder {
         self
     }
 
+    /// Selects whether the runtime adds its generic active-tool hint provider.
+    ///
+    /// The default is `true`. Product prompt builders that already compose
+    /// active-tool modules may disable it to keep one authoritative module set.
+    pub fn builtin_tool_hints(mut self, enabled: bool) -> Self {
+        self.builtin_tool_hints = enabled;
+        self
+    }
+
     /// Registers one product profile. Duplicate profile ids fail at build.
     pub fn profile(mut self, profile: AgentProfile) -> Self {
         self.profiles.push(profile);
@@ -392,8 +403,11 @@ impl AgentRuntimeBuilder {
             let policy = Arc::new(build_engine(&resolved_rules).map_err(|error| {
                 RuntimeError::new(RuntimeErrorCode::PolicyFailure, error.to_string())
             })?);
-            let context_providers =
-                build_context_providers(profile.workspace_instructions(), &self.context_providers)?;
+            let context_providers = build_context_providers(
+                profile.workspace_instructions(),
+                self.builtin_tool_hints,
+                &self.context_providers,
+            )?;
             let prompt_budget = PromptBudget::new(
                 profile.prompt_budget().max_bytes(),
                 profile.prompt_budget().max_estimated_tokens(),

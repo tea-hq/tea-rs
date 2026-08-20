@@ -3,8 +3,8 @@ use std::collections::BTreeMap;
 use crate::budget::{PROMPT_SEPARATOR, effective_remaining_bytes, estimate_tokens, truncate};
 use crate::{
     BudgetBehavior, ConflictKey, ConflictMode, ContextError, ContextErrorCode, PromptBudget,
-    PromptDiagnostic, PromptDiagnosticCode, PromptInspectionEntry, PromptModule, PromptModuleId,
-    PromptSegment, PromptSegmentId, SegmentDisposition,
+    PromptDiagnostic, PromptDiagnosticCode, PromptInspection, PromptInspectionEntry, PromptModule,
+    PromptModuleId, PromptSegment, PromptSegmentId, SegmentDisposition,
 };
 
 /// Maximum modules accepted by one compilation.
@@ -44,6 +44,16 @@ impl CompiledPrompt {
     #[must_use]
     pub fn inspection(&self) -> &[PromptInspectionEntry] {
         &self.inspection
+    }
+    /// Returns content-free aggregate metadata for host inspection APIs.
+    #[must_use]
+    pub fn inspection_snapshot(&self) -> PromptInspection {
+        PromptInspection::new(
+            self.bytes(),
+            self.estimated_tokens,
+            &self.inspection,
+            &self.diagnostics,
+        )
     }
 }
 
@@ -251,6 +261,7 @@ fn render(
         inspection.push(PromptInspectionEntry::new(
             candidate.module_id,
             candidate.segment.id().clone(),
+            candidate.authority,
             candidate.segment.provenance().clone(),
             candidate.segment.trust(),
             candidate.segment.cache_scope(),
@@ -291,6 +302,7 @@ fn nonrendered(candidate: &Candidate, disposition: SegmentDisposition) -> Prompt
     PromptInspectionEntry::new(
         candidate.module_id.clone(),
         candidate.segment.id().clone(),
+        candidate.authority,
         candidate.segment.provenance().clone(),
         candidate.segment.trust(),
         candidate.segment.cache_scope(),

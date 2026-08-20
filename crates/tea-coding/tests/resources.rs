@@ -4,3 +4,5 @@ mod context_files;
 mod prompts;
 #[path = "resources/skills.rs"]
 mod skills;
+#[path = "resources/system_prompts.rs"]
+mod system_prompts;

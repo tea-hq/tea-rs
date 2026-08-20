@@ -14,7 +14,10 @@ use tea_coding::config::{
 use tea_coding::mcp_config::{
     McpEnvironmentValue, ProcessMcpEnvironmentResolver, resolve_mcp_environment,
 };
-use tea_coding::resources::{ResourceCatalog, SkillRoot, SkillSource};
+use tea_coding::resources::{
+    CodingPromptResourceRoots, ResourceCatalog, SkillRoot, SkillSource, has_project_instructions,
+    project_instruction_boundary,
+};
 use tea_coding::{
     AppPaths, CodingAgentBuilder, CodingAgentService, InteractionMode, McpEnvironmentResolver,
     PersistedTrustDecision, ProjectAccess, ProjectTrustStore, TrustRequest,
@@ -299,10 +302,17 @@ impl CliBootstrap {
         args: &CliArgs,
     ) -> Result<Option<WorkspaceTrustPrompt>, CliFailure> {
         let (workspace, paths) = self.workspace_and_paths(args)?;
-        let access = Self::resolve_project_access(args, ClientSurface::Tui, &workspace, &paths)?;
+        let project_boundary = project_instruction_boundary(workspace.host_path())?;
+        let access = Self::resolve_project_access(
+            args,
+            ClientSurface::Tui,
+            &workspace,
+            &project_boundary,
+            &paths,
+        )?;
         Ok(
             (access == ProjectAccess::Ask).then(|| WorkspaceTrustPrompt {
-                workspace: workspace.host_path().to_path_buf(),
+                workspace: project_boundary,
                 trust_file: paths.trust_file(),
             }),
         )
@@ -355,7 +365,9 @@ impl CliBootstrap {
             return Err(config_failure("profile is not registered"));
         }
         let (workspace, paths) = self.workspace_and_paths(args)?;
-        let access = Self::resolve_project_access(args, surface, &workspace, &paths)?;
+        let project_boundary = project_instruction_boundary(workspace.host_path())?;
+        let access =
+            Self::resolve_project_access(args, surface, &workspace, &project_boundary, &paths)?;
         if access == ProjectAccess::Ask {
             return Err(config_failure("workspace trust confirmation is required"));
         }
@@ -451,18 +463,21 @@ impl CliBootstrap {
                 .map_err(|_| config_failure("skill root is invalid"))?,
         );
         let global_prompts = paths.data_dir().join("prompts");
+        let coding_prompt_roots = CodingPromptResourceRoots::new(paths.data_dir())?
+            .with_project_root(workspace.host_path().join(".tea"))?;
         let project_prompts = if access == tea_coding::ProjectAccess::Trusted {
             optional_project_directory(&workspace, ".tea/prompts")?
         } else {
             None
         };
-        let mut resources = ResourceCatalog::discover_with_skill_roots(
-            workspace.host_path(),
+        let mut resources = ResourceCatalog::discover_complete(
+            &project_boundary,
             workspace.host_path(),
             access,
             &skill_roots,
             Some(&global_prompts),
             project_prompts.as_deref(),
+            Some(&coding_prompt_roots),
         )
         .map_err(CliFailure::from)?;
         resources.apply_settings(
@@ -659,16 +674,17 @@ impl CliBootstrap {
         args: &CliArgs,
         surface: ClientSurface,
         workspace: &WorkspaceRoot,
+        project_boundary: &Path,
         paths: &AppPaths,
     ) -> Result<ProjectAccess, CliFailure> {
-        let has_project_resources = [
-            workspace.host_path().join("AGENTS.md"),
-            workspace.host_path().join("CLAUDE.md"),
-            workspace.host_path().join(".tea"),
-            workspace.host_path().join(".agents/skills"),
-        ]
-        .iter()
-        .any(|path| path.exists());
+        let has_project_resources =
+            has_project_instructions(project_boundary, workspace.host_path())
+                || [
+                    workspace.host_path().join(".tea"),
+                    workspace.host_path().join(".agents/skills"),
+                ]
+                .iter()
+                .any(|path| path.exists());
         if args.trust == TrustArg::Default && !has_project_resources {
             return Ok(ProjectAccess::Ignored);
         }
@@ -677,7 +693,7 @@ impl CliBootstrap {
             ClientSurface::Tui => InteractionMode::Interactive,
         };
         ProjectTrustStore::new(paths.trust_file())
-            .resolve(workspace.host_path(), trust_request(args.trust), mode)
+            .resolve(project_boundary, trust_request(args.trust), mode)
             .map_err(CliFailure::from)
     }
 
@@ -1297,10 +1313,26 @@ fn internal_failure(message: &'static str) -> CliFailure {
 mod tests {
     use super::*;
     use clap::Parser as _;
-    use tea_model::ReasoningEffort;
+    use tea_model::{ModelCapabilities, ModelDisplayName, ModelSpec, ReasoningEffort};
+    use tea_protocol::TokenCount;
+    use tea_testkit::ScriptedModelProvider;
 
     fn model_ref(provider_id: &str, model_id: &str) -> tea_protocol::ModelRef {
         tea_protocol::ModelRef::new(provider_id.parse().unwrap(), model_id.parse().unwrap())
+    }
+
+    fn fake_provider() -> Arc<ScriptedModelProvider> {
+        let provider_id = ProviderId::from_str("fake").unwrap();
+        let model = ModelSpec::new(
+            ModelId::from_str("fake/model").unwrap(),
+            provider_id.clone(),
+            ModelDisplayName::from_str("Fake Model").unwrap(),
+            TokenCount::new(32_000).unwrap(),
+            TokenCount::new(4_000).unwrap(),
+            ModelCapabilities::text().with_tools(true),
+        )
+        .unwrap();
+        Arc::new(ScriptedModelProvider::new(provider_id, vec![model], []))
     }
 
     fn test_environment(
@@ -1663,6 +1695,63 @@ mod tests {
                 .get(&root)
                 .unwrap(),
             Some(PersistedTrustDecision::Trusted)
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn bootstrap_inherits_repository_instructions_without_replacing_the_selected_workspace() {
+        let root = std::env::temp_dir().join(format!(
+            "tea-cli-project-boundary-bootstrap-{}",
+            uuid::Uuid::now_v7().hyphenated()
+        ));
+        let workspace = root.join("src/nested");
+        let config = root.join("config");
+        let state = root.join("state");
+        let data = root.join("data");
+        fs::create_dir_all(root.join(".git")).unwrap();
+        fs::create_dir_all(&workspace).unwrap();
+        fs::write(root.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
+        fs::write(root.join("AGENTS.md"), "repository instructions").unwrap();
+        let bootstrap = CliBootstrap::new(BootstrapEnvironment::new(
+            &workspace,
+            Some(root.clone()),
+            BTreeMap::new(),
+        ))
+        .with_provider(fake_provider());
+        let args = CliArgs::try_parse_from([
+            "tea",
+            "--no-session",
+            "--provider",
+            "fake",
+            "--model",
+            "fake/model",
+            "--trust",
+            "once",
+            "--cwd",
+            workspace.to_str().unwrap(),
+            "--config-dir",
+            config.to_str().unwrap(),
+            "--state-dir",
+            state.to_str().unwrap(),
+            "--data-dir",
+            data.to_str().unwrap(),
+        ])
+        .unwrap();
+
+        let (service, _) = bootstrap.build(&args).unwrap();
+        assert_eq!(service.resources().context().len(), 1);
+        assert_eq!(
+            service.resources().context()[0].content(),
+            "repository instructions"
+        );
+        assert_eq!(
+            service.resources().logical_workspace(),
+            "<workspace>/src/nested"
+        );
+        assert_eq!(
+            service.workspace().host_path(),
+            fs::canonicalize(&workspace).unwrap()
         );
         fs::remove_dir_all(root).unwrap();
     }

@@ -41,7 +41,7 @@ pub async fn run(
     }
     let prompt = super::print::initial_prompt(args, input, stdin_is_terminal, bootstrap)?;
     let (service, selection) = bootstrap.build_async(args).await?;
-    let result = run_service(&service, selection, &prompt, output).await;
+    let result = Box::pin(run_service(&service, selection, &prompt, output)).await;
     service.shutdown().await;
     result
 }

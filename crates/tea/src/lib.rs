@@ -41,6 +41,7 @@ mod health;
 mod id;
 mod policy_wiring;
 mod prompt;
+mod prompt_inspection;
 mod runtime;
 mod session_host;
 
@@ -71,5 +72,6 @@ pub use error::{RuntimeError, RuntimeErrorCode};
 pub use event::{DEFAULT_EVENT_CHANNEL_CAPACITY, MAX_EVENT_SUBSCRIBERS, RuntimeEventSink};
 pub use health::RuntimeHealth;
 pub use id::{SessionIdSource, UuidSessionIdSource};
+pub use prompt_inspection::RuntimePromptInspection;
 pub use runtime::AgentRuntime;
 pub use session_host::{RuntimeSessionState, SessionStats};

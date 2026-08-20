@@ -176,6 +176,26 @@ fn maps_contextual_user_text_as_model_visible_anthropic_content() {
 }
 
 #[test]
+fn maps_privacy_safe_coding_prompt_to_anthropic_shape() {
+    let prompt = "The logical working directory is `<workspace>`.\n\nProject instructions from `<workspace>/AGENTS.md`:\n\nproject rules";
+    let request = ModelRequest::new(
+        ModelId::from_str("claude-sonnet-4-20250514").unwrap(),
+        vec![user("hello")],
+    )
+    .unwrap()
+    .with_system_prompt(prompt)
+    .unwrap();
+
+    let body = build_messages_body(&request, &config()).unwrap();
+    assert_eq!(body["system"], prompt);
+    let snapshot = serde_json::to_string(&body).unwrap();
+    assert!(snapshot.contains("<workspace>"));
+    assert!(!snapshot.contains("seeded-alice"));
+    assert!(!snapshot.contains("/Users/seeded-alice"));
+    assert!(!snapshot.contains("private-config"));
+}
+
+#[test]
 fn coalesces_parallel_tool_results_into_one_user_turn() {
     let first_call_id = "0195a0b1-5e60-7000-8000-0aa7aa000001";
     let second_call_id = "0195a0b1-5e60-7000-8000-0aa7aa000002";

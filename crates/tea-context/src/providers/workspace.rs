@@ -61,6 +61,30 @@ impl WorkspaceInstruction {
             trust,
         })
     }
+
+    /// Returns the stable prompt segment identity.
+    #[must_use]
+    pub const fn id(&self) -> &PromptSegmentId {
+        &self.id
+    }
+
+    /// Returns the caller-authored instruction body.
+    #[must_use]
+    pub fn content(&self) -> &str {
+        &self.content
+    }
+
+    /// Returns the caller-supplied logical source locator.
+    #[must_use]
+    pub fn locator(&self) -> &str {
+        &self.locator
+    }
+
+    /// Returns the source trust classification.
+    #[must_use]
+    pub const fn trust(&self) -> TrustLevel {
+        self.trust
+    }
 }
 
 /// Provider over caller-supplied workspace instruction snapshots.

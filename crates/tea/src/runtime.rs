@@ -9,6 +9,7 @@ use tea_protocol::{ModelRef, ProfileId, ReasoningEffort, SessionId};
 use tea_session::SessionStore;
 use tea_tools::{ToolName, ToolRegistry, ToolSpec};
 
+use crate::RuntimePromptInspection;
 use crate::binding::{ToolRegistration, build_filtered_registry};
 use crate::id::SessionIdSource;
 use crate::policy_wiring::RegisteredPolicyRule;
@@ -25,6 +26,9 @@ type SessionQueues = Mutex<HashMap<tea_protocol::SessionId, Arc<tea_kernel::Kern
 
 /// Per-session runtime-only active-tool replacements.
 type ActiveToolOverrides = Mutex<HashMap<SessionId, ActiveToolOverride>>;
+
+/// Content-free last-successful prompt metadata keyed by live session.
+type PromptInspections = Mutex<HashMap<SessionId, RuntimePromptInspection>>;
 
 #[derive(Debug)]
 struct ActiveToolOverride {
@@ -81,6 +85,7 @@ pub struct AgentRuntime {
     active_tool_overrides: ActiveToolOverrides,
     pub(crate) sessions_created: TrackedSessions,
     pub(crate) queues: SessionQueues,
+    prompt_inspections: PromptInspections,
 }
 
 impl AgentRuntime {
@@ -127,6 +132,7 @@ impl AgentRuntime {
             active_tool_overrides: Mutex::new(HashMap::new()),
             sessions_created: Mutex::new(HashSet::new()),
             queues: Mutex::new(HashMap::new()),
+            prompt_inspections: Mutex::new(HashMap::new()),
         }
     }
 
@@ -370,5 +376,49 @@ impl AgentRuntime {
     #[must_use]
     pub fn compiler(&self) -> &Arc<PromptCompiler> {
         &self.compiler
+    }
+
+    /// Returns the last successfully compiled prompt metadata for one session.
+    ///
+    /// The result contains no prompt text and exists only in this runtime
+    /// process. `None` is returned before the first successful compilation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an invalid-state error if the runtime inspection lock is poisoned.
+    pub fn prompt_inspection(
+        &self,
+        session_id: SessionId,
+    ) -> Result<Option<RuntimePromptInspection>, RuntimeError> {
+        self.prompt_inspections
+            .lock()
+            .map_err(|_| {
+                RuntimeError::new(
+                    RuntimeErrorCode::InvalidState,
+                    "runtime prompt inspection state is poisoned",
+                )
+            })
+            .map(|inspections| inspections.get(&session_id).cloned())
+    }
+
+    pub(crate) fn record_prompt_inspection(
+        &self,
+        session_id: SessionId,
+        run_id: Option<tea_protocol::RunId>,
+        prompt: &tea_context::CompiledPrompt,
+    ) -> Result<(), RuntimeError> {
+        self.prompt_inspections
+            .lock()
+            .map_err(|_| {
+                RuntimeError::new(
+                    RuntimeErrorCode::InvalidState,
+                    "runtime prompt inspection state is poisoned",
+                )
+            })?
+            .insert(
+                session_id,
+                RuntimePromptInspection::new(session_id, run_id, prompt.inspection_snapshot()),
+            );
+        Ok(())
     }
 }

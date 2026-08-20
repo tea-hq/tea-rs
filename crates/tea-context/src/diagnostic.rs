@@ -1,7 +1,10 @@
+use serde::Serialize;
+
 use crate::{ConflictKey, PromptSegmentId};
 
 /// Stable prompt-compiler diagnostic classification.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum PromptDiagnosticCode {
     /// An exact duplicate segment was emitted only once.
     ExactDuplicate,
@@ -16,7 +19,8 @@ pub enum PromptDiagnosticCode {
 }
 
 /// Bounded deterministic compiler diagnostic without prompt content.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct PromptDiagnostic {
     code: PromptDiagnosticCode,
     segment_id: PromptSegmentId,
