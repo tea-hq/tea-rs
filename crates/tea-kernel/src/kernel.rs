@@ -327,7 +327,11 @@ impl<'a> AgentKernel<'a> {
             tool_name: tool.tool_name().to_owned(),
             arguments: tool.arguments().clone(),
         };
-        let invocation = match prepare(self.tools, &call) {
+        let invocation = match prepare(
+            self.tools,
+            &call,
+            tool_execution_metadata(snapshot.state().session_id())?,
+        ) {
             PreparedToolCall::Valid(invocation) => invocation,
             PreparedToolCall::Rejected { .. } => {
                 return Err(KernelError::new(
@@ -678,7 +682,11 @@ impl<'a> AgentKernel<'a> {
             },
         ));
         for call in &output.tool_calls {
-            let metadata = match prepare(self.tools, call) {
+            let metadata = match prepare(
+                self.tools,
+                call,
+                tool_execution_metadata(snapshot.state().session_id())?,
+            ) {
                 PreparedToolCall::Valid(invocation) => tool_audit_metadata(&invocation)?,
                 PreparedToolCall::Rejected { .. } => ProtocolMetadata::default(),
             };
@@ -751,7 +759,11 @@ impl<'a> AgentKernel<'a> {
 
         let mut classified: Vec<Classified> = Vec::with_capacity(output.tool_calls.len());
         for (index, call) in output.tool_calls.iter().enumerate() {
-            match prepare(self.tools, call) {
+            match prepare(
+                self.tools,
+                call,
+                tool_execution_metadata(snapshot.state().session_id())?,
+            ) {
                 PreparedToolCall::Rejected { code, message } => {
                     classified.push(Classified::Rejected {
                         index,
@@ -1082,7 +1094,11 @@ impl<'a> AgentKernel<'a> {
         emitter: &mut EventEmitter<'_>,
         deadline: tea_protocol::ProtocolTimestamp,
     ) -> Result<ToolProcessOutcome, KernelError> {
-        match prepare(self.tools, call) {
+        match prepare(
+            self.tools,
+            call,
+            tool_execution_metadata(snapshot.state().session_id())?,
+        ) {
             PreparedToolCall::Rejected { code, message } => {
                 let terminal = failed_terminal(code, message)?;
                 self.commit_denied(snapshot, call, terminal)
@@ -1851,6 +1867,14 @@ fn byte_count_error() -> KernelError {
         KernelErrorCode::LimitExceeded,
         "assistant output byte count cannot be reconstructed",
     )
+}
+
+fn tool_execution_metadata(session_id: SessionId) -> Result<ProtocolMetadata, KernelError> {
+    ProtocolMetadata::from_entries([(
+        "dev.tea-rs.execution",
+        serde_json::json!({ "sessionId": session_id.to_string() }),
+    )])
+    .map_err(|error| KernelError::new(KernelErrorCode::InvalidState, error.to_string()))
 }
 
 fn persisted_request(

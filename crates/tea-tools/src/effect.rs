@@ -20,6 +20,8 @@ pub enum ToolEffect {
     CredentialRead,
     /// Read clipboard content.
     ClipboardRead,
+    /// Read bounded data from a host-owned external source.
+    ExternalRead,
     /// Require direct user interaction.
     UserInteraction,
     /// Mutate state in an external system.
@@ -40,6 +42,7 @@ impl ToolEffect {
             Self::NetworkRequest => "network.request",
             Self::CredentialRead => "credential.read",
             Self::ClipboardRead => "clipboard.read",
+            Self::ExternalRead => "external.read",
             Self::UserInteraction => "user.interaction",
             Self::ExternalMutation => "external.mutation",
             Self::Unknown(value) => value,
@@ -55,7 +58,7 @@ impl ToolEffect {
     pub(crate) const fn is_read_only(&self) -> bool {
         matches!(
             self,
-            Self::FsRead | Self::CredentialRead | Self::ClipboardRead
+            Self::FsRead | Self::CredentialRead | Self::ClipboardRead | Self::ExternalRead
         )
     }
 }
@@ -92,6 +95,7 @@ impl FromStr for ToolEffect {
             "network.request" => Some(Self::NetworkRequest),
             "credential.read" => Some(Self::CredentialRead),
             "clipboard.read" => Some(Self::ClipboardRead),
+            "external.read" => Some(Self::ExternalRead),
             "user.interaction" => Some(Self::UserInteraction),
             "external.mutation" => Some(Self::ExternalMutation),
             _ => None,

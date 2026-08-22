@@ -160,7 +160,10 @@ impl PolicyRule for DesktopPolicy {
 }
 
 fn is_known_read_only(effect: &ToolEffect) -> bool {
-    matches!(effect, ToolEffect::FsRead | ToolEffect::ClipboardRead)
+    matches!(
+        effect,
+        ToolEffect::FsRead | ToolEffect::ClipboardRead | ToolEffect::ExternalRead
+    )
 }
 
 fn is_read_only_git_status(arguments: &serde_json::Value) -> bool {

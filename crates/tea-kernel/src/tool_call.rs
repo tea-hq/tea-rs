@@ -15,19 +15,20 @@ pub(crate) enum PreparedToolCall {
     },
 }
 
-pub(crate) fn prepare(tools: &ToolRegistry, call: &CompletedToolCall) -> PreparedToolCall {
+pub(crate) fn prepare(
+    tools: &ToolRegistry,
+    call: &CompletedToolCall,
+    metadata: ProtocolMetadata,
+) -> PreparedToolCall {
     let Ok(name) = ToolName::from_str(&call.tool_name) else {
         return PreparedToolCall::Rejected {
             code: "unknown_tool",
             message: "model requested an unknown tool",
         };
     };
-    let Ok(invocation) = ToolInvocation::new(
-        call.tool_call_id,
-        name,
-        call.arguments.clone(),
-        ProtocolMetadata::default(),
-    ) else {
+    let Ok(invocation) =
+        ToolInvocation::new(call.tool_call_id, name, call.arguments.clone(), metadata)
+    else {
         return PreparedToolCall::Rejected {
             code: "invalid_tool_arguments",
             message: "model supplied invalid tool arguments",

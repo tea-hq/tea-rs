@@ -79,6 +79,7 @@ fn known_and_unknown_effects_have_stable_values() {
         ("network.request", ToolEffect::NetworkRequest),
         ("credential.read", ToolEffect::CredentialRead),
         ("clipboard.read", ToolEffect::ClipboardRead),
+        ("external.read", ToolEffect::ExternalRead),
         ("user.interaction", ToolEffect::UserInteraction),
         ("external.mutation", ToolEffect::ExternalMutation),
     ];

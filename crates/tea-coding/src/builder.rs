@@ -2,7 +2,7 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use tea::AgentRuntimeBuilder;
+use tea::{AgentRuntimeBuilder, AgentToolRegistration};
 use tea_coding_tools::{
     BashConfig, BashTool, EditTool, FetchProvider, FindTool, GrepTool, LsTool, ReadTool,
     SearchProvider, WebFetchTool, WebSearchTool, WorkspaceFileResourceResolver, WorkspaceRoot,
@@ -18,8 +18,8 @@ use tea_policy::{
 use tea_profile::ProfileRuleId;
 use tea_session::{SessionCatalog, SessionStore};
 use tea_tools::{
-    ArgumentResourceResolver, StaticResourceResolver, ToolBinding, ToolResourceAccess,
-    ToolRoutePreference,
+    ArgumentResourceResolver, StaticResourceResolver, ToolBinding, ToolExecutor,
+    ToolResourceAccess, ToolResourceResolver, ToolRoutePreference, ToolSpec,
 };
 
 use crate::config::{
@@ -50,6 +50,7 @@ pub struct CodingAgentBuilder {
     search_provider: Option<Arc<dyn SearchProvider>>,
     fetch_provider: Option<Arc<dyn FetchProvider>>,
     context_providers: Vec<Arc<dyn ContextProvider>>,
+    host_tools: Vec<AgentToolRegistration>,
 }
 
 impl CodingAgentBuilder {
@@ -87,6 +88,7 @@ impl CodingAgentBuilder {
             search_provider: None,
             fetch_provider: None,
             context_providers: Vec::new(),
+            host_tools: Vec::new(),
         }
     }
 
@@ -158,6 +160,21 @@ impl CodingAgentBuilder {
     #[must_use]
     pub fn context_provider(mut self, provider: Arc<dyn ContextProvider>) -> Self {
         self.context_providers.push(provider);
+        self
+    }
+
+    /// Registers one product-owned host tool in the frozen runtime catalog.
+    ///
+    /// The tool remains inactive until a host explicitly selects its name for
+    /// an individual session through [`CodingAgentService::set_active_tools`].
+    #[must_use]
+    pub fn host_tool(
+        mut self,
+        spec: ToolSpec,
+        resolver: Arc<dyn ToolResourceResolver>,
+        executor: Arc<dyn ToolExecutor>,
+    ) -> Self {
+        self.host_tools.push((spec, resolver, executor));
         self
     }
 
@@ -243,6 +260,11 @@ impl CodingAgentBuilder {
             self.fetch_provider,
         )?;
         builder = register_mcp_tools(builder, self.mcp_manager.as_deref())?;
+        for (spec, resolver, executor) in self.host_tools {
+            builder = builder
+                .tool(spec, resolver, executor)
+                .map_err(|_| runtime_error())?;
+        }
         let runtime = builder.build().map_err(CodingError::from)?;
         Ok(CodingAgentService::new(
             runtime,

@@ -584,7 +584,8 @@ impl OpenAiErrorCode {
             Self::RateLimited => ModelFailureCode::RateLimited,
             Self::Unavailable => ModelFailureCode::Unavailable,
             Self::Transport => ModelFailureCode::Transport,
-            Self::MalformedResponse | Self::InvalidRequest => ModelFailureCode::MalformedResponse,
+            Self::InvalidRequest => ModelFailureCode::InvalidRequest,
+            Self::MalformedResponse => ModelFailureCode::MalformedResponse,
             Self::ContextOverflow => ModelFailureCode::ContextOverflow,
             Self::Cancelled => ModelFailureCode::Cancelled,
             Self::Internal => ModelFailureCode::Internal,
@@ -656,6 +657,41 @@ mod tests {
             capabilities,
         )
         .unwrap()
+    }
+
+    #[test]
+    fn adapter_error_codes_preserve_provider_neutral_failure_classification() {
+        let cases = [
+            (
+                OpenAiErrorCode::InvalidRequest,
+                ModelFailureCode::InvalidRequest,
+            ),
+            (
+                OpenAiErrorCode::Authentication,
+                ModelFailureCode::Authentication,
+            ),
+            (
+                OpenAiErrorCode::PermissionDenied,
+                ModelFailureCode::PermissionDenied,
+            ),
+            (OpenAiErrorCode::RateLimited, ModelFailureCode::RateLimited),
+            (OpenAiErrorCode::Unavailable, ModelFailureCode::Unavailable),
+            (OpenAiErrorCode::Transport, ModelFailureCode::Transport),
+            (
+                OpenAiErrorCode::MalformedResponse,
+                ModelFailureCode::MalformedResponse,
+            ),
+            (
+                OpenAiErrorCode::ContextOverflow,
+                ModelFailureCode::ContextOverflow,
+            ),
+            (OpenAiErrorCode::Cancelled, ModelFailureCode::Cancelled),
+            (OpenAiErrorCode::Internal, ModelFailureCode::Internal),
+        ];
+
+        for (adapter, expected) in cases {
+            assert_eq!(adapter.into_model_failure_code(), expected);
+        }
     }
 
     async fn captured_headers(provider: &OpenAiProvider) -> String {
