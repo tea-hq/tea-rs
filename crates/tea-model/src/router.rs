@@ -33,13 +33,22 @@ impl<T: ModelProvider> ModelRouter for T {
 }
 
 /// Immutable reference registry for a fixed runtime provider generation.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ModelRegistry {
     providers: BTreeMap<ProviderId, Arc<dyn ModelProvider>>,
     models: Vec<ModelSpec>,
 }
 
 impl ModelRegistry {
+    /// Creates an empty provider generation.
+    #[must_use]
+    pub fn empty() -> Self {
+        Self {
+            providers: BTreeMap::new(),
+            models: Vec::new(),
+        }
+    }
+
     /// Builds a validated registry from one immutable provider generation.
     ///
     /// # Errors
@@ -49,7 +58,20 @@ impl ModelRegistry {
     pub fn new(
         providers: impl IntoIterator<Item = Arc<dyn ModelProvider>>,
     ) -> Result<Self, ModelRegistryError> {
-        let mut by_id = BTreeMap::new();
+        Self::empty().with_registered(providers)
+    }
+
+    /// Returns a new generation containing the current and supplied providers.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first duplicate or catalog mismatch without changing this
+    /// generation or returning a partially updated generation.
+    pub fn with_registered(
+        &self,
+        providers: impl IntoIterator<Item = Arc<dyn ModelProvider>>,
+    ) -> Result<Self, ModelRegistryError> {
+        let mut by_id = self.providers.clone();
         for provider in providers {
             let provider_id = provider.provider_id().clone();
             if provider
@@ -59,22 +81,40 @@ impl ModelRegistry {
             {
                 return Err(ModelRegistryError::ProviderCatalogMismatch(provider_id));
             }
-            if by_id.insert(provider_id.clone(), provider).is_some() {
+            if by_id.contains_key(&provider_id) {
                 return Err(ModelRegistryError::DuplicateProvider(provider_id));
             }
+            by_id.insert(provider_id, provider);
         }
-        if by_id.is_empty() {
-            return Err(ModelRegistryError::Empty);
+        Ok(Self::from_providers(by_id))
+    }
+
+    /// Returns a new generation without the supplied providers.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when any requested provider is absent. This generation
+    /// remains unchanged and no partial removal is returned.
+    pub fn without_providers(
+        &self,
+        provider_ids: impl IntoIterator<Item = ProviderId>,
+    ) -> Result<Self, ModelRegistryError> {
+        let mut by_id = self.providers.clone();
+        for provider_id in provider_ids {
+            if by_id.remove(&provider_id).is_none() {
+                return Err(ModelRegistryError::UnknownProvider(provider_id));
+            }
         }
-        let mut models = by_id
+        Ok(Self::from_providers(by_id))
+    }
+
+    fn from_providers(providers: BTreeMap<ProviderId, Arc<dyn ModelProvider>>) -> Self {
+        let mut models = providers
             .values()
             .flat_map(|provider| provider.models().iter().cloned())
             .collect::<Vec<_>>();
         models.sort_by(|left, right| left.model_ref().cmp(right.model_ref()));
-        Ok(Self {
-            providers: by_id,
-            models,
-        })
+        Self { providers, models }
     }
 
     /// Returns the registered provider count.
@@ -87,6 +127,12 @@ impl ModelRegistry {
     #[must_use]
     pub fn provider_ids(&self) -> Vec<ProviderId> {
         self.providers.keys().cloned().collect()
+    }
+
+    /// Returns one shared provider from this immutable generation.
+    #[must_use]
+    pub fn provider_arc(&self, provider_id: &ProviderId) -> Option<Arc<dyn ModelProvider>> {
+        self.providers.get(provider_id).cloned()
     }
 }
 
@@ -103,13 +149,13 @@ impl ModelRouter for ModelRegistry {
 /// Invalid immutable provider-registry composition.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum ModelRegistryError {
-    /// At least one provider is required.
-    #[error("model registry requires at least one provider")]
-    Empty,
     /// Two adapters claimed the same provider identity.
     #[error("model provider {0} is registered more than once")]
     DuplicateProvider(ProviderId),
     /// An adapter advertised a model owned by a different provider.
     #[error("model provider {0} advertises a model owned by another provider")]
     ProviderCatalogMismatch(ProviderId),
+    /// A requested provider is absent from the generation.
+    #[error("model provider {0} is not registered")]
+    UnknownProvider(ProviderId),
 }

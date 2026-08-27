@@ -175,6 +175,65 @@ fn assert_persisted_image_privacy(
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn providerless_service_registers_dynamically_without_changing_selection() {
+    let root = std::env::temp_dir().join(format!(
+        "coding-service-dynamic-provider-{}-{}",
+        std::process::id(),
+        ID.fetch_add(1, Ordering::Relaxed)
+    ));
+    fs::create_dir_all(&root).unwrap();
+    let workspace = WorkspaceRoot::new(&root).unwrap();
+    let resources =
+        ResourceCatalog::discover(&root, &root, ProjectAccess::Trusted, &[], &[], None, None)
+            .unwrap();
+    let store = Arc::new(
+        SqliteSessionStore::open(root.join("sessions.sqlite3").to_str().unwrap()).unwrap(),
+    );
+    let bash = BashConfig::new(
+        BashShell::new("/bin/sh", "-c").unwrap(),
+        BashOutputDirectory::new(&root).unwrap(),
+        Duration::from_secs(5),
+    )
+    .unwrap();
+    let service = CodingAgentBuilder::without_provider(
+        workspace,
+        resources,
+        Arc::clone(&store),
+        bash,
+        fake_settings(),
+        ActorId::from_str("local:user").unwrap(),
+        WorkspaceId::from_str("workspace/local").unwrap(),
+    )
+    .build()
+    .unwrap();
+    assert!(service.models().is_empty());
+
+    let session_id = service.create_session().await.unwrap();
+    service.prompt(session_id, "before provider").unwrap();
+    let error = service.wait(session_id).await.unwrap_err();
+    assert_eq!(error.code(), CodingErrorCode::Unavailable);
+
+    let provider = provider(vec![ScriptedModelResponse::text(["ready"])]);
+    service
+        .register_model_providers([Arc::clone(&provider) as Arc<dyn tea_model::ModelProvider>])
+        .unwrap();
+    assert_eq!(service.models(), [model_ref("fake/model")]);
+    assert_eq!(
+        service.snapshot(session_id).await.unwrap().model_ref(),
+        Some(&model_ref("fake/model"))
+    );
+
+    service.prompt(session_id, "after provider").unwrap();
+    service.wait(session_id).await.unwrap();
+    assert_eq!(provider.captured_requests().unwrap().len(), 1);
+
+    service.shutdown().await;
+    drop(service);
+    drop(store);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn typed_prompt_content_reaches_model_and_session() {
     let root = std::env::temp_dir().join(format!(
         "coding-service-image-{}-{}",

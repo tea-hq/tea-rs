@@ -17,6 +17,7 @@ use tea_protocol::{
 };
 use tea_session::InMemorySessionStore;
 use tea_testkit::{ScriptedModelProvider, ScriptedModelResponse};
+use tokio::sync::Notify;
 
 fn envelope(command: AgentCommand, session_id: Option<tea_protocol::SessionId>) -> CommandEnvelope {
     CommandEnvelope::new(
@@ -111,6 +112,39 @@ impl ContextProvider for TurnPromptProvider {
         )
         .unwrap();
         Box::pin(async move { Ok(vec![module]) })
+    }
+}
+
+#[derive(Debug)]
+struct GatedContextProvider {
+    id: ContextProviderId,
+    entered: Arc<Notify>,
+    release: Arc<Notify>,
+}
+
+impl GatedContextProvider {
+    fn new() -> Self {
+        Self {
+            id: "test.gated_prompt".parse().unwrap(),
+            entered: Arc::new(Notify::new()),
+            release: Arc::new(Notify::new()),
+        }
+    }
+}
+
+impl ContextProvider for GatedContextProvider {
+    fn id(&self) -> &ContextProviderId {
+        &self.id
+    }
+
+    fn provide(&self, _request: ContextRequest) -> ContextProviderFuture<'_> {
+        let entered = Arc::clone(&self.entered);
+        let release = Arc::clone(&self.release);
+        Box::pin(async move {
+            entered.notify_one();
+            release.notified().await;
+            Ok(Vec::new())
+        })
     }
 }
 
@@ -271,6 +305,159 @@ async fn set_model_appends_configuration_change() {
 }
 
 #[tokio::test]
+async fn providerless_session_keeps_its_model_until_the_provider_is_registered() {
+    let provider = common::provider_with([ScriptedModelResponse::text(["registered later"])]);
+    let runtime = build_runtime(
+        Arc::clone(&provider),
+        Arc::new(TestIds::default()),
+        Arc::new(TestSessionIds::default()),
+    )
+    .unwrap();
+    runtime
+        .remove_model_providers([ProviderId::from_str("fake").unwrap()])
+        .unwrap();
+
+    let session_id = create_session(&runtime, "coding-agent").await;
+    let selected = runtime
+        .snapshot(session_id)
+        .await
+        .unwrap()
+        .state()
+        .configuration()
+        .model_ref()
+        .cloned();
+    assert_eq!(selected, Some(model_ref("fake/model")));
+
+    let error = runtime
+        .send(envelope(
+            AgentCommand::Prompt {
+                message: user_message("before registration"),
+            },
+            Some(session_id),
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), RuntimeErrorCode::UnknownProvider);
+
+    runtime
+        .register_model_providers([Arc::clone(&provider) as Arc<dyn tea_model::ModelProvider>])
+        .unwrap();
+    assert_eq!(
+        runtime
+            .snapshot(session_id)
+            .await
+            .unwrap()
+            .state()
+            .configuration()
+            .model_ref(),
+        Some(&model_ref("fake/model"))
+    );
+    runtime
+        .send(envelope(
+            AgentCommand::Prompt {
+                message: user_message("after registration"),
+            },
+            Some(session_id),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(provider.captured_requests().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn registration_is_atomic_and_does_not_change_session_selection() {
+    let runtime = runtime();
+    let session_id = create_session(&runtime, "coding-agent").await;
+    let alternate_id = ProviderId::from_str("alternate").unwrap();
+    let alternate_model = ModelSpec::new(
+        "alternate/model".parse().unwrap(),
+        alternate_id.clone(),
+        ModelDisplayName::from_str("Alternate Model").unwrap(),
+        TokenCount::new(32_000).unwrap(),
+        TokenCount::new(4_000).unwrap(),
+        ModelCapabilities::text().with_tools(true),
+    )
+    .unwrap();
+    let alternate = Arc::new(ScriptedModelProvider::new(
+        alternate_id.clone(),
+        vec![alternate_model],
+        [],
+    ));
+
+    runtime
+        .register_model_providers([Arc::clone(&alternate) as Arc<dyn tea_model::ModelProvider>])
+        .unwrap();
+    assert_eq!(
+        runtime
+            .snapshot(session_id)
+            .await
+            .unwrap()
+            .state()
+            .configuration()
+            .model_ref(),
+        Some(&model_ref("fake/model"))
+    );
+
+    let error = runtime
+        .register_model_providers([alternate as Arc<dyn tea_model::ModelProvider>])
+        .unwrap_err();
+    assert_eq!(error.code(), RuntimeErrorCode::DuplicateEntry);
+    assert_eq!(runtime.model_registry().provider_count(), 2);
+}
+
+#[tokio::test]
+async fn active_run_finishes_against_its_starting_generation_after_removal() {
+    let provider = common::provider_with([ScriptedModelResponse::text(["old generation"])]);
+    let gate = Arc::new(GatedContextProvider::new());
+    let runtime = Arc::new(
+        runtime_builder(
+            Arc::clone(&provider),
+            Arc::new(TestIds::default()),
+            Arc::new(TestSessionIds::default()),
+        )
+        .unwrap()
+        .context_provider(gate.clone())
+        .build()
+        .unwrap(),
+    );
+    let session_id = create_session(&runtime, "coding-agent").await;
+    let running = {
+        let runtime = Arc::clone(&runtime);
+        tokio::spawn(async move {
+            runtime
+                .send(envelope(
+                    AgentCommand::Prompt {
+                        message: user_message("use the captured generation"),
+                    },
+                    Some(session_id),
+                ))
+                .await
+        })
+    };
+
+    gate.entered.notified().await;
+    runtime
+        .remove_model_providers([ProviderId::from_str("fake").unwrap()])
+        .unwrap();
+    assert!(runtime.models().is_empty());
+    gate.release.notify_one();
+
+    running.await.unwrap().unwrap();
+    assert_eq!(provider.captured_requests().unwrap().len(), 1);
+
+    let error = runtime
+        .send(envelope(
+            AgentCommand::Prompt {
+                message: user_message("future run"),
+            },
+            Some(session_id),
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), RuntimeErrorCode::UnknownProvider);
+}
+
+#[tokio::test]
 async fn set_model_rejects_unknown_model() {
     let runtime = runtime();
     let session_id = create_session(&runtime, "coding-agent").await;
@@ -422,8 +609,15 @@ async fn reopened_session_routes_by_persisted_provider_identity() {
     .session_store(Arc::clone(&store))
     .build()
     .unwrap();
+    let state = missing_provider.attach_session(session_id).await.unwrap();
+    assert_eq!(state.model_ref(), Some(&alternate_ref));
     let error = missing_provider
-        .attach_session(session_id)
+        .send(envelope(
+            AgentCommand::Prompt {
+                message: user_message("provider is temporarily unavailable"),
+            },
+            Some(session_id),
+        ))
         .await
         .unwrap_err();
     assert_eq!(error.code(), RuntimeErrorCode::UnknownProvider);

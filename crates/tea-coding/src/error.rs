@@ -124,9 +124,9 @@ impl From<tea::RuntimeError> for CodingError {
                 tea::RuntimeErrorCode::ProviderFailure => CodingErrorCode::Internal,
                 tea::RuntimeErrorCode::PolicyFailure => CodingErrorCode::PolicyDenied,
                 tea::RuntimeErrorCode::Cancelled => CodingErrorCode::Cancelled,
+                tea::RuntimeErrorCode::UnknownProvider => CodingErrorCode::Unavailable,
                 tea::RuntimeErrorCode::InvalidRequest
                 | tea::RuntimeErrorCode::UnknownProfile
-                | tea::RuntimeErrorCode::UnknownProvider
                 | tea::RuntimeErrorCode::UnknownModel
                 | tea::RuntimeErrorCode::UnknownTool
                 | tea::RuntimeErrorCode::UnknownPolicyRule => CodingErrorCode::InvalidInput,

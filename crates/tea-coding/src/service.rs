@@ -8,7 +8,7 @@ use std::task::Poll;
 use tea::{AgentRuntime, RuntimeCommandOutcome, RuntimeSessionState, SessionStats};
 use tea_coding_tools::WorkspaceRoot;
 use tea_mcp::{McpError, McpManager, McpServerHealth, McpServerId};
-use tea_model::{ModelCapabilities, ModelSpec};
+use tea_model::{ModelCapabilities, ModelProvider, ModelRegistry, ModelSpec, ProviderId};
 use tea_policy::WorkspaceId;
 use tea_protocol::{
     AgentCommand, ApprovalDecision, ApprovalId, BranchId, CanonicalMessage, CommandEnvelope,
@@ -109,7 +109,7 @@ impl CodingAgentService {
             .map(|model| model.model_ref().clone())
             .collect()
     }
-    /// Returns capabilities for one model in the frozen provider catalog.
+    /// Returns capabilities for one model in the current provider generation.
     #[must_use]
     pub fn model_capabilities(&self, model_ref: &ModelRef) -> Option<ModelCapabilities> {
         self.runtime
@@ -118,13 +118,50 @@ impl CodingAgentService {
             .find(|model| model.model_ref() == model_ref)
             .map(tea_model::ModelSpec::capabilities)
     }
-    /// Returns one advertised model contract from the frozen catalog.
+    /// Returns one advertised model contract from the current provider generation.
     #[must_use]
-    pub fn model_spec(&self, model_ref: &ModelRef) -> Option<&ModelSpec> {
+    pub fn model_spec(&self, model_ref: &ModelRef) -> Option<ModelSpec> {
         self.runtime
             .models()
-            .iter()
+            .into_iter()
             .find(|model| model.model_ref() == model_ref)
+    }
+
+    /// Returns the current immutable provider generation.
+    #[must_use]
+    pub fn model_registry(&self) -> Arc<ModelRegistry> {
+        self.runtime.model_registry()
+    }
+
+    /// Atomically registers providers without changing any session selection.
+    pub fn register_model_providers(
+        &self,
+        providers: impl IntoIterator<Item = Arc<dyn ModelProvider>>,
+    ) -> Result<Arc<ModelRegistry>, CodingError> {
+        self.runtime
+            .register_model_providers(providers)
+            .map_err(CodingError::from)
+    }
+
+    /// Atomically removes providers while preserving session model references.
+    pub fn remove_model_providers(
+        &self,
+        provider_ids: impl IntoIterator<Item = ProviderId>,
+    ) -> Result<Arc<ModelRegistry>, CodingError> {
+        self.runtime
+            .remove_model_providers(provider_ids)
+            .map_err(CodingError::from)
+    }
+
+    /// Atomically replaces part of the provider generation.
+    pub fn update_model_providers(
+        &self,
+        provider_ids: impl IntoIterator<Item = ProviderId>,
+        providers: impl IntoIterator<Item = Arc<dyn ModelProvider>>,
+    ) -> Result<Arc<ModelRegistry>, CodingError> {
+        self.runtime
+            .update_model_providers(provider_ids, providers)
+            .map_err(CodingError::from)
     }
 
     /// Returns a safe immutable MCP lifecycle and catalog projection.

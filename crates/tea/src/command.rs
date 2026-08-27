@@ -1,6 +1,7 @@
 use std::sync::Arc;
 use tea_control::CancellationScope;
 use tea_kernel::{AgentKernel, KernelRunConfig};
+use tea_model::ModelRouter;
 use tea_policy::{ApprovalResolution, GrantScope, PolicyGrant, ResourcePattern};
 use tea_protocol::{
     AgentCommand, AgentCommandType, ApprovalDecision, BranchId, CanonicalMessage, CommandEnvelope,
@@ -10,6 +11,7 @@ use tea_protocol::{
 use tea_session::ApprovalArtifactEntry;
 
 use crate::prompt::compile_prompt;
+use crate::runtime::resolve_model;
 use crate::{AgentRuntime, RuntimeError, RuntimeErrorCode};
 
 struct ActiveRunGuard<'a> {
@@ -187,11 +189,12 @@ impl AgentRuntime {
                 "session id cannot be converted to a root branch id",
             )
         })?;
-        let model = self.resolve_model(binding.model_ref())?;
-        let reasoning_effort = self
-            .default_reasoning_effort
-            .and_then(|requested| model.resolve_reasoning(Some(requested)))
-            .map(tea_model::ReasoningResolution::effective);
+        let models = self.model_registry();
+        let reasoning_effort = models.model(binding.model_ref()).and_then(|model| {
+            self.default_reasoning_effort
+                .and_then(|requested| model.resolve_reasoning(Some(requested)))
+                .map(tea_model::ReasoningResolution::effective)
+        });
         let records = self.build_records(
             session_id,
             timestamp,
@@ -231,7 +234,7 @@ impl AgentRuntime {
             )
         })?;
         let (active_tools, _) = self.active_tool_snapshot(session_id, binding)?;
-        active_tools.model_definitions(model).map_err(|error| {
+        active_tools.model_definitions(&model).map_err(|error| {
             RuntimeError::new(RuntimeErrorCode::InvalidRequest, error.to_string())
         })?;
         let requested_reasoning_effort = snapshot.state().configuration().reasoning_effort();
@@ -592,8 +595,9 @@ impl AgentRuntime {
                 )
             })?;
         let (tools, _) = self.active_tool_snapshot(session_id, binding)?;
+        let models = self.model_registry();
         let kernel = tea_kernel::AgentKernel::new(
-            self.models.as_ref(),
+            models.as_ref(),
             tools.as_ref(),
             binding.policy(),
             self.sessions.as_ref(),
@@ -641,10 +645,12 @@ impl AgentRuntime {
                     "session has no active model",
                 )
             })?;
-        let model = self.resolve_model(model_ref)?;
-        tools.model_definitions(model).map_err(|error| {
-            RuntimeError::new(RuntimeErrorCode::InvalidRequest, error.to_string())
-        })?;
+        let models = self.model_registry();
+        if let Some(model) = models.model(model_ref) {
+            tools.model_definitions(model).map_err(|error| {
+                RuntimeError::new(RuntimeErrorCode::InvalidRequest, error.to_string())
+            })?;
+        }
         self.replace_active_tool_override(session_id, profile_id, names)
     }
 
@@ -656,6 +662,7 @@ impl AgentRuntime {
         let session_id = Self::require_session(session_id)?;
         let active_run = self.begin_active_run(session_id)?;
         let snapshot = self.load_snapshot(session_id).await?;
+        let models = self.model_registry();
         let model_ref = snapshot
             .state()
             .configuration()
@@ -666,7 +673,7 @@ impl AgentRuntime {
                     "session has no active model",
                 )
             })?;
-        self.resolve_model(model_ref)?;
+        let model = resolve_model(models.as_ref(), model_ref)?;
         let profile_id = snapshot.state().configuration().profile_id().clone();
         let binding = self.binding(&profile_id).ok_or_else(|| {
             RuntimeError::new(
@@ -675,6 +682,9 @@ impl AgentRuntime {
             )
         })?;
         let (active_tools, active_tool_specs) = self.active_tool_snapshot(session_id, binding)?;
+        active_tools.model_definitions(model).map_err(|error| {
+            RuntimeError::new(RuntimeErrorCode::InvalidRequest, error.to_string())
+        })?;
         let run_id = self.ids.next_run_id().map_err(|error| {
             RuntimeError::new(RuntimeErrorCode::InvalidState, error.message().to_owned())
         })?;
@@ -696,6 +706,7 @@ impl AgentRuntime {
         let outcome = self
             .run_kernel(
                 session_id,
+                models,
                 binding,
                 active_tools.as_ref(),
                 &config,
@@ -745,6 +756,18 @@ impl AgentRuntime {
         let session_id = Self::require_session(session_id)?;
         let active_run = self.begin_active_run(session_id)?;
         let snapshot = self.load_snapshot(session_id).await?;
+        let models = self.model_registry();
+        let model_ref = snapshot
+            .state()
+            .configuration()
+            .model_ref()
+            .ok_or_else(|| {
+                RuntimeError::new(
+                    RuntimeErrorCode::UnknownModel,
+                    "session has no active model",
+                )
+            })?;
+        resolve_model(models.as_ref(), model_ref)?;
         let profile_id = snapshot.state().configuration().profile_id().clone();
         let binding = self.binding(&profile_id).ok_or_else(|| {
             RuntimeError::new(
@@ -809,6 +832,7 @@ impl AgentRuntime {
         let outcome = self
             .resume_kernel(
                 session_id,
+                models,
                 binding,
                 active_tools.as_ref(),
                 &resolution,
@@ -875,6 +899,7 @@ impl AgentRuntime {
     async fn run_kernel(
         &self,
         session_id: SessionId,
+        models: Arc<tea_model::ModelRegistry>,
         binding: &crate::ProfileBinding,
         tools: &tea_tools::ToolRegistry,
         config: &KernelRunConfig,
@@ -882,7 +907,7 @@ impl AgentRuntime {
     ) -> Result<tea_kernel::KernelRunOutcome, RuntimeError> {
         let queue = self.session_queue(session_id)?;
         let kernel = AgentKernel::new(
-            self.models.as_ref(),
+            models.as_ref(),
             tools,
             binding.policy(),
             self.sessions.as_ref(),
@@ -900,6 +925,7 @@ impl AgentRuntime {
     async fn resume_kernel(
         &self,
         session_id: SessionId,
+        models: Arc<tea_model::ModelRegistry>,
         binding: &crate::ProfileBinding,
         tools: &tea_tools::ToolRegistry,
         resolution: &ApprovalResolution,
@@ -908,7 +934,7 @@ impl AgentRuntime {
     ) -> Result<tea_kernel::KernelRunOutcome, RuntimeError> {
         let queue = self.session_queue(session_id)?;
         let kernel = AgentKernel::new(
-            self.models.as_ref(),
+            models.as_ref(),
             tools,
             binding.policy(),
             self.sessions.as_ref(),

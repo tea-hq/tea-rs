@@ -131,8 +131,8 @@ impl AgentRuntime {
     ///
     /// # Errors
     ///
-    /// Returns an error when the session is missing or references a profile or
-    /// model not registered by this runtime.
+    /// Returns an error when the session is missing or references a profile not
+    /// registered by this runtime. Model availability is checked when a run starts.
     pub async fn attach_session(
         &self,
         session_id: SessionId,
@@ -147,9 +147,6 @@ impl AgentRuntime {
                     configuration.profile_id()
                 ),
             ));
-        }
-        if let Some(model_ref) = configuration.model_ref() {
-            self.resolve_model(model_ref)?;
         }
         self.track_session_attached(session_id)?;
         self.runtime_session_state_from_snapshot(&snapshot).await

@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use tea_context::{ContextProvider, PromptBudget, PromptCompiler};
 use tea_kernel::{KernelClock, KernelIdSource, RunLimits, TokioKernelClock, UuidV7KernelIdSource};
-use tea_model::{ModelProvider, ModelRegistry};
+use tea_model::{ModelProvider, ModelRegistry, ModelRouter};
 use tea_policy::{ActorId, PolicyRule, UnknownEffectPolicy, WorkspaceId};
 use tea_profile::{AgentProfile, ProfileRuleId};
 use tea_protocol::{ProfileId, ReasoningEffort};
@@ -67,7 +67,7 @@ impl AgentRuntimeBuilder {
         }
     }
 
-    /// Registers one model provider. At least one is required before building.
+    /// Registers one model provider in the initial runtime generation.
     pub fn provider(mut self, provider: Arc<dyn ModelProvider>) -> Self {
         self.providers.push(provider);
         self
@@ -371,7 +371,10 @@ impl AgentRuntimeBuilder {
                 ));
             }
             let model_ref = profile.model_ref().clone();
-            let model = crate::runtime::resolve_model(models.as_ref(), &model_ref)?;
+            let model = match models.provider(model_ref.provider_id()) {
+                Some(_) => Some(crate::runtime::resolve_model(models.as_ref(), &model_ref)?),
+                None => None,
+            };
             if profile.active_tool_names().is_empty()
                 && !profile.workspace_instructions().is_empty()
             {
@@ -379,9 +382,11 @@ impl AgentRuntimeBuilder {
             }
             let (tools, active_tool_specs) =
                 build_filtered_registry(profile.active_tool_names(), &self.tool_registrations)?;
-            tools.model_definitions(model).map_err(|error| {
-                RuntimeError::new(RuntimeErrorCode::InvalidRequest, error.to_string())
-            })?;
+            if let Some(model) = model {
+                tools.model_definitions(model).map_err(|error| {
+                    RuntimeError::new(RuntimeErrorCode::InvalidRequest, error.to_string())
+                })?;
+            }
             let resolved_rules: Vec<SharedPolicyRule> = profile
                 .policy_rule_ids()
                 .iter()
