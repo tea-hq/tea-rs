@@ -82,7 +82,7 @@ pub struct ResponsesReducer {
     text_by_index: BTreeMap<u16, String>,
     text_by_content: BTreeMap<(u16, u16), String>,
     emitted_text: String,
-    reasoning_by_index: BTreeMap<u16, String>,
+    reasoning_by_index: BTreeMap<(u16, u16), String>,
     citation_payloads: BTreeMap<(u16, u16, u16), Value>,
     pending_citations: BTreeMap<(u16, u16, u16), SourceCitation>,
     pending_citation_bytes: usize,
@@ -198,7 +198,7 @@ impl ResponsesReducer {
                         self.text_by_index.entry(index).or_default();
                     }
                     OutputItemKind::Reasoning => {
-                        self.reasoning_by_index.entry(index).or_default();
+                        self.reasoning_by_index.entry((index, 0)).or_default();
                     }
                     OutputItemKind::Other(_) => {}
                 }
@@ -237,10 +237,15 @@ impl ResponsesReducer {
             }
             "response.reasoning_summary_text.delta" | "response.reasoning_text.delta" => {
                 let index = self.resolve_output_index(value)?;
+                let summary_index = value
+                    .get("summary_index")
+                    .map(|_| bounded_event_index(value, "summary_index"))
+                    .transpose()?
+                    .unwrap_or(0);
                 self.register_output_item_kind(index, OutputItemKind::Reasoning)?;
                 if let Some(delta) = nonempty_string(value, "delta") {
                     self.reasoning_by_index
-                        .entry(index)
+                        .entry((index, summary_index))
                         .or_default()
                         .push_str(delta);
                     events.push(ModelEvent::ThinkingDelta(
@@ -253,7 +258,8 @@ impl ResponsesReducer {
                 let index = self.resolve_output_index(value)?;
                 self.register_output_item_kind(index, OutputItemKind::Reasoning)?;
                 if let Some(text) = value.get("text").and_then(Value::as_str) {
-                    self.reconcile_reasoning(index, text, &mut events)?;
+                    let summary_index = bounded_event_index(value, "summary_index")?;
+                    self.reconcile_reasoning(index, summary_index, text, &mut events)?;
                 }
             }
             "response.function_call_arguments.delta" => {
@@ -689,16 +695,17 @@ impl ResponsesReducer {
                 self.emit_message_annotations(index, item, events)?;
             }
             OutputItemKind::Reasoning => {
-                let text = item
-                    .get("summary")
-                    .and_then(Value::as_array)
-                    .into_iter()
-                    .flatten()
-                    .filter_map(|summary| summary.get("text").and_then(Value::as_str))
-                    .collect::<Vec<_>>()
-                    .join("\n\n");
-                if !text.is_empty() {
-                    self.reconcile_reasoning(index, &text, events)?;
+                if let Some(summary) = item.get("summary").and_then(Value::as_array) {
+                    for (summary_index, summary) in summary.iter().enumerate() {
+                        let summary_index = u16::try_from(summary_index).map_err(|_| {
+                            malformed("Responses reasoning summary index out of range")
+                        })?;
+                        if let Some(text) = summary.get("text").and_then(Value::as_str)
+                            && !text.is_empty()
+                        {
+                            self.reconcile_reasoning(index, summary_index, text, events)?;
+                        }
+                    }
                 }
             }
             OutputItemKind::Other(_) => {}
@@ -1007,10 +1014,14 @@ impl ResponsesReducer {
     fn reconcile_reasoning(
         &mut self,
         index: u16,
+        summary_index: u16,
         text: &str,
         events: &mut Vec<ModelEvent>,
     ) -> Result<(), OpenAiError> {
-        let current = self.reasoning_by_index.entry(index).or_default();
+        let current = self
+            .reasoning_by_index
+            .entry((index, summary_index))
+            .or_default();
         let suffix = text
             .strip_prefix(current.as_str())
             .ok_or_else(|| malformed("Responses reasoning text changed"))?;

@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
@@ -90,29 +90,137 @@ impl ProcessCodingConfiguration {
     /// Returns typed failures for unreadable settings, invalid provider files,
     /// missing credentials, unsupported catalogs, or provider construction.
     pub fn load(&self) -> Result<ConfiguredCodingProvider, CodingError> {
+        let configured = self.load_all()?;
+        let provider = Arc::clone(
+            configured
+                .providers
+                .first()
+                .ok_or_else(|| invalid("provider configuration is empty"))?,
+        );
+        Ok(ConfiguredCodingProvider {
+            settings: configured.settings,
+            provider,
+        })
+    }
+
+    /// Loads global settings and every explicitly configured provider.
+    ///
+    /// The provider selected by `settings.json` is always first. Remaining
+    /// providers follow canonical provider-id order from `providers.json`.
+    ///
+    /// # Errors
+    ///
+    /// Returns typed failures when any configured provider cannot be resolved
+    /// into one immutable provider generation.
+    pub fn load_all(&self) -> Result<ConfiguredCodingProviders, CodingError> {
+        self.load_all_with_provider_id(|provider_id| ProviderId::from_str(provider_id).ok())
+    }
+
+    /// Loads every provider after assigning its final runtime identity.
+    ///
+    /// The mapper runs before provider construction so every advertised
+    /// [`ModelSpec`] is born with the same final identity as its provider. This
+    /// is intended for hosts that namespace provider sources, such as
+    /// `local.openai`, without teaching `tea-model` about those sources.
+    ///
+    /// # Errors
+    ///
+    /// Returns typed failures for configuration, identity mapping, duplicate
+    /// mapped identities, credentials, catalogs, or provider construction.
+    pub fn load_all_with_provider_id(
+        &self,
+        map_provider_id: impl Fn(&str) -> Option<ProviderId>,
+    ) -> Result<ConfiguredCodingProviders, CodingError> {
         let settings = load_settings_file(&self.config_dir.join("settings.json"))?;
         let providers = load_providers_file(&self.config_dir.join("providers.json"));
         if providers.error.is_some() {
             return Err(invalid("provider configuration is invalid"));
         }
-        let settings = merge_settings(
+        let mut settings = merge_settings(
             CodingSettings::default(),
             settings.as_ref(),
             None,
             None,
             None,
         )?;
+        let selected_source_id = settings.provider.clone();
+        let selected_provider_id = map_provider_id(&selected_source_id)
+            .ok_or_else(|| invalid("mapped provider identity is invalid"))?;
+        let mut mapped_provider_ids = BTreeSet::from([selected_provider_id.clone()]);
         let resolved = resolve_openai_compatible_provider(
-            &settings.provider,
+            selected_provider_id.as_str(),
             &settings.model,
-            providers.config.providers.get(&settings.provider),
+            providers.config.providers.get(&selected_source_id),
             None,
             self.environment.clone(),
         )?;
-        Ok(ConfiguredCodingProvider {
+        settings.provider = selected_provider_id.to_string();
+        let mut resolved_providers = vec![resolved.build()?];
+        for (provider_id, provider) in &providers.config.providers {
+            if provider_id == &selected_source_id {
+                continue;
+            }
+            let mapped_provider_id = map_provider_id(provider_id)
+                .ok_or_else(|| invalid("mapped provider identity is invalid"))?;
+            if !mapped_provider_ids.insert(mapped_provider_id.clone()) {
+                return Err(invalid("mapped provider identity is duplicated"));
+            }
+            let model_id = provider
+                .models
+                .first()
+                .map(|model| model.id.as_str())
+                .ok_or_else(|| invalid("configured provider model catalog is empty"))?;
+            let resolved = resolve_openai_compatible_provider(
+                mapped_provider_id.as_str(),
+                model_id,
+                Some(provider),
+                None,
+                self.environment.clone(),
+            )?;
+            resolved_providers.push(resolved.build()?);
+        }
+        Ok(ConfiguredCodingProviders {
             settings,
-            provider: resolved.build()?,
+            providers: resolved_providers,
         })
+    }
+}
+
+/// Secret-safe settings and all providers loaded for one process generation.
+#[derive(Clone)]
+pub struct ConfiguredCodingProviders {
+    settings: CodingSettings,
+    providers: Vec<Arc<dyn ModelProvider>>,
+}
+
+impl std::fmt::Debug for ConfiguredCodingProviders {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ConfiguredCodingProviders")
+            .field("settings", &self.settings)
+            .field(
+                "providers",
+                &self
+                    .providers
+                    .iter()
+                    .map(|provider| (provider.provider_id(), provider.models()))
+                    .collect::<Vec<_>>(),
+            )
+            .finish()
+    }
+}
+
+impl ConfiguredCodingProviders {
+    /// Returns the selected global settings.
+    #[must_use]
+    pub const fn settings(&self) -> &CodingSettings {
+        &self.settings
+    }
+
+    /// Returns all initialized providers with the selected provider first.
+    #[must_use]
+    pub fn providers(&self) -> &[Arc<dyn ModelProvider>] {
+        &self.providers
     }
 }
 
@@ -506,6 +614,74 @@ mod tests {
             "debug-model"
         );
         assert!(!format!("{configured:?}").contains("configured-secret"));
+        fs::remove_dir_all(directory).expect("temporary configuration cleanup");
+    }
+
+    #[test]
+    fn global_configuration_builds_every_configured_provider_with_the_selected_one_first() {
+        let directory = config_dir("multiple-providers");
+        fs::write(
+            directory.join("settings.json"),
+            r#"{"schemaVersion":1,"provider":"local-b","model":"model-b"}"#,
+        )
+        .expect("settings file");
+        fs::write(
+            directory.join("providers.json"),
+            r#"{
+                "providers": {
+                    "local-a": {
+                        "base_url": "http://127.0.0.1:11434/v1",
+                        "api_key": "secret-a",
+                        "models": [{"id": "model-a"}]
+                    },
+                    "local-b": {
+                        "base_url": "http://127.0.0.1:11435/v1",
+                        "api_key": "secret-b",
+                        "models": [{"id": "model-b"}]
+                    }
+                }
+            }"#,
+        )
+        .expect("providers file");
+
+        let configured = ProcessCodingConfiguration::new(&directory, BTreeMap::new())
+            .unwrap()
+            .load_all()
+            .unwrap();
+
+        assert_eq!(configured.settings().provider, "local-b");
+        assert_eq!(configured.settings().model, "model-b");
+        assert_eq!(
+            configured
+                .providers()
+                .iter()
+                .map(|provider| provider.provider_id().as_str())
+                .collect::<Vec<_>>(),
+            ["local-b", "local-a"]
+        );
+        assert!(!format!("{configured:?}").contains("secret-a"));
+        assert!(!format!("{configured:?}").contains("secret-b"));
+
+        let mapped = ProcessCodingConfiguration::new(&directory, BTreeMap::new())
+            .unwrap()
+            .load_all_with_provider_id(|provider_id| {
+                ProviderId::from_str(&format!("local.{provider_id}")).ok()
+            })
+            .unwrap();
+        assert_eq!(mapped.settings().provider, "local.local-b");
+        assert_eq!(mapped.settings().model, "model-b");
+        assert_eq!(
+            mapped
+                .providers()
+                .iter()
+                .map(|provider| provider.provider_id().as_str())
+                .collect::<Vec<_>>(),
+            ["local.local-b", "local.local-a"]
+        );
+        assert_eq!(
+            mapped.providers()[0].models()[0].provider_id().as_str(),
+            "local.local-b"
+        );
         fs::remove_dir_all(directory).expect("temporary configuration cleanup");
     }
 

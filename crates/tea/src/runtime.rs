@@ -1,9 +1,9 @@
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 
 use tea_context::PromptCompiler;
 use tea_kernel::{KernelClock, KernelIdSource};
-use tea_model::{ModelProvider, ModelRegistry, ModelRouter, ModelSpec};
+use tea_model::{ModelProvider, ModelRegistry, ModelRegistryError, ModelRouter, ModelSpec};
 use tea_policy::{ActorId, WorkspaceId};
 use tea_protocol::{ModelRef, ProfileId, ReasoningEffort, SessionId};
 use tea_session::SessionStore;
@@ -57,6 +57,15 @@ pub(crate) fn resolve_model<'a>(
     })
 }
 
+fn registry_error(error: &ModelRegistryError) -> RuntimeError {
+    let code = match error {
+        ModelRegistryError::DuplicateProvider(_) => RuntimeErrorCode::DuplicateEntry,
+        ModelRegistryError::UnknownProvider(_) => RuntimeErrorCode::UnknownProvider,
+        ModelRegistryError::ProviderCatalogMismatch(_) => RuntimeErrorCode::InvalidRequest,
+    };
+    RuntimeError::new(code, error.to_string())
+}
+
 /// Ergonomic embedding facade owning replaceable ports and profile bindings.
 ///
 /// Construct through [`crate::AgentRuntimeBuilder`]. The runtime constructs a
@@ -64,7 +73,7 @@ pub(crate) fn resolve_model<'a>(
 #[allow(dead_code)]
 #[derive(Debug)]
 pub struct AgentRuntime {
-    pub(crate) models: Arc<ModelRegistry>,
+    models: RwLock<Arc<ModelRegistry>>,
     pub(crate) clock: Arc<dyn KernelClock>,
     pub(crate) ids: Arc<dyn KernelIdSource>,
     pub(crate) session_id_source: Arc<dyn SessionIdSource>,
@@ -111,7 +120,7 @@ impl AgentRuntime {
         default_reasoning_effort: Option<ReasoningEffort>,
     ) -> Self {
         Self {
-            models,
+            models: RwLock::new(models),
             clock,
             ids,
             session_id_source,
@@ -136,14 +145,91 @@ impl AgentRuntime {
         }
     }
 
-    /// Returns provider-advertised models in stable adapter order.
+    /// Returns provider-advertised models from the current immutable generation.
+    ///
     #[must_use]
-    pub fn models(&self) -> &[tea_model::ModelSpec] {
-        self.models.models()
+    pub fn models(&self) -> Vec<tea_model::ModelSpec> {
+        self.model_registry().models().to_vec()
     }
 
-    pub(crate) fn resolve_model(&self, model_ref: &ModelRef) -> Result<&ModelSpec, RuntimeError> {
-        resolve_model(self.models.as_ref(), model_ref)
+    pub(crate) fn resolve_model(&self, model_ref: &ModelRef) -> Result<ModelSpec, RuntimeError> {
+        let models = self.model_registry();
+        resolve_model(models.as_ref(), model_ref).cloned()
+    }
+
+    /// Returns the current immutable model-provider generation.
+    ///
+    /// Active runs retain their own returned generation while future runs read
+    /// whatever generation is current when they start.
+    ///
+    #[must_use]
+    pub fn model_registry(&self) -> Arc<ModelRegistry> {
+        let models = self
+            .models
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        Arc::clone(&models)
+    }
+
+    /// Atomically publishes a generation containing additional providers.
+    ///
+    /// Registration does not change any session's selected model.
+    ///
+    /// # Errors
+    ///
+    /// Returns a duplicate-entry error when a provider identity is already
+    /// registered.
+    pub fn register_model_providers(
+        &self,
+        providers: impl IntoIterator<Item = Arc<dyn ModelProvider>>,
+    ) -> Result<Arc<ModelRegistry>, RuntimeError> {
+        self.update_model_providers([], providers)
+    }
+
+    /// Atomically publishes a generation without the requested providers.
+    ///
+    /// Existing runs keep their starting generation. Sessions keep their
+    /// selected [`ModelRef`] and future prompts fail until it is available again.
+    ///
+    /// # Errors
+    ///
+    /// Returns an unknown-provider error when any requested identity is absent,
+    /// or the requested generation is otherwise invalid.
+    pub fn remove_model_providers(
+        &self,
+        provider_ids: impl IntoIterator<Item = tea_model::ProviderId>,
+    ) -> Result<Arc<ModelRegistry>, RuntimeError> {
+        self.update_model_providers(provider_ids, [])
+    }
+
+    /// Atomically removes and registers providers as one generation update.
+    ///
+    /// This supports replacing one host-owned provider set without exposing a
+    /// transient partial catalog. Provider identities removed by the same call
+    /// may be registered again with a new immutable adapter.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error without publishing a partial generation when removal or
+    /// registration validation fails.
+    pub fn update_model_providers(
+        &self,
+        provider_ids: impl IntoIterator<Item = tea_model::ProviderId>,
+        providers: impl IntoIterator<Item = Arc<dyn ModelProvider>>,
+    ) -> Result<Arc<ModelRegistry>, RuntimeError> {
+        let provider_ids = provider_ids.into_iter().collect::<Vec<_>>();
+        let providers = providers.into_iter().collect::<Vec<_>>();
+        let mut current = self
+            .models
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let next = current
+            .without_providers(provider_ids)
+            .and_then(|registry| registry.with_registered(providers))
+            .map_err(|error| registry_error(&error))?;
+        let next = Arc::new(next);
+        *current = Arc::clone(&next);
+        Ok(next)
     }
 
     /// Returns the bound profile configuration, if registered.
@@ -288,9 +374,9 @@ impl AgentRuntime {
     /// Returns a health summary of the runtime configuration.
     #[must_use]
     pub fn health(&self) -> RuntimeHealth {
-        let provider_ids = self.models.provider_ids();
-        let model_refs = self
-            .models
+        let models = self.model_registry();
+        let provider_ids = models.provider_ids();
+        let model_refs = models
             .models()
             .iter()
             .map(|model| model.model_ref().clone())
@@ -362,14 +448,8 @@ impl AgentRuntime {
 
     /// Returns one runtime model provider by canonical identity.
     #[must_use]
-    pub fn provider(&self, provider_id: &tea_model::ProviderId) -> Option<&dyn ModelProvider> {
-        self.models.provider(provider_id)
-    }
-
-    /// Returns the immutable model router generation.
-    #[must_use]
-    pub fn model_router(&self) -> &Arc<ModelRegistry> {
-        &self.models
+    pub fn provider(&self, provider_id: &tea_model::ProviderId) -> Option<Arc<dyn ModelProvider>> {
+        self.model_registry().provider_arc(provider_id)
     }
 
     /// Returns the prompt compiler.

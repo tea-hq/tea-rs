@@ -25,7 +25,15 @@ async fn execute(args: &CliArgs) -> Result<(), CliFailure> {
     let stdin = std::io::stdin();
     let stdin_is_terminal = stdin.is_terminal();
     let stdout_is_terminal = std::io::stdout().is_terminal();
-    if args.rpc {
+    if args.app_server {
+        Box::pin(tea_cli::app_server::run(
+            args,
+            &bootstrap,
+            tokio::io::stdin(),
+            tokio::io::stdout(),
+        ))
+        .await
+    } else if args.rpc {
         Box::pin(tea_cli::rpc::run(
             args,
             &bootstrap,

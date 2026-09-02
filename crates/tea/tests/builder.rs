@@ -163,13 +163,23 @@ fn desktop_profile() -> tea_profile::AgentProfile {
 }
 
 #[test]
-fn build_without_provider_fails() {
-    let err = AgentRuntimeBuilder::new()
+fn build_without_provider_keeps_a_valid_empty_generation() {
+    let profile = tea_profile::AgentProfile::builder(
+        "providerless".parse().unwrap(),
+        "Providerless".parse().unwrap(),
+        model_ref("fake/model"),
+    )
+    .environment(environment(ExecutionSurface::Cli))
+    .build()
+    .unwrap();
+    let runtime = AgentRuntimeBuilder::new()
         .actor(ActorId::from_str("user:alice").unwrap())
-        .profile(coding_profile())
+        .profile(profile)
         .build()
-        .unwrap_err();
-    assert_eq!(err.code(), RuntimeErrorCode::InvalidRequest);
+        .unwrap();
+
+    assert!(runtime.models().is_empty());
+    assert!(runtime.health().provider_ids().is_empty());
 }
 
 #[test]
@@ -257,7 +267,7 @@ fn build_rejects_unregistered_model() {
 }
 
 #[test]
-fn build_rejects_unregistered_provider_distinctly() {
+fn build_defers_an_unregistered_profile_provider_until_run_time() {
     let profile = tea_profile::AgentProfile::builder(
         "coding-agent".parse().unwrap(),
         "Coding Agent".parse().unwrap(),
@@ -266,18 +276,17 @@ fn build_rejects_unregistered_provider_distinctly() {
             "fake/model".parse().unwrap(),
         ),
     )
-    .active_tool("read_file".parse().unwrap())
-    .policy_rule(ProfileRuleId::from_str("product.coding_workspace").unwrap())
     .environment(environment(ExecutionSurface::Cli))
     .build()
     .unwrap();
-    let err = AgentRuntimeBuilder::new()
+    let runtime = AgentRuntimeBuilder::new()
         .provider(provider())
         .actor(ActorId::from_str("user:alice").unwrap())
         .profile(profile)
         .build()
-        .unwrap_err();
-    assert_eq!(err.code(), RuntimeErrorCode::UnknownProvider);
+        .unwrap();
+
+    assert_eq!(runtime.models().len(), 1);
 }
 
 #[test]
@@ -500,11 +509,8 @@ fn hosted_tool_is_available_but_only_active_for_explicit_profiles() {
         .binding(&"hosted-inactive".parse().unwrap())
         .unwrap();
     let active = runtime.binding(&"hosted-active".parse().unwrap()).unwrap();
-    let model = runtime
-        .provider(&"fake".parse().unwrap())
-        .unwrap()
-        .model(&"fake/model".parse().unwrap())
-        .unwrap();
+    let provider = runtime.provider(&"fake".parse().unwrap()).unwrap();
+    let model = provider.model(&"fake/model".parse().unwrap()).unwrap();
 
     assert_eq!(inactive.all_tools().names().count(), 1);
     assert!(

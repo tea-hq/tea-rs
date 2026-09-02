@@ -6,6 +6,8 @@
 //! Terminal, argument parser, JSONL/RPC, and presentation dependencies stop at
 //! this crate. Runtime and product state remain authoritative in inward crates.
 
+/// Versioned protocol-neutral app-server contract.
+pub mod app_server;
 /// Shared command-line argument contract.
 pub mod args;
 /// Injected production/test service bootstrap.

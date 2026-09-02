@@ -38,6 +38,9 @@ pub enum SessionSelection {
 #[command(name = "tea", version = crate::version())]
 #[allow(clippy::struct_excessive_bools)] // Clap presence flags map to one validated selection.
 pub struct CliArgs {
+    /// Run the protocol-neutral Tea app-server over stdin/stdout.
+    #[arg(long = "app-server", conflicts_with_all = ["print", "json", "rpc", "prompt"])]
+    pub app_server: bool,
     /// Run one script-safe prompt and print only the final assistant text.
     #[arg(long, conflicts_with_all = ["json", "rpc"])]
     pub print: bool,

@@ -55,6 +55,15 @@ fn model_ref(provider_id: &str, model_id: &str) -> ModelRef {
 }
 
 #[test]
+fn empty_registry_is_a_valid_generation() {
+    let registry = ModelRegistry::empty();
+
+    assert_eq!(registry.provider_count(), 0);
+    assert!(registry.provider_ids().is_empty());
+    assert!(registry.models().is_empty());
+}
+
+#[test]
 fn registry_rejects_duplicate_provider_identities() {
     let error = ModelRegistry::new([
         provider("one", vec![model("one", "shared")]),
@@ -104,4 +113,72 @@ fn same_model_id_is_resolved_by_provider_qualified_identity() {
         "two"
     );
     assert!(registry.model(&model_ref("missing", "shared")).is_none());
+}
+
+#[test]
+fn registration_publishes_a_new_generation_without_mutating_the_old_one() {
+    let first = provider("one", vec![model("one", "shared")]);
+    let original = ModelRegistry::new([Arc::clone(&first)]).unwrap();
+
+    let next = original
+        .with_registered([provider("two", vec![model("two", "shared")])])
+        .unwrap();
+
+    assert_eq!(original.provider_ids(), ["one".parse().unwrap()]);
+    assert_eq!(
+        next.provider_ids(),
+        ["one".parse().unwrap(), "two".parse().unwrap()]
+    );
+    assert!(Arc::ptr_eq(
+        &original.provider_arc(first.provider_id()).unwrap(),
+        &first
+    ));
+}
+
+#[test]
+fn batch_registration_is_atomic_when_a_provider_id_is_duplicated() {
+    let original = ModelRegistry::new([provider("one", vec![model("one", "shared")])]).unwrap();
+
+    let error = original
+        .with_registered([
+            provider("two", vec![model("two", "shared")]),
+            provider("one", vec![model("one", "other")]),
+        ])
+        .unwrap_err();
+
+    assert_eq!(
+        error,
+        ModelRegistryError::DuplicateProvider("one".parse().unwrap())
+    );
+    assert_eq!(original.provider_ids(), ["one".parse().unwrap()]);
+    assert!(original.provider(&"two".parse().unwrap()).is_none());
+}
+
+#[test]
+fn removal_publishes_an_empty_generation_while_the_old_generation_stays_usable() {
+    let first = provider("one", vec![model("one", "shared")]);
+    let original = ModelRegistry::new([Arc::clone(&first)]).unwrap();
+
+    let next = original
+        .without_providers([first.provider_id().clone()])
+        .unwrap();
+
+    assert_eq!(next.provider_count(), 0);
+    assert!(next.provider(first.provider_id()).is_none());
+    assert!(Arc::ptr_eq(
+        &original.provider_arc(first.provider_id()).unwrap(),
+        &first
+    ));
+    assert!(original.model(&model_ref("one", "shared")).is_some());
+}
+
+#[test]
+fn removal_rejects_an_unknown_provider_without_changing_the_generation() {
+    let original = ModelRegistry::new([provider("one", vec![model("one", "shared")])]).unwrap();
+    let missing = ProviderId::from_str("missing").unwrap();
+
+    let error = original.without_providers([missing.clone()]).unwrap_err();
+
+    assert_eq!(error, ModelRegistryError::UnknownProvider(missing));
+    assert_eq!(original.provider_ids(), ["one".parse().unwrap()]);
 }

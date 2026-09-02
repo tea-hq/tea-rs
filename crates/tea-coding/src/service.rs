@@ -8,7 +8,7 @@ use std::task::Poll;
 use tea::{AgentRuntime, RuntimeCommandOutcome, RuntimeSessionState, SessionStats};
 use tea_coding_tools::WorkspaceRoot;
 use tea_mcp::{McpError, McpManager, McpServerHealth, McpServerId};
-use tea_model::{ModelCapabilities, ModelSpec};
+use tea_model::{ModelCapabilities, ModelProvider, ModelRegistry, ModelSpec, ProviderId};
 use tea_policy::WorkspaceId;
 use tea_protocol::{
     AgentCommand, ApprovalDecision, ApprovalId, BranchId, CanonicalMessage, CommandEnvelope,
@@ -109,7 +109,7 @@ impl CodingAgentService {
             .map(|model| model.model_ref().clone())
             .collect()
     }
-    /// Returns capabilities for one model in the frozen provider catalog.
+    /// Returns capabilities for one model in the current provider generation.
     #[must_use]
     pub fn model_capabilities(&self, model_ref: &ModelRef) -> Option<ModelCapabilities> {
         self.runtime
@@ -118,13 +118,71 @@ impl CodingAgentService {
             .find(|model| model.model_ref() == model_ref)
             .map(tea_model::ModelSpec::capabilities)
     }
-    /// Returns one advertised model contract from the frozen catalog.
+    /// Returns one advertised model contract from the current provider generation.
     #[must_use]
-    pub fn model_spec(&self, model_ref: &ModelRef) -> Option<&ModelSpec> {
+    pub fn model_spec(&self, model_ref: &ModelRef) -> Option<ModelSpec> {
         self.runtime
             .models()
-            .iter()
+            .into_iter()
             .find(|model| model.model_ref() == model_ref)
+    }
+
+    /// Validates a model against the current provider and profile tool contracts.
+    pub fn validate_model(&self, model_ref: &ModelRef) -> Result<(), CodingError> {
+        let model = self.model_spec(model_ref).ok_or_else(|| {
+            CodingError::new(
+                CodingErrorCode::InvalidInput,
+                "requested model is unavailable",
+            )
+        })?;
+        let profile_id = ProfileId::from_str("coding-agent").map_err(|_| {
+            CodingError::new(CodingErrorCode::Runtime, "coding profile is unavailable")
+        })?;
+        let binding = self.runtime.binding(&profile_id).ok_or_else(|| {
+            CodingError::new(CodingErrorCode::Runtime, "coding profile is unavailable")
+        })?;
+        binding
+            .tools()
+            .model_definitions(&model)
+            .map(|_| ())
+            .map_err(|error| CodingError::new(CodingErrorCode::InvalidInput, error.to_string()))
+    }
+
+    /// Returns the current immutable provider generation.
+    #[must_use]
+    pub fn model_registry(&self) -> Arc<ModelRegistry> {
+        self.runtime.model_registry()
+    }
+
+    /// Atomically registers providers without changing any session selection.
+    pub fn register_model_providers(
+        &self,
+        providers: impl IntoIterator<Item = Arc<dyn ModelProvider>>,
+    ) -> Result<Arc<ModelRegistry>, CodingError> {
+        self.runtime
+            .register_model_providers(providers)
+            .map_err(CodingError::from)
+    }
+
+    /// Atomically removes providers while preserving session model references.
+    pub fn remove_model_providers(
+        &self,
+        provider_ids: impl IntoIterator<Item = ProviderId>,
+    ) -> Result<Arc<ModelRegistry>, CodingError> {
+        self.runtime
+            .remove_model_providers(provider_ids)
+            .map_err(CodingError::from)
+    }
+
+    /// Atomically replaces part of the provider generation.
+    pub fn update_model_providers(
+        &self,
+        provider_ids: impl IntoIterator<Item = ProviderId>,
+        providers: impl IntoIterator<Item = Arc<dyn ModelProvider>>,
+    ) -> Result<Arc<ModelRegistry>, CodingError> {
+        self.runtime
+            .update_model_providers(provider_ids, providers)
+            .map_err(CodingError::from)
     }
 
     /// Returns a safe immutable MCP lifecycle and catalog projection.
@@ -138,6 +196,60 @@ impl CodingAgentService {
             .map_err(|_| tea_mcp::McpError::new(tea_mcp::McpErrorCode::Unavailable))?
             .clone();
         mcp::snapshot(manager.as_deref(), now_mcp()?)
+    }
+
+    /// Returns the frozen MCP tool names currently owned by this service.
+    #[must_use]
+    pub fn mcp_tool_names(&self) -> Vec<ToolName> {
+        self.mcp_manager
+            .lock()
+            .ok()
+            .and_then(|manager| manager.as_ref().cloned())
+            .map(|manager| {
+                manager
+                    .catalog()
+                    .bindings()
+                    .map(|binding| binding.spec().name().clone())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Returns frozen MCP tool names owned by the supplied server identities.
+    #[must_use]
+    pub fn mcp_tool_names_for_servers(&self, server_ids: &[McpServerId]) -> Vec<ToolName> {
+        self.mcp_manager
+            .lock()
+            .ok()
+            .and_then(|manager| manager.as_ref().cloned())
+            .map(|manager| {
+                manager
+                    .catalog()
+                    .bindings()
+                    .filter(|binding| {
+                        server_ids
+                            .iter()
+                            .any(|server_id| server_id == binding.server_id())
+                    })
+                    .map(|binding| binding.spec().name().clone())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Returns the profile's default active tool set for one session.
+    pub async fn default_active_tool_names(
+        &self,
+        session_id: SessionId,
+    ) -> Result<Vec<ToolName>, CodingError> {
+        let state = self.snapshot(session_id).await?;
+        let Some(binding) = self.runtime.binding(state.profile_id()) else {
+            return Err(CodingError::new(
+                CodingErrorCode::Runtime,
+                "session profile is not registered",
+            ));
+        };
+        Ok(binding.active_tool_names().to_vec())
     }
 
     /// Reconnects one configured MCP server only when its new discovery
@@ -325,6 +437,18 @@ impl CodingAgentService {
             }
         })
         .await
+    }
+
+    /// Waits for the currently owned command and returns its terminal outcome.
+    ///
+    /// This is equivalent to [`Self::wait`], but is named for protocol hosts
+    /// that need to distinguish a completed turn from a turn paused for
+    /// approval before deciding whether to continue it.
+    pub async fn wait_owned(
+        &self,
+        session_id: SessionId,
+    ) -> Result<RuntimeCommandOutcome, CodingError> {
+        self.wait(session_id).await
     }
 
     /// Sends steering text to an active run.

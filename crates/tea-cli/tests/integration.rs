@@ -1,5 +1,15 @@
 #![forbid(unsafe_code)]
 
+#[path = "app_server_live_smoke.rs"]
+mod app_server_live_smoke;
+#[path = "app_server_mcp.rs"]
+mod app_server_mcp;
+#[path = "app_server_process.rs"]
+mod app_server_process;
+#[path = "app_server_protocol.rs"]
+mod app_server_protocol;
+#[path = "app_server_session.rs"]
+mod app_server_session;
 #[path = "args.rs"]
 mod args;
 #[path = "tui/common.rs"]

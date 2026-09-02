@@ -14,8 +14,8 @@ pub use crate::mcp_config::{
 pub use file::{MAX_SETTINGS_FILE_BYTES, load_settings_file, persist_global_model_settings};
 pub use merge::merge_settings;
 pub use process::{
-    ConfiguredCodingProvider, ProcessCodingConfiguration, ResolvedOpenAiProvider,
-    resolve_openai_compatible_provider,
+    ConfiguredCodingProvider, ConfiguredCodingProviders, ProcessCodingConfiguration,
+    ResolvedOpenAiProvider, resolve_openai_compatible_provider,
 };
 pub use providers::{
     HostedToolCapability, MAX_PROVIDERS_FILE_BYTES, ModelCapabilitiesConfig, ModelDefinition,

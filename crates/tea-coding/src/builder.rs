@@ -70,10 +70,41 @@ impl CodingAgentBuilder {
     where
         S: SessionStore + SessionCatalog + 'static,
     {
+        Self::without_provider(
+            workspace,
+            resources,
+            store,
+            bash,
+            settings,
+            actor,
+            workspace_id,
+        )
+        .provider(provider)
+    }
+
+    /// Creates a service whose model providers will be registered dynamically.
+    ///
+    /// The resulting service can create and restore sessions immediately. A
+    /// prompt fails with an unknown-provider error until the selected model's
+    /// provider is registered through [`CodingAgentService`](crate::CodingAgentService).
+    #[allow(clippy::too_many_arguments)]
+    #[must_use]
+    pub fn without_provider<S>(
+        workspace: WorkspaceRoot,
+        resources: ResourceCatalog,
+        store: Arc<S>,
+        bash: BashConfig,
+        settings: CodingSettings,
+        actor: ActorId,
+        workspace_id: WorkspaceId,
+    ) -> Self
+    where
+        S: SessionStore + SessionCatalog + 'static,
+    {
         let session_store: Arc<dyn SessionStore> = store.clone();
         let session_catalog: Arc<dyn SessionCatalog> = store;
         Self {
-            providers: vec![provider],
+            providers: Vec::new(),
             workspace,
             resources: Arc::new(resources),
             store: session_store,
@@ -103,7 +134,7 @@ impl CodingAgentBuilder {
         self
     }
 
-    /// Registers an additional model provider in the immutable runtime generation.
+    /// Registers a model provider in the initial runtime generation.
     #[must_use]
     pub fn provider(mut self, provider: Arc<dyn ModelProvider>) -> Self {
         self.providers.push(provider);
