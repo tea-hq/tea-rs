@@ -1136,6 +1136,90 @@ fn responses_allows_reasoning_and_message_streams_to_reuse_a_non_executable_inde
 }
 
 #[test]
+fn responses_reasoning_keeps_multiple_summary_parts_independent() {
+    let mut reducer = ResponsesReducer::new();
+    let streamed = [
+        serde_json::json!({
+            "type": "response.output_item.added",
+            "output_index": 0,
+            "item": {"id": "reasoning_multi", "type": "reasoning", "summary": []}
+        }),
+        serde_json::json!({
+            "type": "response.reasoning_summary_text.delta",
+            "output_index": 0,
+            "item_id": "reasoning_multi",
+            "summary_index": 0,
+            "delta": "First part."
+        }),
+        serde_json::json!({
+            "type": "response.reasoning_summary_text.delta",
+            "output_index": 0,
+            "item_id": "reasoning_multi",
+            "summary_index": 1,
+            "delta": "Second part."
+        }),
+        serde_json::json!({
+            "type": "response.reasoning_summary_text.done",
+            "output_index": 0,
+            "item_id": "reasoning_multi",
+            "summary_index": 0,
+            "text": "First part."
+        }),
+        serde_json::json!({
+            "type": "response.reasoning_summary_text.done",
+            "output_index": 0,
+            "item_id": "reasoning_multi",
+            "summary_index": 1,
+            "text": "Second part."
+        }),
+        serde_json::json!({
+            "type": "response.output_item.done",
+            "output_index": 0,
+            "item": {
+                "id": "reasoning_multi",
+                "type": "reasoning",
+                "summary": [
+                    {"type": "summary_text", "text": "First part."},
+                    {"type": "summary_text", "text": "Second part."}
+                ]
+            }
+        }),
+    ];
+    let mut events = Vec::new();
+    for value in streamed {
+        events.extend(reducer.map_chunk(&value).unwrap());
+    }
+
+    events.extend(
+        reducer
+            .map_chunk(&serde_json::json!({
+                "type": "response.completed",
+                "response": {
+                    "id": "resp_reasoning_multi",
+                    "status": "completed",
+                    "output": [{
+                        "id": "reasoning_multi",
+                        "type": "reasoning",
+                        "summary": [
+                            {"type": "summary_text", "text": "First part."},
+                            {"type": "summary_text", "text": "Second part."}
+                        ]
+                    }]
+                }
+            }))
+            .unwrap(),
+    );
+
+    let thinking = events
+        .iter()
+        .filter_map(ModelEvent::as_thinking_delta)
+        .collect::<String>();
+    assert_eq!(thinking, "First part.Second part.");
+    assert!(matches!(events.last(), Some(ModelEvent::Completed(_))));
+    assert!(events_validator_accepts(&events));
+}
+
+#[test]
 fn responses_rejects_conflicting_duplicate_web_search_completion() {
     let url = "https://example.com/duplicate";
     let mut reducer = ResponsesReducer::new();

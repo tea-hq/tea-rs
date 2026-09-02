@@ -265,6 +265,10 @@ pub struct AppServerCapabilities {
     pub session_mcp: bool,
     /// Whether permission requests are supported.
     pub permission_requests: bool,
+    /// Whether the server supports listing durable sessions.
+    pub session_list: bool,
+    /// Whether the server supports mode and model configuration updates.
+    pub session_config: bool,
 }
 
 /// Session creation parameters.
@@ -316,6 +320,9 @@ pub struct CreateSessionResult {
     pub session_id: SessionId,
     /// Current model, when configured.
     pub model: Option<ModelRef>,
+    /// Models available to this app-server runtime generation.
+    #[serde(default)]
+    pub available_models: Vec<ModelRef>,
     /// Current mode.
     pub mode: String,
 }
@@ -336,6 +343,37 @@ pub struct PromptParams {
 pub struct SessionParams {
     /// Target session.
     pub session_id: SessionId,
+}
+
+/// Session load/resume parameters.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct LoadSessionParams {
+    /// Canonical workspace path.
+    pub cwd: String,
+    /// Durable Tea session identity.
+    pub session_id: SessionId,
+    /// Optional session-scoped MCP servers.
+    #[serde(default)]
+    pub mcp_servers: Vec<McpServerDescriptor>,
+}
+
+/// Durable session list parameters.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Default)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ListSessionsParams {
+    /// Optional workspace filter.
+    pub cwd: Option<String>,
+}
+
+/// Session permission mode parameters.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SetModeParams {
+    /// Target session.
+    pub session_id: SessionId,
+    /// Requested mode (`read-only`, `default`, or `full-access`).
+    pub mode: String,
 }
 
 /// Session configuration parameters.

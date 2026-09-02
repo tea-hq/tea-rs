@@ -33,7 +33,7 @@ use tea_model::{
     ModelFailure, ModelFailureCode, ModelProvider, ModelRequest, ModelResponseInfo, ModelSpec,
     ProviderId,
 };
-use tea_policy::{ActorId, WorkspaceId};
+use tea_policy::{ActorId, ExecutionSurface, WorkspaceId};
 use tea_protocol::ProtocolTimestamp;
 use tea_protocol::{ModelId, RetryClass, TokenCount};
 use tea_provider_anthropic::{
@@ -158,6 +158,7 @@ pub struct CliBootstrap {
 enum ClientSurface {
     Cli,
     Tui,
+    AppServer,
 }
 
 impl ClientSurface {
@@ -165,6 +166,7 @@ impl ClientSurface {
         match self {
             Self::Cli => "tea-cli",
             Self::Tui => "tea-tui",
+            Self::AppServer => "tea-app-server",
         }
     }
 }
@@ -284,6 +286,74 @@ impl CliBootstrap {
     ) -> Result<(CodingAgentService, SessionSelection), CliFailure> {
         let (service, selection, _) = self
             .build_async_for_surface(args, ClientSurface::Cli)
+            .await?;
+        Ok((service, selection))
+    }
+
+    /// Builds a service with additional session-scoped MCP servers supplied by
+    /// an outer protocol adapter such as ACP.
+    ///
+    /// The supplied configurations are validated and started through the same
+    /// manager and immutable runtime assembly used by the CLI configuration
+    /// path. They are never persisted into the user's settings files.
+    pub async fn build_async_with_mcp_servers(
+        &self,
+        args: &CliArgs,
+        additional: Vec<(McpServerConfig, ToolTrust)>,
+    ) -> Result<(CodingAgentService, SessionSelection), CliFailure> {
+        let additional = additional
+            .into_iter()
+            .map(|(config, trust)| {
+                let environment = resolve_mcp_environment(&config, self.mcp_environment_resolver())
+                    .map_err(|_| config_failure("MCP environment is unavailable"))?;
+                McpServerLaunch::new(config, trust, environment.into_variables())
+                    .map_err(mcp_failure)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        self.build_async_with_mcp_launches(args, additional).await
+    }
+
+    /// Builds a service with fully resolved session-scoped MCP launches.
+    ///
+    /// This variant is used when an outer protocol has already supplied exact
+    /// environment values and they must not be looked up again from process
+    /// state.
+    pub async fn build_async_with_mcp_launches(
+        &self,
+        args: &CliArgs,
+        additional: Vec<McpServerLaunch>,
+    ) -> Result<(CodingAgentService, SessionSelection), CliFailure> {
+        let prepared = self.prepare(args, ClientSurface::AppServer)?;
+        let manager = self
+            .start_mcp_manager_with_launches(
+                &prepared.mcp_servers,
+                &prepared.active_mcp_tools,
+                additional,
+            )
+            .await?;
+        let mut builder = prepared.builder;
+        if let Some(manager) = &manager {
+            builder = builder.mcp_manager(Arc::clone(manager));
+        }
+        match builder.build().map_err(CliFailure::from) {
+            Ok(service) => Ok((service, prepared.selection)),
+            Err(error) => {
+                if let Some(manager) = manager {
+                    let _ = manager.shutdown().await;
+                }
+                Err(error)
+            }
+        }
+    }
+
+    /// Builds the service used by the protocol-neutral app-server without
+    /// requiring a provider credential during session setup.
+    pub(crate) async fn build_app_server_async(
+        &self,
+        args: &CliArgs,
+    ) -> Result<(CodingAgentService, SessionSelection), CliFailure> {
+        let (service, selection, _) = self
+            .build_async_for_surface(args, ClientSurface::AppServer)
             .await?;
         Ok((service, selection))
     }
@@ -417,7 +487,7 @@ impl CliBootstrap {
                 .providers
                 .iter()
                 .any(|provider| provider.provider_id().as_str() == settings.provider)
-            && surface != ClientSurface::Tui
+            && !matches!(surface, ClientSurface::Tui | ClientSurface::AppServer)
         {
             return Err(config_failure(if providers_config_error {
                 "custom provider configuration is invalid"
@@ -562,7 +632,7 @@ impl CliBootstrap {
         })();
         let provider = match provider {
             Ok(provider) => provider,
-            Err(error) if surface == ClientSurface::Tui => {
+            Err(error) if matches!(surface, ClientSurface::Tui | ClientSurface::AppServer) => {
                 provider_notices.push(format!("provider unavailable: {}", error.message()));
                 unavailable_provider(&settings, error.message())?
             }
@@ -639,7 +709,12 @@ impl CliBootstrap {
             ActorId::from_str("local:user")
                 .map_err(|_| internal_failure("actor identity failed"))?,
             workspace_id,
-        );
+        )
+        .execution_surface(match surface {
+            ClientSurface::Cli => ExecutionSurface::Cli,
+            ClientSurface::Tui => ExecutionSurface::Cli,
+            ClientSurface::AppServer => ExecutionSurface::Desktop,
+        });
         for provider in additional_providers {
             builder = builder.provider(provider);
         }
@@ -691,6 +766,7 @@ impl CliBootstrap {
         let mode = match surface {
             ClientSurface::Cli => InteractionMode::NonInteractive,
             ClientSurface::Tui => InteractionMode::Interactive,
+            ClientSurface::AppServer => InteractionMode::NonInteractive,
         };
         ProjectTrustStore::new(paths.trust_file())
             .resolve(project_boundary, trust_request(args.trust), mode)
@@ -702,10 +778,20 @@ impl CliBootstrap {
         servers: &[(McpServerConfig, ToolTrust)],
         active_tools: &[ToolName],
     ) -> Result<Option<Arc<McpManager>>, CliFailure> {
-        if servers.is_empty() {
+        self.start_mcp_manager_with_launches(servers, active_tools, Vec::new())
+            .await
+    }
+
+    async fn start_mcp_manager_with_launches(
+        &self,
+        servers: &[(McpServerConfig, ToolTrust)],
+        active_tools: &[ToolName],
+        additional_launches: Vec<McpServerLaunch>,
+    ) -> Result<Option<Arc<McpManager>>, CliFailure> {
+        if servers.is_empty() && additional_launches.is_empty() {
             return Ok(None);
         }
-        let mut launches = Vec::with_capacity(servers.len());
+        let mut launches = Vec::with_capacity(servers.len() + additional_launches.len());
         for (server, trust) in servers {
             let environment = resolve_mcp_environment(server, self.mcp_environment_resolver())
                 .map_err(|_| config_failure("MCP environment is unavailable"))?;
@@ -714,6 +800,7 @@ impl CliBootstrap {
                     .map_err(mcp_failure)?,
             );
         }
+        launches.extend(additional_launches);
         let observed_at = mcp_timestamp()?;
         let manager = McpManager::start(
             launches,
@@ -1459,11 +1546,8 @@ mod tests {
 
         let (service, _) = bootstrap.build(&args).unwrap();
         let model = model_ref(&service.settings().provider, &service.settings().model);
-        let profile = service
-            .model_spec(&model)
-            .unwrap()
-            .reasoning_profile()
-            .unwrap();
+        let model_spec = service.model_spec(&model).unwrap();
+        let profile = model_spec.reasoning_profile().unwrap();
         assert_eq!(profile.default_effort(), ReasoningEffort::Medium);
         assert_eq!(
             profile.supported_efforts(),

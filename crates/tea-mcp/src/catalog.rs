@@ -62,14 +62,23 @@ impl McpToolCatalog {
             if !remote_names.insert(descriptor.name().clone()) {
                 return Err(McpError::new(McpErrorCode::Descriptor));
             }
-            let Some(policy) = policies.get(descriptor.name()) else {
-                continue;
-            };
-            let Some(declaration) = policy.declaration() else {
+            let policy = policies.get(descriptor.name());
+            let declaration = policy
+                .and_then(|policy| policy.declaration())
+                .or_else(|| config.default_tool_declaration());
+            let Some(declaration) = declaration else {
                 continue;
             };
             let alias = policy
-                .resolved_alias(config.id())
+                .and_then(|policy| policy.resolved_alias(config.id()))
+                .or_else(|| {
+                    tea_tools::ToolName::from_str(&format!(
+                        "mcp.{}.{}",
+                        config.id().as_str(),
+                        descriptor.name().as_str()
+                    ))
+                    .ok()
+                })
                 .ok_or_else(|| McpError::new(McpErrorCode::PolicyDeclaration))?;
             let host_policy = host_policy_json(
                 config,

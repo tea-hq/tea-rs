@@ -177,6 +177,38 @@ impl CodingAgentService {
         mcp::snapshot(manager.as_deref(), now_mcp()?)
     }
 
+    /// Returns the frozen MCP tool names currently owned by this service.
+    #[must_use]
+    pub fn mcp_tool_names(&self) -> Vec<ToolName> {
+        self.mcp_manager
+            .lock()
+            .ok()
+            .and_then(|manager| manager.as_ref().cloned())
+            .map(|manager| {
+                manager
+                    .catalog()
+                    .bindings()
+                    .map(|binding| binding.spec().name().clone())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Returns the profile's default active tool set for one session.
+    pub async fn default_active_tool_names(
+        &self,
+        session_id: SessionId,
+    ) -> Result<Vec<ToolName>, CodingError> {
+        let state = self.snapshot(session_id).await?;
+        let Some(binding) = self.runtime.binding(state.profile_id()) else {
+            return Err(CodingError::new(
+                CodingErrorCode::Runtime,
+                "session profile is not registered",
+            ));
+        };
+        Ok(binding.active_tool_names().to_vec())
+    }
+
     /// Reconnects one configured MCP server only when its new discovery
     /// snapshot exactly matches the frozen runtime catalog.
     ///
@@ -362,6 +394,18 @@ impl CodingAgentService {
             }
         })
         .await
+    }
+
+    /// Waits for the currently owned command and returns its terminal outcome.
+    ///
+    /// This is equivalent to [`Self::wait`], but is named for protocol hosts
+    /// that need to distinguish a completed turn from a turn paused for
+    /// approval before deciding whether to continue it.
+    pub async fn wait_owned(
+        &self,
+        session_id: SessionId,
+    ) -> Result<RuntimeCommandOutcome, CodingError> {
+        self.wait(session_id).await
     }
 
     /// Sends steering text to an active run.

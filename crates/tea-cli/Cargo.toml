@@ -90,3 +90,20 @@ path = "tests/integration.rs"
 [[test]]
 name = "app_server_protocol"
 path = "tests/app_server_protocol.rs"
+
+[[test]]
+name = "app_server_process"
+path = "tests/app_server_process.rs"
+
+[[test]]
+name = "app_server_session"
+path = "tests/app_server_session.rs"
+
+[[test]]
+name = "app_server_live_smoke"
+path = "tests/app_server_live_smoke.rs"
+
+[[test]]
+name = "app_server_mcp"
+path = "tests/app_server_mcp.rs"
+required-features = ["fixture-server"]

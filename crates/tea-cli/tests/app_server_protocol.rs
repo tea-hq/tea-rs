@@ -55,5 +55,8 @@ fn app_server_notifications_and_errors_are_machine_safe() {
     assert_eq!(notification["method"], "event/session");
 
     let error = serde_json::to_value(AppServerError::internal()).unwrap();
-    assert_eq!(error, json!({"code": -32603, "message": "app-server internal error"}));
+    assert_eq!(
+        error,
+        json!({"code": -32603, "message": "app-server internal error"})
+    );
 }

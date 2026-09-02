@@ -673,6 +673,7 @@ pub struct McpServerConfig {
     transport: McpTransportConfig,
     inherited_environment: Vec<String>,
     tools: Vec<McpToolPolicy>,
+    default_tool_declaration: Option<McpToolDeclaration>,
     limits: McpLimits,
     lifecycle: McpLifecyclePolicy,
     reconnect: McpReconnectPolicy,
@@ -724,6 +725,7 @@ impl McpServerConfig {
             transport,
             inherited_environment,
             tools,
+            default_tool_declaration: None,
             limits,
             lifecycle,
             reconnect,
@@ -752,6 +754,23 @@ impl McpServerConfig {
     #[must_use]
     pub fn tools(&self) -> &[McpToolPolicy] {
         &self.tools
+    }
+
+    /// Sets a fallback declaration for tools discovered from this server.
+    ///
+    /// This is intended for protocol hosts such as ACP where a client can
+    /// provide a server before its tool names are known. Explicit per-tool
+    /// policies still take precedence over this fallback.
+    #[must_use]
+    pub fn with_default_tool_declaration(mut self, declaration: McpToolDeclaration) -> Self {
+        self.default_tool_declaration = Some(declaration);
+        self
+    }
+
+    /// Returns the fallback declaration for otherwise unconfigured tools.
+    #[must_use]
+    pub const fn default_tool_declaration(&self) -> Option<&McpToolDeclaration> {
+        self.default_tool_declaration.as_ref()
     }
 
     /// Returns the validated protocol and output limits.
@@ -784,6 +803,10 @@ impl fmt::Debug for McpServerConfig {
                 &self.inherited_environment.len(),
             )
             .field("tool_count", &self.tools.len())
+            .field(
+                "has_default_tool_declaration",
+                &self.default_tool_declaration.is_some(),
+            )
             .field("limits", &self.limits)
             .field("lifecycle", &self.lifecycle)
             .field("reconnect", &self.reconnect)
