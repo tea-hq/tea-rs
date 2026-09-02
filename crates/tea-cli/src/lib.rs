@@ -8,6 +8,8 @@
 
 /// Shared command-line argument contract.
 pub mod args;
+/// Versioned protocol-neutral app-server contract.
+pub mod app_server;
 /// Injected production/test service bootstrap.
 pub mod bootstrap;
 mod exit;

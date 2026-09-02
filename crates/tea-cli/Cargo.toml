@@ -86,3 +86,7 @@ workspace = true
 [[test]]
 name = "integration"
 path = "tests/integration.rs"
+
+[[test]]
+name = "app_server_protocol"
+path = "tests/app_server_protocol.rs"
