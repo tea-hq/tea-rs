@@ -140,6 +140,30 @@ fn only_host_declarations_control_policy_and_execute_resources_are_mandatory() {
 }
 
 #[test]
+fn explicit_disabled_policy_overrides_default_declaration() {
+    let config = config(
+        "server",
+        vec![McpToolPolicy::new(
+            McpRemoteToolName::new("disabled").unwrap(),
+        )],
+    )
+    .with_default_tool_declaration(conservative_declaration());
+    let catalog = McpToolCatalog::freeze(
+        &config,
+        ToolTrust::User,
+        [descriptor(json!({
+            "name": "disabled",
+            "description": "Disabled by host policy.",
+            "inputSchema": {"type": "object"},
+            "outputSchema": {"type": "object"}
+        }))],
+    )
+    .unwrap();
+
+    assert!(catalog.is_empty());
+}
+
+#[test]
 fn lossy_default_aliases_require_an_explicit_canonical_alias() {
     let declaration = conservative_declaration();
     let lossy = McpToolPolicy::enabled(

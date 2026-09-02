@@ -218,6 +218,8 @@ async fn providerless_service_registers_dynamically_without_changing_selection()
         .register_model_providers([Arc::clone(&provider) as Arc<dyn tea_model::ModelProvider>])
         .unwrap();
     assert_eq!(service.models(), [model_ref("fake/model")]);
+    assert!(service.validate_model(&model_ref("fake/model")).is_ok());
+    assert!(service.validate_model(&model_ref("fake/missing")).is_err());
     assert_eq!(
         service.snapshot(session_id).await.unwrap().model_ref(),
         Some(&model_ref("fake/model"))

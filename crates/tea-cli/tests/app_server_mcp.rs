@@ -148,6 +148,24 @@ async fn app_server_accepts_session_mcp_and_bridges_approval() {
     let initialized = receive(&mut output).await;
     assert_eq!(initialized["result"]["capabilities"]["sessionMcp"], true);
 
+    // Listing first lazily creates the base service. The subsequent session
+    // must still rebuild it with the session-scoped MCP descriptor.
+    send(
+        &mut input,
+        json!({
+            "jsonrpc": "2.0",
+            "id": "list",
+            "method": "session/list",
+            "params": {"cwd": root}
+        }),
+    )
+    .await;
+    let listed = receive(&mut output).await;
+    assert!(
+        listed.get("error").is_none(),
+        "session list failed: {listed}"
+    );
+
     send(
         &mut input,
         json!({

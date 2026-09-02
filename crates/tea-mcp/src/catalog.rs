@@ -63,9 +63,10 @@ impl McpToolCatalog {
                 return Err(McpError::new(McpErrorCode::Descriptor));
             }
             let policy = policies.get(descriptor.name());
-            let declaration = policy
-                .and_then(|policy| policy.declaration())
-                .or_else(|| config.default_tool_declaration());
+            let declaration = match policy {
+                Some(policy) => policy.declaration(),
+                None => config.default_tool_declaration(),
+            };
             let Some(declaration) = declaration else {
                 continue;
             };

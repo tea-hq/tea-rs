@@ -127,6 +127,27 @@ impl CodingAgentService {
             .find(|model| model.model_ref() == model_ref)
     }
 
+    /// Validates a model against the current provider and profile tool contracts.
+    pub fn validate_model(&self, model_ref: &ModelRef) -> Result<(), CodingError> {
+        let model = self.model_spec(model_ref).ok_or_else(|| {
+            CodingError::new(
+                CodingErrorCode::InvalidInput,
+                "requested model is unavailable",
+            )
+        })?;
+        let profile_id = ProfileId::from_str("coding-agent").map_err(|_| {
+            CodingError::new(CodingErrorCode::Runtime, "coding profile is unavailable")
+        })?;
+        let binding = self.runtime.binding(&profile_id).ok_or_else(|| {
+            CodingError::new(CodingErrorCode::Runtime, "coding profile is unavailable")
+        })?;
+        binding
+            .tools()
+            .model_definitions(&model)
+            .map(|_| ())
+            .map_err(|error| CodingError::new(CodingErrorCode::InvalidInput, error.to_string()))
+    }
+
     /// Returns the current immutable provider generation.
     #[must_use]
     pub fn model_registry(&self) -> Arc<ModelRegistry> {
@@ -188,6 +209,28 @@ impl CodingAgentService {
                 manager
                     .catalog()
                     .bindings()
+                    .map(|binding| binding.spec().name().clone())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Returns frozen MCP tool names owned by the supplied server identities.
+    #[must_use]
+    pub fn mcp_tool_names_for_servers(&self, server_ids: &[McpServerId]) -> Vec<ToolName> {
+        self.mcp_manager
+            .lock()
+            .ok()
+            .and_then(|manager| manager.as_ref().cloned())
+            .map(|manager| {
+                manager
+                    .catalog()
+                    .bindings()
+                    .filter(|binding| {
+                        server_ids
+                            .iter()
+                            .any(|server_id| server_id == binding.server_id())
+                    })
                     .map(|binding| binding.spec().name().clone())
                     .collect()
             })

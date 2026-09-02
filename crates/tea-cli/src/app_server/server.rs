@@ -5,7 +5,9 @@ use std::str::FromStr;
 use std::sync::Arc;
 
 use tea_coding::{CodingAgentService, CodingError, CommandAcceptance};
-use tea_mcp::{McpServerConfig, McpServerLaunch, McpToolDeclaration, McpTransportConfig};
+use tea_mcp::{
+    McpServerConfig, McpServerId, McpServerLaunch, McpToolDeclaration, McpTransportConfig,
+};
 use tea_protocol::{EventEnvelope, SessionId, ToolIdempotency};
 use tea_tools::{
     ToolConcurrency, ToolEffect, ToolExecutionSemantics, ToolRetrySafety, ToolTimeout, ToolTrust,
@@ -383,9 +385,10 @@ async fn handle_request(
                             false,
                         );
                     }
+                    let decision = approval_decision_for_mode(mode, params.decision);
                     match service.as_ref() {
                         Some(service) => match service
-                            .approve(params.session_id, params.approval_id, params.decision)
+                            .approve(params.session_id, params.approval_id, decision)
                             .map_err(coding_error)
                         {
                             Ok(acceptance) => {
@@ -430,46 +433,62 @@ async fn create_session(
     params: serde_json::Value,
 ) -> Result<serde_json::Value, AppServerError> {
     let params = parse_params::<CreateSessionParams>(params)?;
-    if service.is_none() {
-        let extra = mcp_descriptors(&params.mcp_servers)?;
-        *service = Some(Arc::new(
-            bootstrap
-                .build_async_with_mcp_launches(args, extra)
-                .await
-                .map_err(cli_failure)?
-                .0,
-        ));
+    let requested_mode = params.mode.as_deref().unwrap_or("default");
+    validate_mode(requested_mode)?;
+    let extra = mcp_descriptors(&params.mcp_servers)?;
+    let extra_server_ids = extra
+        .iter()
+        .map(|launch| launch.config().id().clone())
+        .collect::<Vec<McpServerId>>();
+    if let Some(previous) = service.take() {
+        previous.shutdown().await;
     }
-    let service_ref = service.as_ref().ok_or_else(AppServerError::internal)?;
-    if !workspace_matches(&params.cwd, service_ref.workspace().host_path()) {
-        return Err(AppServerError::invalid_params(
-            "session workspace does not match app-server workspace",
-        ));
-    }
-    let id = service_ref.create_session().await.map_err(coding_error)?;
-    if let Some(model) = params.model.clone() {
-        service_ref
-            .set_model(id, model)
+    let candidate = Arc::new(
+        bootstrap
+            .build_async_with_mcp_launches(args, extra)
             .await
-            .map_err(coding_error)?;
+            .map_err(cli_failure)?
+            .0,
+    );
+    let result = async {
+        if !workspace_matches(&params.cwd, candidate.workspace().host_path()) {
+            return Err(AppServerError::invalid_params(
+                "session workspace does not match app-server workspace",
+            ));
+        }
+        if let Some(model) = params.model.clone() {
+            candidate.validate_model(&model).map_err(coding_error)?;
+        }
+        let id = candidate.create_session().await.map_err(coding_error)?;
+        if let Some(model) = params.model.clone() {
+            candidate.set_model(id, model).await.map_err(coding_error)?;
+        }
+        activate_mcp_tools(&candidate, id, &extra_server_ids).await?;
+        let events_receiver = candidate.subscribe(id).map_err(coding_error)?;
+        let snapshot = candidate.snapshot(id).await.map_err(coding_error)?;
+        let result = serde_json::to_value(CreateSessionResult {
+            session_id: id,
+            model: snapshot.model_ref().cloned(),
+            available_models: candidate.models(),
+            mode: requested_mode.to_owned(),
+        })
+        .map_err(|_| AppServerError::internal())?;
+        *events = Some(events_receiver);
+        *session_id = Some(id);
+        requested_mode.clone_into(mode);
+        Ok(result)
     }
-    validate_mode(params.mode.as_deref().unwrap_or("default"))?;
-    *mode = params.mode.unwrap_or_else(|| "default".to_owned());
-    activate_mcp_tools(service_ref, id).await?;
-    *events = Some(service_ref.subscribe(id).map_err(coding_error)?);
-    *session_id = Some(id);
-    serde_json::to_value(CreateSessionResult {
-        session_id: id,
-        model: service_ref
-            .snapshot(id)
-            .await
-            .map_err(coding_error)?
-            .model_ref()
-            .cloned(),
-        available_models: service_ref.models(),
-        mode: mode.clone(),
-    })
-    .map_err(|_| AppServerError::internal())
+    .await;
+    match result {
+        Ok(result) => {
+            *service = Some(candidate);
+            Ok(result)
+        }
+        Err(error) => {
+            candidate.shutdown().await;
+            Err(error)
+        }
+    }
 }
 
 async fn load_session(
@@ -482,38 +501,61 @@ async fn load_session(
     params: serde_json::Value,
 ) -> Result<serde_json::Value, AppServerError> {
     let params = parse_params::<LoadSessionParams>(params)?;
-    if service.is_none() {
-        let extra = mcp_descriptors(&params.mcp_servers)?;
-        *service = Some(Arc::new(
-            bootstrap
-                .build_async_with_mcp_launches(args, extra)
-                .await
-                .map_err(cli_failure)?
-                .0,
-        ));
+    let extra = mcp_descriptors(&params.mcp_servers)?;
+    let extra_server_ids = extra
+        .iter()
+        .map(|launch| launch.config().id().clone())
+        .collect::<Vec<McpServerId>>();
+    if let Some(previous) = service.take() {
+        previous.shutdown().await;
     }
-    let service = service
-        .as_ref()
-        .ok_or_else(|| AppServerError::invalid_request("session service is not initialized"))?;
-    if !workspace_matches(&params.cwd, service.workspace().host_path()) {
-        return Err(AppServerError::invalid_params(
-            "session workspace does not match app-server workspace",
-        ));
+    let candidate = Arc::new(
+        bootstrap
+            .build_async_with_mcp_launches(args, extra)
+            .await
+            .map_err(cli_failure)?
+            .0,
+    );
+    let result = async {
+        if !workspace_matches(&params.cwd, candidate.workspace().host_path()) {
+            return Err(AppServerError::invalid_params(
+                "session workspace does not match app-server workspace",
+            ));
+        }
+        candidate
+            .open_session(params.session_id)
+            .await
+            .map_err(coding_error)?;
+        activate_mcp_tools(&candidate, params.session_id, &extra_server_ids).await?;
+        let events_receiver = candidate
+            .subscribe(params.session_id)
+            .map_err(coding_error)?;
+        let snapshot = candidate
+            .snapshot(params.session_id)
+            .await
+            .map_err(coding_error)?;
+        let result = serde_json::json!({
+            "sessionId": params.session_id,
+            "mode": "default",
+            "model": snapshot.model_ref(),
+            "availableModels": candidate.models(),
+        });
+        *events = Some(events_receiver);
+        *session_id = Some(params.session_id);
+        "default".clone_into(mode);
+        Ok(result)
     }
-    service
-        .open_session(params.session_id)
-        .await
-        .map_err(coding_error)?;
-    activate_mcp_tools(service, params.session_id).await?;
-    *events = Some(service.subscribe(params.session_id).map_err(coding_error)?);
-    *session_id = Some(params.session_id);
-    "default".clone_into(mode);
-    Ok(serde_json::json!({
-        "sessionId": params.session_id,
-        "mode": mode,
-        "model": service.snapshot(params.session_id).await.map_err(coding_error)?.model_ref(),
-        "availableModels": service.models(),
-    }))
+    .await;
+    match result {
+        Ok(result) => {
+            *service = Some(candidate);
+            Ok(result)
+        }
+        Err(error) => {
+            candidate.shutdown().await;
+            Err(error)
+        }
+    }
 }
 
 async fn list_sessions(
@@ -654,6 +696,17 @@ fn validate_mode(mode: &str) -> Result<(), AppServerError> {
     }
 }
 
+fn approval_decision_for_mode(
+    mode: &str,
+    requested: tea_protocol::ApprovalDecision,
+) -> tea_protocol::ApprovalDecision {
+    match mode {
+        "read-only" => tea_protocol::ApprovalDecision::Deny,
+        "full-access" => tea_protocol::ApprovalDecision::AllowOnce,
+        _ => requested,
+    }
+}
+
 fn parse_model_ref(value: &str) -> Result<tea_protocol::ModelRef, AppServerError> {
     if let Ok(model) = serde_json::from_str(value) {
         return Ok(model);
@@ -719,12 +772,13 @@ fn mcp_descriptors(
 async fn activate_mcp_tools(
     service: &CodingAgentService,
     session_id: SessionId,
+    session_mcp_server_ids: &[McpServerId],
 ) -> Result<(), AppServerError> {
     let mut names = service
         .default_active_tool_names(session_id)
         .await
         .map_err(coding_error)?;
-    names.extend(service.mcp_tool_names());
+    names.extend(service.mcp_tool_names_for_servers(session_mcp_server_ids));
     names.sort();
     names.dedup();
     service
@@ -763,4 +817,26 @@ fn write_failure(error: RpcWriteError) -> CliFailure {
         RpcWriteError::Closed | RpcWriteError::Deadline => ExitCategory::Cancelled,
     };
     CliFailure::new(category, error.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::approval_decision_for_mode;
+    use tea_protocol::ApprovalDecision;
+
+    #[test]
+    fn approval_decision_is_bounded_by_session_mode() {
+        assert_eq!(
+            approval_decision_for_mode("read-only", ApprovalDecision::AllowOnce),
+            ApprovalDecision::Deny
+        );
+        assert_eq!(
+            approval_decision_for_mode("full-access", ApprovalDecision::Deny),
+            ApprovalDecision::AllowOnce
+        );
+        assert_eq!(
+            approval_decision_for_mode("default", ApprovalDecision::AllowSession),
+            ApprovalDecision::AllowSession
+        );
+    }
 }
