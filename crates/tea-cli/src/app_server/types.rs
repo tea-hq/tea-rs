@@ -17,6 +17,11 @@ pub struct AppRequestId(String);
 
 impl AppRequestId {
     /// Creates a bounded identifier without control characters.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the value is empty, oversized, or contains a
+    /// control character.
     pub fn new(value: impl Into<String>) -> Result<Self, AppServerError> {
         let value = value.into();
         if value.is_empty()
@@ -78,6 +83,11 @@ pub struct AppServerRequest {
 
 impl AppServerRequest {
     /// Validates the JSON-RPC envelope and returns its parameters.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the JSON-RPC version, method name, or method
+    /// length is invalid.
     pub fn validate(self) -> Result<(Option<AppRequestId>, String, Value), AppServerError> {
         if self.jsonrpc != "2.0" {
             return Err(AppServerError::invalid_request(
@@ -258,6 +268,7 @@ pub struct InitializeResult {
 /// Capabilities exposed by the Tea app-server.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
+#[allow(clippy::struct_excessive_bools)]
 pub struct AppServerCapabilities {
     /// Whether session resume is supported.
     pub session_resume: bool,

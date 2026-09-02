@@ -296,6 +296,11 @@ impl CliBootstrap {
     /// The supplied configurations are validated and started through the same
     /// manager and immutable runtime assembly used by the CLI configuration
     /// path. They are never persisted into the user's settings files.
+    ///
+    /// # Errors
+    ///
+    /// Returns a CLI failure when MCP configuration, environment resolution,
+    /// server startup, or runtime assembly fails.
     pub async fn build_async_with_mcp_servers(
         &self,
         args: &CliArgs,
@@ -318,6 +323,10 @@ impl CliBootstrap {
     /// This variant is used when an outer protocol has already supplied exact
     /// environment values and they must not be looked up again from process
     /// state.
+    ///
+    /// # Errors
+    ///
+    /// Returns a CLI failure when MCP startup or runtime assembly fails.
     pub async fn build_async_with_mcp_launches(
         &self,
         args: &CliArgs,
@@ -711,8 +720,7 @@ impl CliBootstrap {
             workspace_id,
         )
         .execution_surface(match surface {
-            ClientSurface::Cli => ExecutionSurface::Cli,
-            ClientSurface::Tui => ExecutionSurface::Cli,
+            ClientSurface::Cli | ClientSurface::Tui => ExecutionSurface::Cli,
             ClientSurface::AppServer => ExecutionSurface::Desktop,
         });
         for provider in additional_providers {
@@ -764,9 +772,8 @@ impl CliBootstrap {
             return Ok(ProjectAccess::Ignored);
         }
         let mode = match surface {
-            ClientSurface::Cli => InteractionMode::NonInteractive,
             ClientSurface::Tui => InteractionMode::Interactive,
-            ClientSurface::AppServer => InteractionMode::NonInteractive,
+            ClientSurface::Cli | ClientSurface::AppServer => InteractionMode::NonInteractive,
         };
         ProjectTrustStore::new(paths.trust_file())
             .resolve(project_boundary, trust_request(args.trust), mode)

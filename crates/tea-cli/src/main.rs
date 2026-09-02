@@ -27,7 +27,7 @@ async fn execute(args: &CliArgs) -> Result<(), CliFailure> {
     let stdout_is_terminal = std::io::stdout().is_terminal();
     if args.app_server {
         Box::pin(tea_cli::app_server::run(
-            &args,
+            args,
             &bootstrap,
             tokio::io::stdin(),
             tokio::io::stdout(),

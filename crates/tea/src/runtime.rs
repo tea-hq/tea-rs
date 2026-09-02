@@ -57,7 +57,7 @@ pub(crate) fn resolve_model<'a>(
     })
 }
 
-fn registry_error(error: ModelRegistryError) -> RuntimeError {
+fn registry_error(error: &ModelRegistryError) -> RuntimeError {
     let code = match error {
         ModelRegistryError::DuplicateProvider(_) => RuntimeErrorCode::DuplicateEntry,
         ModelRegistryError::UnknownProvider(_) => RuntimeErrorCode::UnknownProvider,
@@ -226,7 +226,7 @@ impl AgentRuntime {
         let next = current
             .without_providers(provider_ids)
             .and_then(|registry| registry.with_registered(providers))
-            .map_err(registry_error)?;
+            .map_err(|error| registry_error(&error))?;
         let next = Arc::new(next);
         *current = Arc::clone(&next);
         Ok(next)

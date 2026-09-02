@@ -67,6 +67,7 @@ async fn receive(output: &mut BufReader<DuplexStream>) -> Value {
 }
 
 #[tokio::test(flavor = "current_thread")]
+#[allow(clippy::too_many_lines)]
 async fn app_server_routes_prompt_events_through_coding_service() {
     let root = std::env::temp_dir().join(format!("tea-app-session-{}", uuid::Uuid::now_v7()));
     fs::create_dir_all(&root).unwrap();
@@ -87,7 +88,13 @@ async fn app_server_routes_prompt_events_through_coding_service() {
     let server_args = cli_args.clone();
     let server_bootstrap = bootstrap.clone();
     let server = tokio::spawn(async move {
-        app_server::run(&server_args, &server_bootstrap, server_input, server_output).await
+        Box::pin(app_server::run(
+            &server_args,
+            &server_bootstrap,
+            server_input,
+            server_output,
+        ))
+        .await
     });
     let mut output = BufReader::new(client_output);
 
@@ -202,6 +209,7 @@ async fn app_server_routes_prompt_events_through_coding_service() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+#[allow(clippy::too_many_lines)]
 async fn app_server_cancels_an_owned_prompt_and_reports_terminal_status() {
     let root = std::env::temp_dir().join(format!("tea-app-cancel-{}", uuid::Uuid::now_v7()));
     fs::create_dir_all(&root).unwrap();
@@ -222,7 +230,13 @@ async fn app_server_cancels_an_owned_prompt_and_reports_terminal_status() {
     let server_args = cli_args.clone();
     let server_bootstrap = bootstrap.clone();
     let server = tokio::spawn(async move {
-        app_server::run(&server_args, &server_bootstrap, server_input, server_output).await
+        Box::pin(app_server::run(
+            &server_args,
+            &server_bootstrap,
+            server_input,
+            server_output,
+        ))
+        .await
     });
     let mut output = BufReader::new(client_output);
 

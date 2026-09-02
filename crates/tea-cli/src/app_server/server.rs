@@ -30,6 +30,11 @@ type OwnedRun =
     Pin<Box<dyn Future<Output = Result<tea::RuntimeCommandOutcome, CodingError>> + Send + 'static>>;
 
 /// Builds one Tea app-server service and runs it over stdin/stdout.
+///
+/// # Errors
+///
+/// Returns a CLI failure when app-server mode is not selected, protocol input
+/// cannot be read, or the output stream cannot be written.
 pub async fn run<R, W>(
     args: &CliArgs,
     bootstrap: &CliBootstrap,
@@ -47,6 +52,12 @@ where
 }
 
 /// Runs the app-server protocol over an already-built service.
+///
+/// # Errors
+///
+/// Returns a CLI failure when protocol input cannot be read, output cannot be
+/// written, or service shutdown fails.
+#[allow(clippy::too_many_lines)]
 pub async fn run_service<R, W>(
     bootstrap: &CliBootstrap,
     args: &CliArgs,
@@ -80,15 +91,12 @@ where
                         break;
                     }
                 };
-                let request = match serde_json::from_slice::<AppServerRequest>(&frame) {
-                    Ok(request) => request,
-                    Err(_) => {
-                        writer.write(&AppServerResponse::failure(
-                            None,
-                            AppServerError::invalid_request("request JSON is malformed"),
-                        )).await.map_err(write_failure)?;
-                        continue;
-                    }
+                let Ok(request) = serde_json::from_slice::<AppServerRequest>(&frame) else {
+                    writer.write(&AppServerResponse::failure(
+                        None,
+                        AppServerError::invalid_request("request JSON is malformed"),
+                    )).await.map_err(write_failure)?;
+                    continue;
                 };
                 let fallback_id = request.id.clone();
                 let (request_id, method, params) = match request.validate() {
@@ -113,10 +121,8 @@ where
                     &method,
                     params,
                 ).await;
-                if request_id.is_some() {
-                    if let Some(response) = response {
-                        writer.write(&with_id(response, request_id)).await.map_err(write_failure)?;
-                    }
+                if request_id.is_some() && let Some(response) = response {
+                    writer.write(&with_id(response, request_id)).await.map_err(write_failure)?;
                 }
                 if should_stop {
                     break;
@@ -124,7 +130,7 @@ where
             }
             event = receive_event(&mut events) => {
                 if let Some(event) = event {
-                    writer.write(&event_notification(event)).await.map_err(write_failure)?;
+                    writer.write(&event_notification(&event)).await.map_err(write_failure)?;
                 } else if let (Some(session_id), Some(service)) = (session_id, service.as_ref()) {
                     writer.write(&AppServerNotification::event(serde_json::json!({
                         "sessionId": session_id,
@@ -183,6 +189,7 @@ where
     }
 }
 
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn handle_request(
     bootstrap: &CliBootstrap,
     args: &CliArgs,
@@ -198,11 +205,7 @@ async fn handle_request(
     let response = match method {
         "server/initialize" => match parse_params::<InitializeParams>(params) {
             Ok(params) => {
-                if params.app_server_version != APP_SERVER_VERSION {
-                    Err(AppServerError::invalid_request(
-                        "app-server version is unsupported",
-                    ))
-                } else {
+                if params.app_server_version == APP_SERVER_VERSION {
                     *initialized = true;
                     Ok(serde_json::to_value(InitializeResult {
                         app_server_version: APP_SERVER_VERSION,
@@ -217,6 +220,10 @@ async fn handle_request(
                         },
                     })
                     .expect("app-server initialize result serializes"))
+                } else {
+                    Err(AppServerError::invalid_request(
+                        "app-server version is unsupported",
+                    ))
                 }
             }
             Err(error) => Err(error),
@@ -238,20 +245,7 @@ async fn handle_request(
                 create_session(bootstrap, args, service, session_id, events, mode, params).await
             }
         }
-        "session/load" => {
-            if !*initialized {
-                Err(AppServerError::invalid_request(
-                    "server must be initialized first",
-                ))
-            } else if session_id.is_some() {
-                Err(AppServerError::invalid_request(
-                    "app-server session already exists",
-                ))
-            } else {
-                load_session(bootstrap, args, service, session_id, events, mode, params).await
-            }
-        }
-        "session/resume" => {
+        "session/load" | "session/resume" => {
             if !*initialized {
                 Err(AppServerError::invalid_request(
                     "server must be initialized first",
@@ -265,12 +259,12 @@ async fn handle_request(
             }
         }
         "session/list" => {
-            if !*initialized {
+            if *initialized {
+                list_sessions(bootstrap, args, service, params).await
+            } else {
                 Err(AppServerError::invalid_request(
                     "server must be initialized first",
                 ))
-            } else {
-                list_sessions(bootstrap, args, service, params).await
             }
         }
         "session/prompt" => {
@@ -287,9 +281,7 @@ async fn handle_request(
         }
         "session/cancel" => match parse_params::<SessionParams>(params) {
             Ok(params) => {
-                if Some(params.session_id) != *session_id {
-                    Err(AppServerError::invalid_request("session is not attached"))
-                } else {
+                if Some(params.session_id) == *session_id {
                     let Some(service) = service.as_ref() else {
                         return (
                             Some(AppServerResponse::failure(
@@ -304,6 +296,8 @@ async fn handle_request(
                         .await
                         .map(|_| serde_json::json!({"accepted": true}))
                         .map_err(coding_error)
+                } else {
+                    Err(AppServerError::invalid_request("session is not attached"))
                 }
             }
             Err(error) => Err(error),
@@ -324,7 +318,7 @@ async fn handle_request(
                 }
                 *session_id = None;
                 *events = None;
-                *mode = "default".to_owned();
+                "default".clone_into(mode);
                 Ok(serde_json::json!({"closed": true}))
             }
             Ok(_) => Err(AppServerError::invalid_request("session is not attached")),
@@ -334,7 +328,7 @@ async fn handle_request(
             Ok(params) if Some(params.session_id) == *session_id => {
                 match validate_mode(&params.mode) {
                     Ok(()) => {
-                        *mode = params.mode.clone();
+                        mode.clone_from(&params.mode);
                         Ok(serde_json::json!({"mode": mode}))
                     }
                     Err(error) => Err(error),
@@ -348,7 +342,7 @@ async fn handle_request(
                 match params.config_id.as_str() {
                     "mode" | "permission_mode" => match validate_mode(&params.value) {
                         Ok(()) => {
-                            *mode = params.value.clone();
+                            mode.clone_from(&params.value);
                             Ok(serde_json::json!({"mode": mode}))
                         }
                         Err(error) => Err(error),
@@ -376,20 +370,18 @@ async fn handle_request(
         },
         "approval/respond" => match parse_params::<super::types::ApprovalResponseParams>(params) {
             Ok(params) => {
-                if Some(params.session_id) != *session_id {
-                    Err(AppServerError::invalid_request("session is not attached"))
-                } else {
+                if Some(params.session_id) == *session_id {
                     // A prompt can still be in the process of returning its
                     // pending-approval checkpoint when the adapter responds.
                     // Let that owned command finish before starting the
                     // explicit approval continuation for the same session.
-                    if let Some(run) = owned_run.take() {
-                        if let Err(error) = run.await {
-                            return (
-                                Some(AppServerResponse::failure(None, coding_error(error))),
-                                false,
-                            );
-                        }
+                    if let Some(run) = owned_run.take()
+                        && let Err(error) = run.await
+                    {
+                        return (
+                            Some(AppServerResponse::failure(None, coding_error(error))),
+                            false,
+                        );
                     }
                     match service.as_ref() {
                         Some(service) => match service
@@ -409,6 +401,8 @@ async fn handle_request(
                             "session has not been created",
                         )),
                     }
+                } else {
+                    Err(AppServerError::invalid_request("session is not attached"))
                 }
             }
             Err(error) => Err(error),
@@ -446,7 +440,7 @@ async fn create_session(
                 .0,
         ));
     }
-    let service_ref = service.as_ref().ok_or_else(|| AppServerError::internal())?;
+    let service_ref = service.as_ref().ok_or_else(AppServerError::internal)?;
     if !workspace_matches(&params.cwd, service_ref.workspace().host_path()) {
         return Err(AppServerError::invalid_params(
             "session workspace does not match app-server workspace",
@@ -513,7 +507,7 @@ async fn load_session(
     activate_mcp_tools(service, params.session_id).await?;
     *events = Some(service.subscribe(params.session_id).map_err(coding_error)?);
     *session_id = Some(params.session_id);
-    *mode = "default".to_owned();
+    "default".clone_into(mode);
     Ok(serde_json::json!({
         "sessionId": params.session_id,
         "mode": mode,
@@ -604,8 +598,8 @@ async fn receive_event(
     }
 }
 
-fn event_notification(event: EventEnvelope) -> AppServerNotification {
-    let value = serde_json::to_value(&event).unwrap_or_else(|_| {
+fn event_notification(event: &EventEnvelope) -> AppServerNotification {
+    let value = serde_json::to_value(event).unwrap_or_else(|_| {
         serde_json::json!({
             "type": "event_serialization_failed"
         })
@@ -635,6 +629,7 @@ fn parse_params<T: serde::de::DeserializeOwned>(
         .map_err(|_| AppServerError::invalid_params("request parameters are invalid"))
 }
 
+#[allow(clippy::needless_pass_by_value)]
 fn coding_error(error: CodingError) -> AppServerError {
     let code = match error.code() {
         tea_coding::CodingErrorCode::InvalidInput => -32602,
@@ -738,6 +733,7 @@ async fn activate_mcp_tools(
         .map_err(coding_error)
 }
 
+#[allow(clippy::needless_pass_by_value)]
 fn cli_failure(error: CliFailure) -> AppServerError {
     AppServerError {
         code: -32001,
@@ -755,10 +751,10 @@ fn read_failure(error: RpcReadError) -> CliFailure {
 }
 
 fn workspace_matches(requested: &str, actual: &std::path::Path) -> bool {
-    std::path::Path::new(requested)
-        .canonicalize()
-        .map(|path| path == actual)
-        .unwrap_or_else(|_| requested == actual.to_string_lossy())
+    std::path::Path::new(requested).canonicalize().map_or_else(
+        |_| requested == actual.to_string_lossy(),
+        |path| path == actual,
+    )
 }
 
 fn write_failure(error: RpcWriteError) -> CliFailure {

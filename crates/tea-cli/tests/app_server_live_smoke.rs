@@ -11,7 +11,7 @@ use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 
 const LIVE_GATE: &str = "TEA_APP_SERVER_LIVE_SMOKE";
 const APP_SERVER_VERSION: &str = "1.0";
-const READ_TIMEOUT: Duration = Duration::from_secs(180);
+const READ_TIMEOUT: Duration = Duration::from_mins(3);
 const MAX_APPROVALS: usize = 8;
 
 struct LiveWorkspace {
@@ -157,6 +157,7 @@ struct TurnObservation {
     status: String,
 }
 
+#[allow(clippy::too_many_lines)]
 async fn prompt(process: &mut AppServerProcess, session_id: &str, text: &str) -> TurnObservation {
     process
         .send(json!({
@@ -239,13 +240,11 @@ async fn prompt(process: &mut AppServerProcess, session_id: &str, text: &str) ->
                         .and_then(|value| value.get("type"))
                         .and_then(Value::as_str)
                         == Some("text_delta")
-                    {
-                        if let Some(chunk) = delta
+                        && let Some(chunk) = delta
                             .and_then(|value| value.get("text"))
                             .and_then(Value::as_str)
-                        {
-                            text_output.push_str(chunk);
-                        }
+                    {
+                        text_output.push_str(chunk);
                     }
                 }
                 "tool_call_requested" | "hosted_tool_started" => saw_tool_call = true,
@@ -318,6 +317,7 @@ fn configured_provider() -> Option<(PathBuf, String, String)> {
 
 #[tokio::test(flavor = "current_thread")]
 #[ignore = "requires TEA_APP_SERVER_LIVE_SMOKE=1, ~/.tea provider credentials, and network"]
+#[allow(clippy::too_many_lines)]
 async fn app_server_uses_local_provider_and_survives_real_session_lifecycle() {
     let Some((config, provider, model)) = configured_provider() else {
         return;

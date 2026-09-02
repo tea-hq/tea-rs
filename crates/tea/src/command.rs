@@ -922,6 +922,7 @@ impl AgentRuntime {
             .map_err(RuntimeError::from)
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn resume_kernel(
         &self,
         session_id: SessionId,
