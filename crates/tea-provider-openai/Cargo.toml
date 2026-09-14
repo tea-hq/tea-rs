@@ -23,6 +23,7 @@ tea-protocol = { version = "=0.1.0", path = "../tea-protocol" }
 async-stream = { workspace = true }
 futures-core = { workspace = true }
 futures-util = { workspace = true }
+jsonschema = { workspace = true, optional = true }
 reqwest = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -39,7 +40,7 @@ tokio = { workspace = true, features = ["io-util", "macros", "net", "rt-multi-th
 default = []
 # Enable the live smoke test helpers. Smoke tests are #[ignore]d and require
 # a real API key via the .env contract; they never run in CI.
-live = []
+live = ["dep:jsonschema"]
 
 [lints]
 workspace = true

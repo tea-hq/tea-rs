@@ -47,6 +47,11 @@ where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin + Send + 'static,
 {
+    if args.output_format.is_some() || args.output_schema.is_some() {
+        return Err(CliFailure::usage(
+            "app-server structured output must be supplied in session/prompt params",
+        ));
+    }
     if !args.app_server {
         return Err(CliFailure::usage("app-server mode requires --app-server"));
     }
@@ -152,6 +157,7 @@ where
                     Ok(_) => serde_json::json!({"status": "completed"}),
                     Err(error) => serde_json::json!({
                         "status": if error.code() == tea_coding::CodingErrorCode::Cancelled { "cancelled" } else { "failed" },
+                        "errorCode": error.code(),
                         "error": error.message()
                     }),
                 };
@@ -272,12 +278,14 @@ async fn handle_request(
         "session/prompt" => {
             let parsed = parse_params::<PromptParams>(params);
             match parsed {
-                Ok(prompt) => service
-                    .as_ref()
-                    .ok_or_else(|| AppServerError::invalid_request("session has not been created"))
-                    .and_then(|service| {
-                        start_prompt(Arc::clone(service), *session_id, owned_run, prompt)
-                    }),
+                Ok(prompt) => match service.as_ref() {
+                    Some(service) => {
+                        start_prompt(Arc::clone(service), *session_id, owned_run, prompt).await
+                    }
+                    None => Err(AppServerError::invalid_request(
+                        "session has not been created",
+                    )),
+                },
                 Err(error) => Err(error),
             }
         }
@@ -596,7 +604,7 @@ async fn list_sessions(
     Ok(serde_json::json!({"sessions": sessions, "nextCursor": null}))
 }
 
-fn start_prompt(
+async fn start_prompt(
     service: Arc<CodingAgentService>,
     session_id: Option<SessionId>,
     owned_run: &mut Option<OwnedRun>,
@@ -609,7 +617,8 @@ fn start_prompt(
         return Err(AppServerError::invalid_request("session is busy"));
     }
     let acceptance = service
-        .prompt(params.session_id, params.text)
+        .prompt(params.session_id, params.text, params.final_output_format)
+        .await
         .map_err(coding_error)?;
     *owned_run = Some(Box::pin(wait_owned(service, acceptance)));
     Ok(serde_json::json!({"accepted": true, "commandId": acceptance.command_id()}))

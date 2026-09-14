@@ -6,20 +6,32 @@ use std::future;
 use std::pin::Pin;
 use std::str::FromStr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use tea::{AgentRuntimeBuilder, RuntimeCommandOutcome};
-use tea_kernel::{CompactionPolicy, CompactionSummarizer, ModelRetryPolicy};
+use tea_kernel::{CompactionPolicy, CompactionSummarizer, ModelRetryPolicy, RunState};
+use tea_model::{
+    ModelCapabilities, ModelCompletion, ModelEvent, ModelResponseInfo, ModelStreamIndex,
+    ProviderToolCallId, ToolCallCompleted, ToolCallStarted,
+};
 use tea_profile::ProfileRuleId;
 use tea_protocol::{
-    AgentCommand, BranchId, CanonicalMessage, ContentBlock, MessageId, ProtocolTimestamp,
-    SessionRecord, StopReason,
+    AgentCommand, BranchId, CanonicalMessage, ContentBlock, FinalOutputFormat, MessageId,
+    ProtocolTimestamp, SessionRecord, StopReason,
 };
 use tea_testkit::ScriptedModelResponse;
 
 use common::{TestIds, TestSessionIds, build_runtime, user_message};
 
 #[derive(Debug, Default)]
-struct FixedSummarizer;
+struct FixedSummarizer(AtomicUsize);
+
+impl FixedSummarizer {
+    fn calls(&self) -> usize {
+        self.0.load(Ordering::SeqCst)
+    }
+}
+
 impl CompactionSummarizer for FixedSummarizer {
     fn summarize(
         &self,
@@ -31,6 +43,7 @@ impl CompactionSummarizer for FixedSummarizer {
                 + '_,
         >,
     > {
+        self.0.fetch_add(1, Ordering::SeqCst);
         Box::pin(future::ready(Ok(CanonicalMessage::assistant(
             MessageId::from_str("0195a0b1-5e90-7000-8000-0000000000d1").unwrap(),
             vec![ContentBlock::text("summary").unwrap()],
@@ -39,6 +52,27 @@ impl CompactionSummarizer for FixedSummarizer {
         )
         .unwrap())))
     }
+}
+
+fn write_script() -> ScriptedModelResponse {
+    let index = ModelStreamIndex::new(0).unwrap();
+    let provider_call_id = ProviderToolCallId::from_str("provider-write").unwrap();
+    ScriptedModelResponse::events([
+        ModelEvent::Started(ModelResponseInfo::new()),
+        ModelEvent::ToolCallStarted(
+            ToolCallStarted::new(index, provider_call_id.clone(), "write_file").unwrap(),
+        ),
+        ModelEvent::ToolCallCompleted(
+            ToolCallCompleted::new(
+                index,
+                provider_call_id,
+                "write_file",
+                serde_json::json!({"path":"/notes.txt","content":"hello"}),
+            )
+            .unwrap(),
+        ),
+        ModelEvent::Completed(ModelCompletion::new(StopReason::ToolUse).unwrap()),
+    ])
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -67,7 +101,7 @@ async fn builder_accepts_reliability_ports() {
             .unwrap(),
         )
         .compaction_policy(Arc::new(AlwaysCompact))
-        .compaction_summarizer(Arc::new(FixedSummarizer))
+        .compaction_summarizer(Arc::new(FixedSummarizer::default()))
         .tool(
             common::spec("read_file", tea_tools::ToolEffect::FsRead),
             Arc::new(
@@ -156,7 +190,7 @@ async fn compact_command_uses_the_configured_summarizer() {
         .ids(Arc::new(TestIds::default()))
         .session_id_source(Arc::new(TestSessionIds::default()))
         .actor("user:alice".parse().unwrap())
-        .compaction_summarizer(Arc::new(FixedSummarizer))
+        .compaction_summarizer(Arc::new(FixedSummarizer::default()))
         .tool(
             common::spec("read_file", tea_tools::ToolEffect::FsRead),
             Arc::new(
@@ -226,6 +260,72 @@ async fn compact_command_uses_the_configured_summarizer() {
         &content[0],
         ContentBlock::Text { text } if text == "summary"
     ));
+}
+
+#[tokio::test]
+async fn compact_command_rejects_pending_approval_before_summarizing() {
+    let provider = common::provider_with_capabilities(
+        [write_script()],
+        ModelCapabilities::text()
+            .with_tools(true)
+            .with_final_json_schema_with_tools(),
+    );
+    let summarizer = Arc::new(FixedSummarizer::default());
+    let runtime = common::runtime_builder(
+        provider,
+        Arc::new(TestIds::default()),
+        Arc::new(TestSessionIds::default()),
+    )
+    .unwrap()
+    .compaction_summarizer(summarizer.clone())
+    .build()
+    .unwrap();
+    let session_id = match runtime
+        .send(common::envelope_create("coding-agent"))
+        .await
+        .unwrap()
+    {
+        RuntimeCommandOutcome::Created { session_id } => session_id,
+        other => panic!("expected Created, got {other:?}"),
+    };
+    let waiting = runtime
+        .send(common::envelope(
+            AgentCommand::Prompt {
+                message: user_message("write the notes"),
+                final_output_format: Some(FinalOutputFormat::JsonSchema {
+                    schema: serde_json::json!({"type":"object"}),
+                }),
+            },
+            Some(session_id),
+        ))
+        .await
+        .unwrap();
+    assert!(matches!(
+        waiting,
+        RuntimeCommandOutcome::RunCompleted {
+            state: RunState::WaitingApproval,
+            ..
+        }
+    ));
+    let before = runtime.snapshot(session_id).await.unwrap();
+
+    let error = runtime
+        .send(common::envelope(
+            AgentCommand::CompactSession { instruction: None },
+            Some(session_id),
+        ))
+        .await
+        .unwrap_err();
+
+    assert_eq!(error.code(), tea::RuntimeErrorCode::KernelFailure);
+    assert_eq!(
+        error.message(),
+        "session has a pending approval; resume it explicitly"
+    );
+    assert_eq!(summarizer.calls(), 0);
+    let after = runtime.snapshot(session_id).await.unwrap();
+    assert_eq!(after.journal_revision(), before.journal_revision());
+    assert_eq!(after, before);
 }
 
 #[tokio::test]

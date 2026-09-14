@@ -3,7 +3,8 @@
 use std::str::FromStr;
 
 use tea_model::{
-    ModelCapabilities, ModelDisplayName, ModelSpec, ProviderId, ReasoningEffort, ReasoningProfile,
+    HostedToolKind, ModelCapabilities, ModelDisplayName, ModelSpec, ProviderId, ReasoningEffort,
+    ReasoningProfile,
 };
 use tea_protocol::{ModelId, TokenCount};
 
@@ -26,10 +27,14 @@ pub fn default_catalog(config: &OpenAiConfig) -> Result<Vec<ModelSpec>, OpenAiEr
         16_384,
         true,
         reasoning_profile(config.model_id().as_str(), config.reasoning_effort())?,
+        config.final_json_object(),
+        config.final_json_schema(),
+        config.final_json_schema_with_tools(),
+        config.hosted_web_search(),
     )?])
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::fn_params_excessive_bools)]
 fn spec(
     provider_id: &ProviderId,
     model_id: &ModelId,
@@ -38,6 +43,10 @@ fn spec(
     output: u64,
     tools: bool,
     reasoning: Option<ReasoningProfile>,
+    final_json_object: bool,
+    final_json_schema: bool,
+    final_json_schema_with_tools: bool,
+    hosted_web_search: bool,
 ) -> Result<ModelSpec, OpenAiError> {
     let mut capabilities = ModelCapabilities::text();
     if tools {
@@ -45,6 +54,18 @@ fn spec(
     }
     if reasoning.is_some() {
         capabilities = capabilities.with_reasoning();
+    }
+    if final_json_object {
+        capabilities = capabilities.with_final_json_object();
+    }
+    if final_json_schema {
+        capabilities = capabilities.with_final_json_schema();
+    }
+    if final_json_schema_with_tools {
+        capabilities = capabilities.with_final_json_schema_with_tools();
+    }
+    if hosted_web_search {
+        capabilities = capabilities.with_hosted_tool(HostedToolKind::WebSearch);
     }
     let spec = ModelSpec::new(
         model_id.clone(),

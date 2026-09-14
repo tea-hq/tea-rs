@@ -1,14 +1,16 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use tea_policy::{ApprovalRequest, ApprovalResolution, GrantId, PolicyGrant};
-use tea_protocol::{ApprovalId, ProfileId, RecordEnvelope, RecordId, SessionId, SessionRecord};
+use tea_protocol::{
+    ApprovalId, FinalOutputFormat, ProfileId, RecordEnvelope, RecordId, SessionId, SessionRecord,
+};
 
 use crate::{SessionReducer, SessionStoreErrorCode};
 
 /// Rich policy approval value linked to a canonical durable approval transition.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 #[allow(clippy::large_enum_variant)] // Boxing would break the public artifact value API.
 pub enum ApprovalArtifactEntry {
     /// Self-contained redacted request snapshot.
@@ -17,6 +19,9 @@ pub enum ApprovalArtifactEntry {
         record_id: RecordId,
         /// Validated policy request.
         request: ApprovalRequest,
+        /// Run-scoped final-output contract to restore after approval.
+        #[serde(deserialize_with = "deserialize_final_output_format")]
+        final_output_format: Option<FinalOutputFormat>,
     },
     /// Self-contained terminal resolution snapshot.
     Resolved {
@@ -35,6 +40,15 @@ impl ApprovalArtifactEntry {
             Self::Requested { record_id, .. } | Self::Resolved { record_id, .. } => *record_id,
         }
     }
+}
+
+fn deserialize_final_output_format<'de, D>(
+    deserializer: D,
+) -> Result<Option<FinalOutputFormat>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Option::deserialize(deserializer)
 }
 
 /// Append-only authorization-grant journal fact.

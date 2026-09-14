@@ -63,6 +63,31 @@ fn capabilities_are_explicit_and_internally_consistent() {
 }
 
 #[test]
+fn final_json_capabilities_are_independent() {
+    let neither = ModelCapabilities::text();
+    let object_only = ModelCapabilities::text().with_final_json_object();
+    let schema_only = ModelCapabilities::text().with_final_json_schema();
+    let schema_with_tools = ModelCapabilities::text().with_final_json_schema_with_tools();
+    let both = ModelCapabilities::text()
+        .with_final_json_object()
+        .with_final_json_schema();
+    assert_eq!(
+        [neither, object_only, schema_only, schema_with_tools, both].map(|capabilities| (
+            capabilities.supports_final_json_object(),
+            capabilities.supports_final_json_schema(),
+            capabilities.supports_final_json_schema_with_tools(),
+        )),
+        [
+            (false, false, false),
+            (true, false, false),
+            (false, true, false),
+            (false, true, true),
+            (true, true, false),
+        ]
+    );
+}
+
+#[test]
 fn model_spec_enforces_context_and_output_limits() {
     let model_id = ModelId::from_str("anthropic/claude-sonnet-4").unwrap();
     let provider_id = ProviderId::from_str("anthropic").unwrap();

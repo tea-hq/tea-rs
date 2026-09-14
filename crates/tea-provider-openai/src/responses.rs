@@ -5,17 +5,20 @@ use std::collections::BTreeMap;
 use serde_json::Value;
 use tea_model::{HostedToolKind, ModelRequest, ModelToolDefinition};
 use tea_protocol::{
-    CanonicalMessage, ContentBlock, ImageSource, ProviderContinuation, SourceCitation, ToolCallId,
+    CanonicalMessage, ContentBlock, FinalOutputFormat, ImageSource, ProviderContinuation,
+    SourceCitation, ToolCallId,
 };
 
-use crate::credential::OpenAiConfig;
+use crate::credential::{OpenAiApiMode, OpenAiConfig};
 use crate::error::{OpenAiError, OpenAiErrorCode};
 use crate::reasoning::{OpenAiReasoningEffortMap, request_wire_effort};
-use crate::request::{provider_tool_call_ids, request_tool_call_id};
+use crate::request::{
+    json_object_instructions, provider_tool_call_ids, request_tool_call_id, validated_final_output,
+};
 use crate::responses_model::{
     FunctionCallOutputPayload, ResponseItem, ResponsesApiRequest, ResponsesApiTool,
-    ResponsesContentItem, ResponsesInputItem, ResponsesReasoning, ResponsesWebSearchFilters,
-    ResponsesWebSearchLocation,
+    ResponsesContentItem, ResponsesInputItem, ResponsesReasoning, ResponsesText,
+    ResponsesTextFormat, ResponsesWebSearchFilters, ResponsesWebSearchLocation,
 };
 
 pub(crate) const WEB_SEARCH_CONTINUATION_FORMAT: &str = "openai.responses.web_search.v1";
@@ -45,6 +48,7 @@ pub fn build_responses_body_with_reasoning_map(
     config: &OpenAiConfig,
     reasoning_map: Option<&OpenAiReasoningEffortMap>,
 ) -> Result<Value, OpenAiError> {
+    let text = map_responses_text(request, config)?;
     let mut input = Vec::new();
     let provider_call_ids = provider_tool_call_ids(request.messages());
     for message in request.messages() {
@@ -111,14 +115,22 @@ pub fn build_responses_body_with_reasoning_map(
         include.push("web_search_call.action.sources".to_owned());
     }
     let has_tools = !tools.is_empty();
+    let mut instructions = request.system_prompt().map(str::to_owned);
+    if matches!(
+        request.final_output_format(),
+        Some(FinalOutputFormat::JsonObject)
+    ) {
+        instructions = Some(json_object_instructions(instructions.as_deref())?);
+    }
     let body = ResponsesApiRequest {
         model: request.model_id().as_str().to_owned(),
-        instructions: request.system_prompt().map(str::to_owned),
+        instructions,
         input,
         tools,
         tool_choice: has_tools.then(|| "auto".to_owned()),
         parallel_tool_calls: has_tools.then(|| request.allow_parallel_tool_calls()),
         reasoning,
+        text,
         store: false,
         stream: true,
         include,
@@ -134,6 +146,34 @@ pub fn build_responses_body_with_reasoning_map(
             format!("Responses request serialization failed: {error}"),
         )
     })
+}
+
+fn map_responses_text(
+    request: &ModelRequest,
+    config: &OpenAiConfig,
+) -> Result<Option<ResponsesText>, OpenAiError> {
+    Ok(
+        validated_final_output(request, config, OpenAiApiMode::Responses)?.map(
+            |(profile, format)| ResponsesText {
+                format: match format {
+                    FinalOutputFormat::JsonObject => ResponsesTextFormat {
+                        r#type: "json_object".to_owned(),
+                        name: None,
+                        strict: None,
+                        schema: None,
+                    },
+                    FinalOutputFormat::JsonSchema { schema } => ResponsesTextFormat {
+                        r#type: "json_schema".to_owned(),
+                        name: Some("tea_output".to_owned()),
+                        strict: profile
+                            .uses_strict_json_schema(OpenAiApiMode::Responses)
+                            .then_some(true),
+                        schema: Some(schema.clone()),
+                    },
+                },
+            },
+        ),
+    )
 }
 
 /// Returns the full Responses endpoint URL for the supplied config.

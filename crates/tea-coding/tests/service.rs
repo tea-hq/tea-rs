@@ -23,13 +23,15 @@ use tea_context::{
 };
 use tea_control::CancellationScope;
 use tea_model::{
-    HostedToolKind, ModelCapabilities, ModelCompletion, ModelDisplayName, ModelEvent,
+    BoxModelStream, HostedToolKind, ModelCancellation, ModelCapabilities, ModelCompletion,
+    ModelDisplayName, ModelEvent, ModelFailure, ModelFailureCode, ModelProvider, ModelRequest,
     ModelResponseInfo, ModelSpec, ModelStreamIndex, ProviderId, ProviderToolCallId,
     ToolCallCompleted, ToolCallStarted,
 };
 use tea_policy::{ActorId, WorkspaceId};
 use tea_protocol::{
-    ApprovalDecision, CanonicalMessage, ContentBlock, ModelId, ModelRef, StopReason, TokenCount,
+    ApprovalDecision, CanonicalMessage, ContentBlock, FinalOutputFormat, ModelId, ModelRef,
+    RetryClass, StopReason, TokenCount,
 };
 use tea_session::{ApprovalArtifactEntry, SessionArchive, SessionSnapshot};
 use tea_session_sqlite::SqliteSessionStore;
@@ -154,6 +156,68 @@ fn provider_with_capabilities(
     ))
 }
 
+#[derive(Debug)]
+struct RejectingCodingPreflightProvider {
+    inner: ScriptedModelProvider,
+    calls: AtomicUsize,
+}
+
+impl RejectingCodingPreflightProvider {
+    fn new() -> Self {
+        let provider_id = ProviderId::from_str("fake").unwrap();
+        let model = ModelSpec::new(
+            ModelId::from_str("fake/model").unwrap(),
+            provider_id.clone(),
+            ModelDisplayName::from_str("Fake Model").unwrap(),
+            TokenCount::new(32_000).unwrap(),
+            TokenCount::new(4_000).unwrap(),
+            ModelCapabilities::text()
+                .with_tools(true)
+                .with_final_json_schema_with_tools(),
+        )
+        .unwrap();
+        Self {
+            inner: ScriptedModelProvider::new(
+                provider_id,
+                vec![model],
+                [ScriptedModelResponse::text([r#"{"answer":"unused"}"#])],
+            ),
+            calls: AtomicUsize::new(0),
+        }
+    }
+}
+
+impl ModelProvider for RejectingCodingPreflightProvider {
+    fn provider_id(&self) -> &ProviderId {
+        self.inner.provider_id()
+    }
+
+    fn models(&self) -> &[ModelSpec] {
+        self.inner.models()
+    }
+
+    fn validate_request(&self, request: &ModelRequest) -> Result<(), ModelFailure> {
+        <ScriptedModelProvider as ModelProvider>::validate_request(&self.inner, request)?;
+        assert!(request.system_prompt().is_some());
+        assert!(!request.tools().is_empty());
+        assert!(matches!(
+            request.final_output_format(),
+            Some(FinalOutputFormat::JsonSchema { .. })
+        ));
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Err(ModelFailure::new(
+            ModelFailureCode::InvalidRequest,
+            "provider-specific preflight rejected complete request",
+            RetryClass::Never,
+        )
+        .unwrap())
+    }
+
+    fn stream(&self, request: ModelRequest, cancellation: ModelCancellation) -> BoxModelStream {
+        self.inner.stream(request, cancellation)
+    }
+}
+
 fn assert_persisted_image_privacy(
     snapshot: &SessionSnapshot,
     content: &[ContentBlock],
@@ -209,7 +273,10 @@ async fn providerless_service_registers_dynamically_without_changing_selection()
     assert!(service.models().is_empty());
 
     let session_id = service.create_session().await.unwrap();
-    service.prompt(session_id, "before provider").unwrap();
+    service
+        .prompt(session_id, "before provider", None)
+        .await
+        .unwrap();
     let error = service.wait(session_id).await.unwrap_err();
     assert_eq!(error.code(), CodingErrorCode::Unavailable);
 
@@ -225,7 +292,10 @@ async fn providerless_service_registers_dynamically_without_changing_selection()
         Some(&model_ref("fake/model"))
     );
 
-    service.prompt(session_id, "after provider").unwrap();
+    service
+        .prompt(session_id, "after provider", None)
+        .await
+        .unwrap();
     service.wait(session_id).await.unwrap();
     assert_eq!(provider.captured_requests().unwrap().len(), 1);
 
@@ -299,7 +369,10 @@ async fn typed_prompt_content_reaches_model_and_session() {
         ContentBlock::text("describe this image").unwrap(),
         ContentBlock::inline_image("image/png", "iVBORw0KGgo=").unwrap(),
     ];
-    service.prompt_content(session_id, content.clone()).unwrap();
+    service
+        .prompt_content(session_id, content.clone(), None)
+        .await
+        .unwrap();
     service.wait(session_id).await.unwrap();
 
     let requests = provider.captured_requests().unwrap();
@@ -339,6 +412,81 @@ async fn typed_prompt_content_reaches_model_and_session() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn provider_preflight_rejects_complete_structured_request_before_acceptance() {
+    let root = std::env::temp_dir().join(format!(
+        "coding-service-structured-preflight-{}-{}",
+        std::process::id(),
+        ID.fetch_add(1, Ordering::Relaxed)
+    ));
+    fs::create_dir_all(&root).unwrap();
+    let workspace = WorkspaceRoot::new(&root).unwrap();
+    let resources =
+        ResourceCatalog::discover(&root, &root, ProjectAccess::Trusted, &[], &[], None, None)
+            .unwrap();
+    let store = Arc::new(
+        SqliteSessionStore::open(root.join("sessions.sqlite3").to_str().unwrap()).unwrap(),
+    );
+    let bash = BashConfig::new(
+        BashShell::new("/bin/sh", "-c").unwrap(),
+        BashOutputDirectory::new(&root).unwrap(),
+        Duration::from_secs(5),
+    )
+    .unwrap();
+    let provider = Arc::new(RejectingCodingPreflightProvider::new());
+    let service = CodingAgentBuilder::new(
+        Arc::clone(&provider) as Arc<dyn ModelProvider>,
+        workspace,
+        resources,
+        Arc::clone(&store),
+        bash,
+        fake_settings(),
+        ActorId::from_str("local:user").unwrap(),
+        WorkspaceId::from_str("workspace/local").unwrap(),
+    )
+    .build()
+    .unwrap();
+    let session_id = service.create_session().await.unwrap();
+
+    let error = service
+        .prompt(
+            session_id,
+            "return JSON",
+            Some(FinalOutputFormat::JsonSchema {
+                schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {"answer": {"type": "string"}},
+                    "required": ["answer"],
+                    "additionalProperties": false
+                }),
+            }),
+        )
+        .await
+        .unwrap_err();
+
+    assert_eq!(error.code(), CodingErrorCode::InvalidInput);
+    assert_eq!(
+        error.message(),
+        "provider-specific preflight rejected complete request"
+    );
+    assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+    assert!(provider.inner.captured_requests().unwrap().is_empty());
+    assert!(
+        service
+            .session_snapshot(session_id)
+            .await
+            .unwrap()
+            .state()
+            .messages()
+            .is_empty()
+    );
+
+    service.shutdown().await;
+    drop(service);
+    drop(store);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn service_exposes_content_free_last_prompt_inspection() {
     let root = std::env::temp_dir().join(format!(
         "coding-service-prompt-inspection-{}-{}",
@@ -371,7 +519,7 @@ async fn service_exposes_content_free_last_prompt_inspection() {
     let session = service.create_session().await.unwrap();
     assert!(service.prompt_inspection(session).unwrap().is_none());
 
-    service.prompt(session, "inspect").unwrap();
+    service.prompt(session, "inspect", None).await.unwrap();
     service.wait(session).await.unwrap();
     let inspection = service.prompt_inspection(session).unwrap().unwrap();
     assert_eq!(inspection.session_id(), session);
@@ -424,7 +572,7 @@ async fn coding_builder_accepts_typed_per_turn_context_providers() {
     .build()
     .unwrap();
     let session = service.create_session().await.unwrap();
-    service.prompt(session, "turn").unwrap();
+    service.prompt(session, "turn", None).await.unwrap();
     service.wait(session).await.unwrap();
 
     let request = &provider.captured_requests().unwrap()[0];
@@ -680,7 +828,10 @@ async fn coding_service_defaults_to_four_tools_and_can_activate_all_seven() {
     );
     let session_id = service.create_session().await.unwrap();
 
-    service.prompt(session_id, "default tools").unwrap();
+    service
+        .prompt(session_id, "default tools", None)
+        .await
+        .unwrap();
     service.wait(session_id).await.unwrap();
     service
         .set_active_tools(
@@ -692,7 +843,7 @@ async fn coding_service_defaults_to_four_tools_and_can_activate_all_seven() {
         )
         .await
         .unwrap();
-    service.prompt(session_id, "all tools").unwrap();
+    service.prompt(session_id, "all tools", None).await.unwrap();
     service.wait(session_id).await.unwrap();
 
     let requests = provider.captured_requests().unwrap();
@@ -760,13 +911,13 @@ async fn coding_system_prompt_uses_logical_sources_and_tracks_active_tools() {
     );
     let session_id = service.create_session().await.unwrap();
 
-    service.prompt(session_id, "first").unwrap();
+    service.prompt(session_id, "first", None).await.unwrap();
     service.wait(session_id).await.unwrap();
     service
         .set_active_tools(session_id, vec!["write".parse().unwrap()])
         .await
         .unwrap();
-    service.prompt(session_id, "second").unwrap();
+    service.prompt(session_id, "second", None).await.unwrap();
     service.wait(session_id).await.unwrap();
 
     let requests = provider.captured_requests().unwrap();
@@ -835,7 +986,10 @@ async fn skill_resource_tool_is_conditional_and_executes_against_the_catalog() {
         fake_settings(),
     );
     let empty_session = empty_service.create_session().await.unwrap();
-    empty_service.prompt(empty_session, "empty").unwrap();
+    empty_service
+        .prompt(empty_session, "empty", None)
+        .await
+        .unwrap();
     empty_service.wait(empty_session).await.unwrap();
     assert!(
         !empty_provider.captured_requests().unwrap()[0]
@@ -900,7 +1054,10 @@ async fn skill_resource_tool_is_conditional_and_executes_against_the_catalog() {
         fake_settings(),
     );
     let session = service.create_session().await.unwrap();
-    service.prompt(session, "read the checklist").unwrap();
+    service
+        .prompt(session, "read the checklist", None)
+        .await
+        .unwrap();
     let outcome = service.wait(session).await.unwrap();
     assert!(matches!(
         outcome,
@@ -950,13 +1107,19 @@ async fn hosted_search_is_registered_but_requires_explicit_activation() {
         ["read", "write", "edit", "bash"]
     );
     let session_id = service.create_session().await.unwrap();
-    service.prompt(session_id, "default tools").unwrap();
+    service
+        .prompt(session_id, "default tools", None)
+        .await
+        .unwrap();
     service.wait(session_id).await.unwrap();
     service
         .set_active_tools(session_id, ["web_search".parse().unwrap()].into())
         .await
         .unwrap();
-    service.prompt(session_id, "search tools").unwrap();
+    service
+        .prompt(session_id, "search tools", None)
+        .await
+        .unwrap();
     service.wait(session_id).await.unwrap();
 
     let requests = provider.captured_requests().unwrap();
@@ -996,13 +1159,19 @@ async fn configured_client_backend_does_not_activate_search_and_prefers_hosted()
     );
     let service = service.unwrap();
     let session_id = service.create_session().await.unwrap();
-    service.prompt(session_id, "default tools").unwrap();
+    service
+        .prompt(session_id, "default tools", None)
+        .await
+        .unwrap();
     service.wait(session_id).await.unwrap();
     service
         .set_active_tools(session_id, ["web_search".parse().unwrap()].into())
         .await
         .unwrap();
-    service.prompt(session_id, "search tools").unwrap();
+    service
+        .prompt(session_id, "search tools", None)
+        .await
+        .unwrap();
     service.wait(session_id).await.unwrap();
 
     let requests = provider.captured_requests().unwrap();
@@ -1032,7 +1201,10 @@ async fn hybrid_search_falls_back_to_client_for_models_without_hosted_search() {
     );
     let service = service.unwrap();
     let session_id = service.create_session().await.unwrap();
-    service.prompt(session_id, "search tools").unwrap();
+    service
+        .prompt(session_id, "search tools", None)
+        .await
+        .unwrap();
     service.wait(session_id).await.unwrap();
 
     let requests = provider.captured_requests().unwrap();
@@ -1062,7 +1234,10 @@ async fn force_client_projects_function_and_fails_without_a_real_backend() {
     );
     let service = service.unwrap();
     let session_id = service.create_session().await.unwrap();
-    service.prompt(session_id, "search tools").unwrap();
+    service
+        .prompt(session_id, "search tools", None)
+        .await
+        .unwrap();
     service.wait(session_id).await.unwrap();
     let requests = provider.captured_requests().unwrap();
     assert!(requests[0].tools()[0].as_function().is_some());
@@ -1213,7 +1388,10 @@ async fn web_fetch_is_a_client_function_independent_of_hosted_model_capabilities
     );
     let service = service.unwrap();
     let session_id = service.create_session().await.unwrap();
-    service.prompt(session_id, "fetch tools").unwrap();
+    service
+        .prompt(session_id, "fetch tools", None)
+        .await
+        .unwrap();
     service.wait(session_id).await.unwrap();
 
     let requests = provider.captured_requests().unwrap();
@@ -1248,7 +1426,10 @@ async fn web_fetch_approval_precedes_provider_and_denial_never_calls_it() {
     );
     let service = service.unwrap();
     let session_id = service.create_session().await.unwrap();
-    service.prompt(session_id, "fetch the URL").unwrap();
+    service
+        .prompt(session_id, "fetch the URL", None)
+        .await
+        .unwrap();
     let outcome = service.wait(session_id).await.unwrap();
     let approval_id = match outcome {
         tea::RuntimeCommandOutcome::RunCompleted {
@@ -1297,7 +1478,10 @@ async fn web_fetch_approval_precedes_provider_and_denial_never_calls_it() {
     );
     let service = service.unwrap();
     let session_id = service.create_session().await.unwrap();
-    service.prompt(session_id, "fetch the URL").unwrap();
+    service
+        .prompt(session_id, "fetch the URL", None)
+        .await
+        .unwrap();
     let outcome = service.wait(session_id).await.unwrap();
     let approval_id = match outcome {
         tea::RuntimeCommandOutcome::RunCompleted {
@@ -1378,7 +1562,10 @@ async fn coding_loop_rebuilds_between_approval_and_resolution() {
     assert!(service.resources().skill_metadata().is_empty());
     let session_id = service.create_session().await.unwrap();
     let _events = service.subscribe(session_id).unwrap();
-    service.prompt(session_id, "fix and test the file").unwrap();
+    service
+        .prompt(session_id, "fix and test the file", None)
+        .await
+        .unwrap();
     let first = service.wait(session_id).await.unwrap();
     let edit_approval = match first {
         tea::RuntimeCommandOutcome::RunCompleted {

@@ -57,24 +57,41 @@ impl OutputItemKind {
             Self::Other(_) => "other",
         }
     }
-
-    const fn is_non_executable_text(&self) -> bool {
-        matches!(self, Self::Message | Self::Reasoning)
-    }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum OutputIndexCompatibility {
-    Strict,
-    ReusedNonExecutable,
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+enum ResponseTerminalKind {
+    #[default]
+    Completed,
+    ToolUse,
+    Refusal,
+}
+
+impl ResponseTerminalKind {
+    fn observe_tool_use(&mut self) {
+        if *self != Self::Refusal {
+            *self = Self::ToolUse;
+        }
+    }
+
+    fn observe_refusal(&mut self) {
+        *self = Self::Refusal;
+    }
+
+    const fn stop_reason(self) -> StopReason {
+        match self {
+            Self::Completed => StopReason::Completed,
+            Self::ToolUse => StopReason::ToolUse,
+            Self::Refusal => StopReason::Refusal,
+        }
+    }
 }
 
 /// Stateful reducer for one `OpenAI` Responses stream.
 pub struct ResponsesReducer {
     started: bool,
     terminal_emitted: bool,
-    saw_tool_call: bool,
-    output_index_compatibility: OutputIndexCompatibility,
+    terminal_kind: ResponseTerminalKind,
     output_item_kinds: BTreeMap<u16, OutputItemKind>,
     output_item_indices: BTreeMap<String, u16>,
     tool_calls: BTreeMap<u16, ToolCallAccumulator>,
@@ -95,11 +112,7 @@ impl fmt::Debug for ResponsesReducer {
             .debug_struct("ResponsesReducer")
             .field("started", &self.started)
             .field("terminal_emitted", &self.terminal_emitted)
-            .field("saw_tool_call", &self.saw_tool_call)
-            .field(
-                "output_index_compatibility",
-                &self.output_index_compatibility,
-            )
+            .field("terminal_kind", &self.terminal_kind)
             .field("output_item_kind_count", &self.output_item_kinds.len())
             .field(
                 "output_item_identity_count",
@@ -123,8 +136,7 @@ impl Default for ResponsesReducer {
         Self {
             started: false,
             terminal_emitted: false,
-            saw_tool_call: false,
-            output_index_compatibility: OutputIndexCompatibility::Strict,
+            terminal_kind: ResponseTerminalKind::default(),
             output_item_kinds: BTreeMap::new(),
             output_item_indices: BTreeMap::new(),
             tool_calls: BTreeMap::new(),
@@ -169,7 +181,7 @@ impl ResponsesReducer {
     #[allow(clippy::too_many_lines)]
     pub fn map_chunk(&mut self, value: &Value) -> Result<Vec<ModelEvent>, OpenAiError> {
         if self.terminal_emitted {
-            return Ok(Vec::new());
+            return Err(malformed("event arrived after Responses stream terminal"));
         }
         let mut events = Vec::new();
         let kind = value.get("type").and_then(Value::as_str).unwrap_or("");
@@ -187,6 +199,9 @@ impl ResponsesReducer {
                 let index = self.register_output_item_identity(raw_index, item)?;
                 let kind = output_item_kind(item)?;
                 self.register_output_item_kind(index, kind.clone())?;
+                if item_contains_refusal(item) {
+                    self.terminal_kind.observe_refusal();
+                }
                 match kind {
                     OutputItemKind::FunctionCall => {
                         self.start_tool_call(index, item, &mut events)?;
@@ -204,6 +219,9 @@ impl ResponsesReducer {
                 }
             }
             "response.output_text.delta" | "response.refusal.delta" => {
+                if kind == "response.refusal.delta" {
+                    self.terminal_kind.observe_refusal();
+                }
                 let index = self.resolve_output_index(value)?;
                 self.register_output_item_kind(index, OutputItemKind::Message)?;
                 let content_index = bounded_event_index(value, "content_index")?;
@@ -211,11 +229,18 @@ impl ResponsesReducer {
                     self.append_text(index, content_index, delta, &mut events)?;
                 }
             }
-            "response.output_text.done" => {
+            "response.output_text.done" | "response.refusal.done" => {
+                if kind == "response.refusal.done" {
+                    self.terminal_kind.observe_refusal();
+                }
                 let index = self.resolve_output_index(value)?;
                 self.register_output_item_kind(index, OutputItemKind::Message)?;
                 let content_index = bounded_event_index(value, "content_index")?;
-                if let Some(text) = value.get("text").and_then(Value::as_str) {
+                if let Some(text) = value
+                    .get("text")
+                    .or_else(|| value.get("refusal"))
+                    .and_then(Value::as_str)
+                {
                     self.reconcile_text(index, content_index, text, &mut events)?;
                 }
             }
@@ -294,15 +319,25 @@ impl ResponsesReducer {
             }
             "response.completed" => {
                 let response = response.ok_or_else(|| malformed("completed response missing"))?;
+                if response.get("status").and_then(Value::as_str) != Some("completed") {
+                    return Err(malformed(
+                        "Responses completed event has non-completed response status",
+                    ));
+                }
+                if response.get("error").is_some_and(|value| !value.is_null())
+                    || response
+                        .get("incomplete_details")
+                        .is_some_and(|value| !value.is_null())
+                {
+                    return Err(malformed(
+                        "Responses completed event contains terminal failure details",
+                    ));
+                }
                 self.complete_response_output(response, &mut events)?;
                 self.ensure_output_items_complete()?;
                 self.flush_pending_citations(&mut events, true)?;
-                let mut completion = ModelCompletion::new(if self.saw_tool_call {
-                    StopReason::ToolUse
-                } else {
-                    StopReason::Completed
-                })
-                .map_err(|_| malformed("Responses completion reason"))?;
+                let mut completion = ModelCompletion::new(self.terminal_kind.stop_reason())
+                    .map_err(|_| malformed("Responses completion reason"))?;
                 if let Some(usage) = parse_usage(response)? {
                     completion = completion.with_usage(usage);
                 }
@@ -385,10 +420,6 @@ impl ResponsesReducer {
     ) -> Result<(), OpenAiError> {
         if let Some(existing) = self.output_item_kinds.get(&index) {
             if *existing != kind {
-                if existing.is_non_executable_text() && kind.is_non_executable_text() {
-                    self.output_index_compatibility = OutputIndexCompatibility::ReusedNonExecutable;
-                    return Ok(());
-                }
                 return Err(malformed(&format!(
                     "Responses output item {index} changed type from {} to {}",
                     existing.label(),
@@ -410,46 +441,44 @@ impl ResponsesReducer {
             return Ok(raw_index);
         };
         if let Some(existing) = self.output_item_indices.get(item_id) {
-            return Ok(*existing);
+            if *existing != raw_index {
+                return Err(malformed("Responses output item changed index"));
+            }
+            return Ok(raw_index);
         }
-        let index = if self
+        if self
             .output_item_indices
-            .values()
-            .any(|index| *index == raw_index)
+            .iter()
+            .any(|(existing_id, index)| existing_id != item_id && *index == raw_index)
         {
-            self.next_output_item_index(raw_index)?
-        } else {
-            raw_index
-        };
-        self.output_item_indices.insert(item_id.to_owned(), index);
-        Ok(index)
+            return Err(malformed("Responses output index changed item identity"));
+        }
+        self.output_item_indices
+            .insert(item_id.to_owned(), raw_index);
+        Ok(raw_index)
     }
 
-    fn resolve_output_index(&self, value: &Value) -> Result<u16, OpenAiError> {
+    fn resolve_output_index(&mut self, value: &Value) -> Result<u16, OpenAiError> {
         let raw = output_index(value)?;
-        Ok(value
-            .get("item_id")
-            .and_then(Value::as_str)
-            .and_then(|item_id| self.output_item_indices.get(item_id).copied())
-            .unwrap_or(raw))
-    }
-
-    fn next_output_item_index(&self, raw_index: u16) -> Result<u16, OpenAiError> {
-        let mut candidate = raw_index;
-        loop {
-            candidate = candidate
-                .checked_add(1)
-                .ok_or_else(|| malformed("Responses output index out of range"))?;
-            if !self
-                .output_item_indices
-                .values()
-                .any(|index| *index == candidate)
-                && !self.output_item_kinds.contains_key(&candidate)
-            {
-                let _ = stream_index(candidate)?;
-                return Ok(candidate);
+        if let Some(item_id) = value.get("item_id").and_then(Value::as_str) {
+            if let Some(existing) = self.output_item_indices.get(item_id) {
+                if *existing != raw {
+                    return Err(malformed(
+                        "Responses event output index does not match item",
+                    ));
+                }
+            } else {
+                if self
+                    .output_item_indices
+                    .iter()
+                    .any(|(existing_id, index)| existing_id != item_id && *index == raw)
+                {
+                    return Err(malformed("Responses output index changed item identity"));
+                }
+                self.output_item_indices.insert(item_id.to_owned(), raw);
             }
         }
+        Ok(raw)
     }
 
     fn start_tool_call(
@@ -491,7 +520,7 @@ impl ResponsesReducer {
                 completed: false,
             },
         );
-        self.saw_tool_call = true;
+        self.terminal_kind.observe_tool_use();
         events.push(ModelEvent::ToolCallStarted(
             ToolCallStarted::new(stream_index, provider_id, name)
                 .map_err(|_| malformed("Responses function call start"))?,
@@ -691,6 +720,9 @@ impl ResponsesReducer {
                 self.complete_hosted_search(index, item, events)?;
             }
             OutputItemKind::Message => {
+                if item_contains_refusal(item) {
+                    self.terminal_kind.observe_refusal();
+                }
                 self.reconcile_message_content(index, item, events)?;
                 self.emit_message_annotations(index, item, events)?;
             }
@@ -958,27 +990,6 @@ impl ResponsesReducer {
         text: &str,
         events: &mut Vec<ModelEvent>,
     ) -> Result<(), OpenAiError> {
-        let reused_non_executable_index =
-            self.output_index_compatibility == OutputIndexCompatibility::ReusedNonExecutable;
-        let streamed_under_reused_index = reused_non_executable_index
-            && !self.text_by_content.contains_key(&(index, content_index))
-            && self
-                .text_by_content
-                .iter()
-                .any(|((other_index, other_content_index), existing)| {
-                    *other_index != index
-                        && *other_content_index == content_index
-                        && existing == text
-                });
-        let replayed_complete_stream = reused_non_executable_index
-            && !self.emitted_text.is_empty()
-            && self.emitted_text == text;
-        if streamed_under_reused_index || replayed_complete_stream {
-            self.text_by_content
-                .insert((index, content_index), text.to_owned());
-            self.text_by_index.insert(index, text.to_owned());
-            return Ok(());
-        }
         let current = self
             .text_by_content
             .entry((index, content_index))
@@ -1040,13 +1051,63 @@ impl ResponsesReducer {
         response: &Value,
         events: &mut Vec<ModelEvent>,
     ) -> Result<(), OpenAiError> {
-        let Some(output) = response.get("output").and_then(Value::as_array) else {
-            return Ok(());
-        };
-        for (index, item) in output.iter().enumerate() {
-            let raw_index = u16::try_from(index)
+        let output = response
+            .get("output")
+            .and_then(Value::as_array)
+            .ok_or_else(|| malformed("Responses completed output missing or invalid"))?;
+        if output.is_empty() {
+            return Err(malformed("Responses completed output is empty"));
+        }
+
+        let mut indexed_items = Vec::with_capacity(output.len());
+        let mut terminal_text_by_content = BTreeMap::new();
+        let mut terminal_text = String::new();
+        for (raw_index, item) in output.iter().enumerate() {
+            let raw_index = u16::try_from(raw_index)
                 .map_err(|_| malformed("Responses output index out of range"))?;
             let index = self.terminal_output_item_index(raw_index, item)?;
+            if output_item_kind(item)? == OutputItemKind::Message {
+                if item
+                    .get("status")
+                    .is_some_and(|status| status.as_str() != Some("completed"))
+                {
+                    return Err(malformed(
+                        "Responses completed message has non-completed status",
+                    ));
+                }
+                let content = item
+                    .get("content")
+                    .and_then(Value::as_array)
+                    .ok_or_else(|| malformed("Responses completed message content missing"))?;
+                for (content_index, part) in content.iter().enumerate() {
+                    let content_index = u16::try_from(content_index)
+                        .map_err(|_| malformed("Responses content index out of range"))?;
+                    let text = completed_message_part_text(part)?;
+                    terminal_text_by_content.insert((index, content_index), text.to_owned());
+                    terminal_text.push_str(text);
+                }
+            }
+            indexed_items.push((index, item));
+        }
+
+        if self.emitted_text != terminal_text
+            || self
+                .text_by_content
+                .iter()
+                .any(|(coordinate, text)| terminal_text_by_content.get(coordinate) != Some(text))
+            || terminal_text_by_content.iter().any(|(coordinate, text)| {
+                self.text_by_content
+                    .get(coordinate)
+                    .is_some_and(|streamed| streamed != text)
+                    || (!text.is_empty() && !self.text_by_content.contains_key(coordinate))
+            })
+        {
+            return Err(malformed(
+                "Responses streamed text does not match completed output",
+            ));
+        }
+
+        for (index, item) in indexed_items {
             self.complete_output_item(index, item, events)?;
         }
         Ok(())
@@ -1057,18 +1118,6 @@ impl ResponsesReducer {
         raw_index: u16,
         item: &Value,
     ) -> Result<u16, OpenAiError> {
-        let Some(item_id) = item.get("id").and_then(Value::as_str) else {
-            return Ok(raw_index);
-        };
-        if let Some(existing) = self.output_item_indices.get(item_id) {
-            return Ok(*existing);
-        }
-        let kind = output_item_kind(item)?;
-        if self.output_item_kinds.get(&raw_index) == Some(&kind) {
-            self.output_item_indices
-                .insert(item_id.to_owned(), raw_index);
-            return Ok(raw_index);
-        }
         self.register_output_item_identity(raw_index, item)
     }
 
@@ -1121,6 +1170,36 @@ fn output_item_kind(item: &Value) -> Result<OutputItemKind, OpenAiError> {
         Some(other) => Ok(OutputItemKind::Other(other.to_owned())),
         None => Err(malformed("Responses output item type missing")),
     }
+}
+
+fn completed_message_part_text(part: &Value) -> Result<&str, OpenAiError> {
+    match part.get("type").and_then(Value::as_str) {
+        Some("output_text") => part
+            .get("text")
+            .and_then(Value::as_str)
+            .ok_or_else(|| malformed("Responses completed output text missing")),
+        Some("refusal") => part
+            .get("refusal")
+            .and_then(Value::as_str)
+            .ok_or_else(|| malformed("Responses completed refusal text missing")),
+        Some(_) => Err(malformed(
+            "Responses completed message content type invalid",
+        )),
+        None => Err(malformed(
+            "Responses completed message content type missing",
+        )),
+    }
+}
+
+fn item_contains_refusal(item: &Value) -> bool {
+    item.get("content")
+        .and_then(Value::as_array)
+        .is_some_and(|content| {
+            content.iter().any(|part| {
+                part.get("type").and_then(Value::as_str) == Some("refusal")
+                    || part.get("refusal").is_some()
+            })
+        })
 }
 
 fn character_range_to_bytes(text: &str, start: usize, end: usize) -> Option<(usize, usize)> {
@@ -1179,12 +1258,17 @@ fn parse_usage(response: &Value) -> Result<Option<Usage>, OpenAiError> {
     };
     let raw_input = token_value(value, "input_tokens")?;
     let output = token_value(value, "output_tokens")?;
+    let total = token_value(value, "total_tokens")?;
+    if raw_input.checked_add(output) != Some(total) {
+        return Err(malformed("Responses total usage is inconsistent"));
+    }
     let details = value.get("input_tokens_details");
     let cache_read = optional_token_value(details, "cached_tokens")?;
     let cache_write = optional_token_value(details, "cache_write_tokens")?;
     let billable_input = raw_input
-        .saturating_sub(cache_read.map_or(0, TokenCount::get))
-        .saturating_sub(cache_write.map_or(0, TokenCount::get));
+        .checked_sub(cache_read.map_or(0, TokenCount::get))
+        .and_then(|input| input.checked_sub(cache_write.map_or(0, TokenCount::get)))
+        .ok_or_else(|| malformed("Responses cached input usage exceeds total input"))?;
     let mut usage = Usage::new(
         TokenCount::new(billable_input).map_err(|_| malformed("Responses input usage"))?,
         TokenCount::new(output).map_err(|_| malformed("Responses output usage"))?,

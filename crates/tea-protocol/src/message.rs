@@ -356,6 +356,8 @@ pub enum StopReason {
     ToolUse,
     /// Provider paused a server-side tool loop and requires transcript replay.
     PauseTurn,
+    /// Provider refused to produce the requested output.
+    Refusal,
     /// Operation was cancelled.
     Cancelled,
     /// Provider or runtime failed.
@@ -373,6 +375,7 @@ impl StopReason {
             Self::Length => "length",
             Self::ToolUse => "tool_use",
             Self::PauseTurn => "pause_turn",
+            Self::Refusal => "refusal",
             Self::Cancelled => "cancelled",
             Self::Error => "error",
             Self::Unknown(value) => value,
@@ -412,6 +415,7 @@ impl<'de> Deserialize<'de> for StopReason {
             "length" => Self::Length,
             "tool_use" => Self::ToolUse,
             "pause_turn" => Self::PauseTurn,
+            "refusal" => Self::Refusal,
             "cancelled" => Self::Cancelled,
             "error" => Self::Error,
             _ => Self::Unknown(value),

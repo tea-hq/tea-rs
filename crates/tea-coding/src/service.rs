@@ -381,13 +381,15 @@ impl CodingAgentService {
     /// # Errors
     ///
     /// Rejects duplicate/overflowing owned runs and invalid prompt text.
-    pub fn prompt(
+    pub async fn prompt(
         &self,
         session_id: SessionId,
         text: impl Into<String>,
+        final_output_format: Option<tea_protocol::FinalOutputFormat>,
     ) -> Result<CommandAcceptance, CodingError> {
         let content = vec![ContentBlock::text(text.into()).map_err(|_| invalid())?];
-        self.prompt_content(session_id, content)
+        self.prompt_content(session_id, content, final_output_format)
+            .await
     }
 
     /// Accepts typed user content into one owned task.
@@ -396,17 +398,27 @@ impl CodingAgentService {
     ///
     /// Rejects duplicate/overflowing owned runs and content that cannot form a
     /// canonical user message.
-    pub fn prompt_content(
+    pub async fn prompt_content(
         &self,
         session_id: SessionId,
         content: Vec<ContentBlock>,
+        final_output_format: Option<tea_protocol::FinalOutputFormat>,
     ) -> Result<CommandAcceptance, CodingError> {
         let timestamp = now()?;
         let message = CanonicalMessage::user(new_id::<MessageId>()?, content, timestamp)
             .map_err(|_| invalid())?;
+        if final_output_format.is_some() {
+            self.runtime
+                .preflight_prompt(session_id, &message, final_output_format.as_ref())
+                .await
+                .map_err(CodingError::from)?;
+        }
         let envelope = envelope_at(
             Some(session_id),
-            AgentCommand::Prompt { message },
+            AgentCommand::Prompt {
+                message,
+                final_output_format,
+            },
             timestamp,
         )?;
         self.start_owned(session_id, envelope)

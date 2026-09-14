@@ -101,7 +101,8 @@ impl From<tea_coding::CodingError> for CliFailure {
             | CodingErrorCode::ContextOverflow
             | CodingErrorCode::Unavailable
             | CodingErrorCode::Transport
-            | CodingErrorCode::InvalidRequest => ExitCategory::Provider,
+            | CodingErrorCode::InvalidRequest
+            | CodingErrorCode::MalformedResponse => ExitCategory::Provider,
             CodingErrorCode::PolicyDenied => ExitCategory::PolicyDenied,
             CodingErrorCode::Cancelled => ExitCategory::Cancelled,
             CodingErrorCode::Persistence | CodingErrorCode::Runtime | CodingErrorCode::Internal => {

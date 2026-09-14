@@ -38,16 +38,26 @@ struct HostedToolAccumulator {
     completed: bool,
 }
 
+#[derive(Clone)]
+struct ContentBlockState {
+    kind: String,
+    closed: bool,
+}
+
 /// Stateful reducer for Anthropic Messages Server-Sent Events.
 #[derive(Default)]
 pub struct AnthropicReducer {
     started: bool,
+    message_started: bool,
     terminal_emitted: bool,
+    pending_stop_reason: Option<StopReason>,
+    output_tokens: Option<u64>,
     input_tokens: Option<u64>,
     cache_read_tokens: Option<u64>,
     cache_write_tokens: Option<u64>,
     tool_calls: BTreeMap<u16, ToolCallAccumulator>,
     hosted_tools: BTreeMap<u16, HostedToolAccumulator>,
+    content_blocks: BTreeMap<u16, ContentBlockState>,
     source_owners: BTreeMap<String, String>,
 }
 
@@ -56,12 +66,19 @@ impl fmt::Debug for AnthropicReducer {
         formatter
             .debug_struct("AnthropicReducer")
             .field("started", &self.started)
+            .field("message_started", &self.message_started)
             .field("terminal_emitted", &self.terminal_emitted)
+            .field(
+                "has_pending_stop_reason",
+                &self.pending_stop_reason.is_some(),
+            )
+            .field("has_output_tokens", &self.output_tokens.is_some())
             .field("has_input_tokens", &self.input_tokens.is_some())
             .field("has_cache_read_tokens", &self.cache_read_tokens.is_some())
             .field("has_cache_write_tokens", &self.cache_write_tokens.is_some())
             .field("tool_call_count", &self.tool_calls.len())
             .field("hosted_tool_count", &self.hosted_tools.len())
+            .field("content_block_count", &self.content_blocks.len())
             .field("source_owner_count", &self.source_owners.len())
             .finish_non_exhaustive()
     }
@@ -86,15 +103,27 @@ impl AnthropicReducer {
     ///
     /// Returns an error when an event cannot be normalized safely.
     pub fn map_chunk(&mut self, value: &Value) -> Result<Vec<ModelEvent>, AnthropicError> {
+        let event_type = value
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if self.terminal_emitted {
+            if event_type == "ping" {
+                return Ok(Vec::new());
+            }
+            return Err(malformed("event arrived after Anthropic stream terminal"));
+        }
+        if self.pending_stop_reason.is_some() && !matches!(event_type, "ping" | "message_stop") {
+            return Err(malformed(
+                "event arrived after Anthropic message stop reason",
+            ));
+        }
+
         let mut events = Vec::new();
         if !self.started {
             events.push(ModelEvent::Started(ModelResponseInfo::new()));
             self.started = true;
         }
-        let event_type = value
-            .get("type")
-            .and_then(Value::as_str)
-            .unwrap_or_default();
         match event_type {
             "error" => {
                 self.terminal_emitted = true;
@@ -103,30 +132,24 @@ impl AnthropicReducer {
             "message_start" => self.map_message_start(value, &mut events)?,
             "content_block_start" => self.map_content_start(value, &mut events)?,
             "content_block_delta" => self.map_content_delta(value, &mut events)?,
-            "message_delta" => self.map_message_delta(value, &mut events)?,
-            "message_stop" if !self.terminal_emitted => {
-                self.ensure_hosted_tools_complete()?;
-                events.extend(self.complete_tool_calls()?);
-                events.push(self.complete(StopReason::Completed, None)?);
-            }
+            "content_block_stop" => self.map_content_stop(value)?,
+            "message_delta" => self.map_message_delta(value)?,
+            "message_stop" => self.map_message_stop(&mut events)?,
             _ => {}
         }
         Ok(events)
     }
 
-    /// Completes a truncated or gateway-terminated stream deterministically.
+    /// Rejects a truncated or gateway-terminated stream before `message_stop`.
     ///
     /// # Errors
     ///
-    /// Returns an error when an accumulated tool input is not valid JSON.
+    /// Returns an error when the required terminal frame was not observed.
     pub fn finish(&mut self) -> Result<Vec<ModelEvent>, AnthropicError> {
         if self.terminal_emitted {
             Ok(Vec::new())
         } else {
-            self.ensure_hosted_tools_complete()?;
-            let mut events = self.complete_tool_calls()?;
-            events.push(self.complete(StopReason::Completed, None)?);
-            Ok(events)
+            Err(malformed("Anthropic stream ended before message_stop"))
         }
     }
 
@@ -135,11 +158,14 @@ impl AnthropicReducer {
         value: &Value,
         events: &mut [ModelEvent],
     ) -> Result<(), AnthropicError> {
+        if self.message_started {
+            return Err(malformed("message_start arrived twice"));
+        }
         let message = value
             .get("message")
             .ok_or_else(|| malformed("message_start missing message"))?;
         if let Some(usage) = message.get("usage") {
-            self.capture_input_usage(usage);
+            self.capture_usage(usage, false)?;
         }
         let mut info = ModelResponseInfo::new();
         if let Some(response_id) = message
@@ -159,6 +185,7 @@ impl AnthropicReducer {
         if matches!(events.first(), Some(ModelEvent::Started(_))) {
             events[0] = ModelEvent::Started(info);
         }
+        self.message_started = true;
         Ok(())
     }
 
@@ -171,8 +198,15 @@ impl AnthropicReducer {
         let block = value
             .get("content_block")
             .ok_or_else(|| malformed("content block missing"))?;
-        match block.get("type").and_then(Value::as_str) {
-            Some("text") => {
+        let kind = block
+            .get("type")
+            .and_then(Value::as_str)
+            .ok_or_else(|| malformed("content block type missing"))?;
+        if self.content_blocks.contains_key(&index.get()) {
+            return Err(malformed("content block index started twice"));
+        }
+        match kind {
+            "text" => {
                 if let Some(text) = block.get("text").and_then(Value::as_str) {
                     Self::push_text(text, events)?;
                 }
@@ -182,7 +216,7 @@ impl AnthropicReducer {
                     }
                 }
             }
-            Some("tool_use") => {
+            "tool_use" => {
                 let id = block
                     .get("id")
                     .and_then(Value::as_str)
@@ -219,10 +253,17 @@ impl AnthropicReducer {
                 }
                 self.tool_calls.insert(index.get(), accumulator);
             }
-            Some("server_tool_use") => self.start_hosted_tool(index, block, events)?,
-            Some("web_search_tool_result") => self.complete_hosted_tool(block, events)?,
+            "server_tool_use" => self.start_hosted_tool(index, block, events)?,
+            "web_search_tool_result" => self.complete_hosted_tool(block, events)?,
             _ => {}
         }
+        self.content_blocks.insert(
+            index.get(),
+            ContentBlockState {
+                kind: kind.to_owned(),
+                closed: false,
+            },
+        );
         Ok(())
     }
 
@@ -235,15 +276,31 @@ impl AnthropicReducer {
         let delta = value
             .get("delta")
             .ok_or_else(|| malformed("content delta missing"))?;
-        match delta.get("type").and_then(Value::as_str) {
-            Some("text_delta") => {
+        let delta_kind = delta
+            .get("type")
+            .and_then(Value::as_str)
+            .ok_or_else(|| malformed("content delta type missing"))?;
+        {
+            let block = self
+                .content_blocks
+                .get(&index.get())
+                .ok_or_else(|| malformed("content delta arrived before block start"))?;
+            if block.closed {
+                return Err(malformed("content delta arrived after block stop"));
+            }
+            if !delta_matches_block(&block.kind, delta_kind) {
+                return Err(malformed("content delta type does not match block type"));
+            }
+        }
+        match delta_kind {
+            "text_delta" => {
                 let text = delta
                     .get("text")
                     .and_then(Value::as_str)
                     .ok_or_else(|| malformed("text delta missing text"))?;
                 Self::push_text(text, events)?;
             }
-            Some("input_json_delta") => {
+            "input_json_delta" => {
                 let partial = delta
                     .get("partial_json")
                     .and_then(Value::as_str)
@@ -265,7 +322,7 @@ impl AnthropicReducer {
                     }
                 }
             }
-            Some("citations_delta") => {
+            "citations_delta" => {
                 let citation = delta
                     .get("citation")
                     .ok_or_else(|| malformed("citation delta missing citation"))?;
@@ -276,39 +333,90 @@ impl AnthropicReducer {
         Ok(())
     }
 
-    fn map_message_delta(
-        &mut self,
-        value: &Value,
-        events: &mut Vec<ModelEvent>,
-    ) -> Result<(), AnthropicError> {
-        let stop = match value
+    fn map_content_stop(&mut self, value: &Value) -> Result<(), AnthropicError> {
+        let index = stream_index(value)?;
+        let block = self
+            .content_blocks
+            .get_mut(&index.get())
+            .ok_or_else(|| malformed("content block stop arrived before block start"))?;
+        if block.closed {
+            return Err(malformed("content block stopped twice"));
+        }
+        block.closed = true;
+        Ok(())
+    }
+
+    fn map_message_delta(&mut self, value: &Value) -> Result<(), AnthropicError> {
+        let delta = value
             .get("delta")
-            .and_then(|delta| delta.get("stop_reason"))
-            .and_then(Value::as_str)
-        {
-            Some("max_tokens") => StopReason::Length,
-            Some("tool_use") => StopReason::ToolUse,
-            Some("pause_turn") => StopReason::PauseTurn,
-            _ => StopReason::Completed,
-        };
-        let output_tokens = value
-            .get("usage")
-            .and_then(|usage| usage.get("output_tokens"))
-            .and_then(Value::as_u64);
+            .and_then(Value::as_object)
+            .ok_or_else(|| malformed("message_delta missing delta object"))?;
+        if let Some(usage) = value.get("usage") {
+            self.capture_usage(usage, true)?;
+        }
+        match delta.get("stop_reason") {
+            None | Some(Value::Null) => {}
+            Some(Value::String(reason)) => {
+                if self.pending_stop_reason.is_some() {
+                    return Err(malformed("message stop reason was reported twice"));
+                }
+                self.pending_stop_reason = Some(match reason.as_str() {
+                    "end_turn" | "stop_sequence" => StopReason::Completed,
+                    "max_tokens" | "model_context_window_exceeded" => StopReason::Length,
+                    "tool_use" => StopReason::ToolUse,
+                    "pause_turn" => StopReason::PauseTurn,
+                    "refusal" => StopReason::Refusal,
+                    reason => StopReason::Unknown(reason.to_owned()),
+                });
+            }
+            Some(_) => return Err(malformed("message_delta stop_reason is invalid")),
+        }
+        Ok(())
+    }
+
+    fn map_message_stop(&mut self, events: &mut Vec<ModelEvent>) -> Result<(), AnthropicError> {
+        if self.terminal_emitted {
+            return Err(malformed("message_stop arrived after completion"));
+        }
+        let stop = self
+            .pending_stop_reason
+            .clone()
+            .ok_or_else(|| malformed("message_stop arrived before a terminal stop reason"))?;
+        self.ensure_content_blocks_closed()?;
         self.ensure_hosted_tools_complete()?;
         for event in self.complete_tool_calls()? {
             events.push(event);
         }
-        events.push(self.complete(stop, output_tokens)?);
+        events.push(self.complete(stop, self.output_tokens)?);
         Ok(())
     }
 
-    fn capture_input_usage(&mut self, usage: &Value) {
-        self.input_tokens = usage.get("input_tokens").and_then(Value::as_u64);
-        self.cache_read_tokens = usage.get("cache_read_input_tokens").and_then(Value::as_u64);
-        self.cache_write_tokens = usage
-            .get("cache_creation_input_tokens")
-            .and_then(Value::as_u64);
+    fn capture_usage(
+        &mut self,
+        usage: &Value,
+        nullable_input_fields: bool,
+    ) -> Result<(), AnthropicError> {
+        if !usage.is_object() {
+            return Err(malformed("Anthropic usage must be an object"));
+        }
+        let input = optional_token_value(usage, "input_tokens", nullable_input_fields)?;
+        let output = optional_token_value(usage, "output_tokens", false)?;
+        let cache_read = optional_token_value(usage, "cache_read_input_tokens", true)?;
+        let cache_write = optional_token_value(usage, "cache_creation_input_tokens", true)?;
+
+        if let Some(input) = input {
+            self.input_tokens = Some(input);
+        }
+        if let Some(output) = output {
+            self.output_tokens = Some(output);
+        }
+        if let Some(cache_read) = cache_read {
+            self.cache_read_tokens = Some(cache_read);
+        }
+        if let Some(cache_write) = cache_write {
+            self.cache_write_tokens = Some(cache_write);
+        }
+        Ok(())
     }
 
     fn push_text(text: &str, events: &mut Vec<ModelEvent>) -> Result<(), AnthropicError> {
@@ -482,6 +590,13 @@ impl AnthropicReducer {
         Ok(())
     }
 
+    fn ensure_content_blocks_closed(&self) -> Result<(), AnthropicError> {
+        if self.content_blocks.values().any(|block| !block.closed) {
+            return Err(malformed("message completed with an open content block"));
+        }
+        Ok(())
+    }
+
     fn complete_tool_calls(&self) -> Result<Vec<ModelEvent>, AnthropicError> {
         self.tool_calls
             .values()
@@ -526,12 +641,49 @@ impl AnthropicReducer {
             {
                 usage = usage.with_cache_write(cache_write);
             }
-            if usage.total_tokens().is_ok() {
-                completion = completion.with_usage(usage);
-            }
+            usage
+                .total_tokens()
+                .map_err(|_| malformed("Anthropic usage total is invalid"))?;
+            completion = completion.with_usage(usage);
         }
         self.terminal_emitted = true;
         Ok(ModelEvent::Completed(completion))
+    }
+}
+
+fn optional_token_value(
+    usage: &Value,
+    key: &str,
+    nullable: bool,
+) -> Result<Option<u64>, AnthropicError> {
+    let Some(value) = usage.get(key) else {
+        return Ok(None);
+    };
+    if nullable && value.is_null() {
+        return Ok(None);
+    }
+    let value = value
+        .as_u64()
+        .ok_or_else(|| malformed("Anthropic usage field is invalid"))?;
+    TokenCount::new(value)
+        .map(|_| Some(value))
+        .map_err(|_| malformed("Anthropic usage field is out of range"))
+}
+
+fn delta_matches_block(block_kind: &str, delta_kind: &str) -> bool {
+    match block_kind {
+        "text" => matches!(delta_kind, "text_delta" | "citations_delta"),
+        "tool_use" | "server_tool_use" => delta_kind == "input_json_delta",
+        "thinking" => matches!(delta_kind, "thinking_delta" | "signature_delta"),
+        "redacted_thinking" | "web_search_tool_result" => false,
+        _ => !matches!(
+            delta_kind,
+            "text_delta"
+                | "citations_delta"
+                | "input_json_delta"
+                | "thinking_delta"
+                | "signature_delta"
+        ),
     }
 }
 

@@ -16,7 +16,7 @@ use tea_model::{
     ModelResponseInfo, ModelSpec, ProviderId, ProviderToolCallId, ToolCallCompleted,
     ToolCallStarted, Utf8Delta,
 };
-use tea_protocol::{ModelId, StopReason, TokenCount};
+use tea_protocol::{FinalOutputFormat, ModelId, StopReason, TokenCount};
 use tea_testkit::{ScriptStep, ScriptedModelProvider, ScriptedModelResponse};
 
 static ID: AtomicU64 = AtomicU64::new(0);
@@ -68,7 +68,9 @@ fn model() -> ModelSpec {
         ModelDisplayName::from_str("Fake Model").unwrap(),
         TokenCount::new(32_000).unwrap(),
         TokenCount::new(4_000).unwrap(),
-        ModelCapabilities::text().with_tools(true),
+        ModelCapabilities::text()
+            .with_tools(true)
+            .with_final_json_schema_with_tools(),
     )
     .unwrap()
 }
@@ -104,6 +106,26 @@ fn args() -> CliArgs {
         "--trust",
         "ignore",
         "run",
+    ])
+    .unwrap()
+}
+
+fn schema_args(root: &Path) -> CliArgs {
+    CliArgs::try_parse_from([
+        "tea",
+        "--json",
+        "--no-session",
+        "--provider",
+        "fake",
+        "--model",
+        "fake/model",
+        "--trust",
+        "ignore",
+        "--cwd",
+        root.to_str().unwrap(),
+        "--output-schema",
+        "answer.schema.json",
+        "return the answer",
     ])
     .unwrap()
 }
@@ -178,6 +200,57 @@ async fn success_stream_matches_golden_and_every_event_is_canonical() {
     }
     assert!(!output.contains(&0x1b));
     fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn json_mode_enforces_json_schema_with_active_tools() {
+    let schema = serde_json::json!({
+        "type": "object",
+        "properties": {"answer": {"type": "string"}},
+        "required": ["answer"],
+        "additionalProperties": false
+    });
+    for (label, response, expected_status) in [
+        ("schema-success", r#"{"answer":"tea"}"#, "completed"),
+        ("schema-malformed", "not JSON", "interrupted"),
+    ] {
+        let root = temp_root(label);
+        fs::write(
+            root.join("answer.schema.json"),
+            serde_json::to_vec(&schema).unwrap(),
+        )
+        .unwrap();
+        let provider = provider([ScriptedModelResponse::text([response])]);
+        let bytes = Arc::new(Mutex::new(Vec::new()));
+        let result = Box::pin(tea_cli::modes::json::run(
+            &schema_args(&root),
+            &bootstrap(&root, Arc::clone(&provider)),
+            &mut io::empty(),
+            true,
+            Box::new(SharedOutput(Arc::clone(&bytes))),
+        ))
+        .await;
+        if expected_status == "completed" {
+            result.unwrap();
+        } else {
+            assert_eq!(result.unwrap_err().category(), ExitCategory::Provider);
+        }
+        let output = bytes.lock().unwrap().clone();
+        let lines = output_lines(&output);
+        assert!(lines.iter().any(|line| {
+            line["type"] == "run_finished" && line["payload"]["status"] == expected_status
+        }));
+        let requests = provider.captured_requests().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert!(!requests[0].tools().is_empty());
+        assert_eq!(
+            requests[0].final_output_format(),
+            Some(&FinalOutputFormat::JsonSchema {
+                schema: schema.clone()
+            })
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
 }
 
 #[tokio::test(flavor = "current_thread")]

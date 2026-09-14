@@ -8,8 +8,8 @@ use tea_policy::{
 };
 use tea_profile::{AgentProfile, ProfileRuleId, ProfileTrustLevel, ProfileWorkspaceInstruction};
 use tea_protocol::{
-    AgentCommand, AgentEvent, CanonicalMessage, CommandEnvelope, CommandId, ContentBlock,
-    EventDelta, ModelRef, ProfileId, ProtocolMetadata, SessionId,
+    AgentCommand, CanonicalMessage, CommandEnvelope, CommandId, ContentBlock, FinalOutputFormat,
+    ModelRef, ProfileId, ProtocolMetadata, SessionId,
 };
 use tea_tools::{ToolExecutor, ToolResourceResolver, ToolSpec};
 use uuid::Uuid;
@@ -215,7 +215,11 @@ impl AgentSession {
     ///
     /// Returns an error when input validation, runtime execution, event
     /// delivery, approval, or terminal run-state validation fails.
-    pub async fn prompt(&self, text: impl Into<String>) -> Result<AgentResponse, RuntimeError> {
+    pub async fn prompt(
+        &self,
+        text: impl Into<String>,
+        final_output_format: Option<FinalOutputFormat>,
+    ) -> Result<AgentResponse, RuntimeError> {
         let mut events = self.runtime.subscribe(self.session_id)?;
         let timestamp = self.runtime.clock().now().map_err(RuntimeError::from)?;
         let message = CanonicalMessage::user(
@@ -234,16 +238,18 @@ impl AgentSession {
             new_command_id()?,
             Some(self.session_id),
             timestamp,
-            AgentCommand::Prompt { message },
+            AgentCommand::Prompt {
+                message,
+                final_output_format,
+            },
         )
         .map_err(|error| invalid_request(error.to_string()))?;
 
-        let mut response = AgentResponse::default();
         let mut send = Box::pin(self.runtime.send(command));
         let outcome = loop {
             tokio::select! {
                 event = events.recv() => match event {
-                    Some(event) => response.observe(event.event()),
+                    Some(_) => {}
                     None => return Err(RuntimeError::new(
                         RuntimeErrorCode::InvalidState,
                         "runtime event subscription closed before prompt completion",
@@ -252,15 +258,14 @@ impl AgentSession {
                 result = &mut send => break result?,
             }
         };
-        while let Ok(event) = events.try_recv() {
-            response.observe(event.event());
-        }
+        while events.try_recv().is_ok() {}
         match outcome {
             RuntimeCommandOutcome::RunCompleted {
                 state: tea_kernel::RunState::Completed,
+                session,
                 pending_approval_id: None,
                 ..
-            } => Ok(response),
+            } => AgentResponse::from_messages(session.messages()),
             RuntimeCommandOutcome::RunCompleted {
                 pending_approval_id: Some(_),
                 ..
@@ -276,27 +281,39 @@ impl AgentSession {
     }
 }
 
-/// Aggregated visible assistant output from one completed prompt.
+/// Visible output from the final durable assistant message of one completed prompt.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct AgentResponse {
     text: String,
 }
 
 impl AgentResponse {
-    /// Returns the visible assistant text in provider stream order.
+    /// Returns the visible text blocks in durable final-message order.
     #[must_use]
     pub fn text(&self) -> &str {
         &self.text
     }
 
-    fn observe(&mut self, event: &AgentEvent) {
-        if let AgentEvent::MessageDelta {
-            delta: EventDelta::TextDelta { text },
-            ..
-        } = event
-        {
-            self.text.push_str(text);
-        }
+    fn from_messages(messages: &[CanonicalMessage]) -> Result<Self, RuntimeError> {
+        let Some(CanonicalMessage::Assistant { content, .. }) = messages.last() else {
+            return Err(RuntimeError::new(
+                RuntimeErrorCode::InvalidState,
+                "completed prompt has no final assistant message",
+            ));
+        };
+        let text = content
+            .iter()
+            .filter_map(|block| match block {
+                ContentBlock::Text { text } => Some(text.as_str()),
+                ContentBlock::ContextualText { .. }
+                | ContentBlock::Thinking { .. }
+                | ContentBlock::Image { .. }
+                | ContentBlock::ToolCall { .. }
+                | ContentBlock::HostedTool { .. }
+                | ContentBlock::Citation { .. } => None,
+            })
+            .collect();
+        Ok(Self { text })
     }
 }
 

@@ -15,7 +15,7 @@ use tea_model::{
     ModelCapabilities, ModelCompletion, ModelDisplayName, ModelEvent, ModelResponseInfo, ModelSpec,
     ModelStreamIndex, ProviderId, ProviderToolCallId, ToolCallCompleted, ToolCallStarted,
 };
-use tea_protocol::{ModelId, SessionId, StopReason, TokenCount};
+use tea_protocol::{FinalOutputFormat, ModelId, SessionId, StopReason, TokenCount};
 use tea_testkit::{ScriptStep, ScriptedModelProvider, ScriptedModelResponse};
 use tokio::io::{AsyncBufReadExt as _, BufReader, DuplexStream};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
@@ -114,6 +114,42 @@ fn versioned_fixture_is_strict_and_request_ids_round_trip() {
 }
 
 #[test]
+fn rpc_prompt_accepts_the_shared_final_output_format_shape() {
+    let request: RpcRequest = serde_json::from_value(serde_json::json!({
+        "rpcVersion": "1.0",
+        "id": "structured-1",
+        "type": "prompt",
+        "payload": {
+            "text": "Return the answer",
+            "finalOutputFormat": {"type": "json_object"}
+        }
+    }))
+    .expect("structured RPC prompt");
+
+    let (_, request) = request.into_parts().unwrap();
+    assert!(matches!(
+        request,
+        tea_cli::rpc::RpcRequestKind::Prompt {
+            final_output_format: Some(tea_protocol::FinalOutputFormat::JsonObject),
+            ..
+        }
+    ));
+
+    assert!(
+        serde_json::from_value::<RpcRequest>(serde_json::json!({
+            "rpcVersion": "1.0",
+            "id": "structured-typo",
+            "type": "prompt",
+            "payload": {
+                "text": "Return the answer",
+                "finalOutputForma": {"type": "json_object"}
+            }
+        }))
+        .is_err()
+    );
+}
+
+#[test]
 fn mcp_identity_errors_require_a_rebuild_without_adapter_diagnostics() {
     let error: RpcError = tea_mcp::McpError::new(tea_mcp::McpErrorCode::Identity).into();
     assert_eq!(error.code(), RpcErrorCode::InvalidRequest);
@@ -165,7 +201,10 @@ fn model() -> ModelSpec {
         ModelDisplayName::from_str("Fake Model").unwrap(),
         TokenCount::new(32_000).unwrap(),
         TokenCount::new(4_000).unwrap(),
-        ModelCapabilities::text().with_tools(true),
+        ModelCapabilities::text()
+            .with_tools(true)
+            .with_final_json_object()
+            .with_final_json_schema_with_tools(),
     )
     .unwrap()
 }
@@ -236,6 +275,41 @@ async fn receive_response(
     }
 }
 
+async fn send_schema_prompt(
+    input: &mut DuplexStream,
+    output: &mut BufReader<DuplexStream>,
+    id: &str,
+    text: &str,
+    schema: &serde_json::Value,
+) -> Vec<serde_json::Value> {
+    send_json(
+        input,
+        serde_json::json!({
+            "rpcVersion": "1.0",
+            "id": id,
+            "type": "prompt",
+            "payload": {
+                "text": text,
+                "finalOutputFormat": {
+                    "type": "json_schema",
+                    "schema": schema
+                }
+            }
+        }),
+    )
+    .await;
+    let mut messages = Vec::new();
+    for _ in 0..32 {
+        let message = receive_json(output).await;
+        let finished = message["type"] == "command_finished";
+        messages.push(message);
+        if finished {
+            return messages;
+        }
+    }
+    panic!("RPC prompt did not finish within the bounded response window");
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn mcp_host_queries_are_correlated_and_do_not_require_a_session_record() {
     let root = temp_root("mcp-host-query");
@@ -284,6 +358,182 @@ async fn mcp_host_queries_are_correlated_and_do_not_require_a_session_record() {
     fs::remove_dir_all(root).unwrap();
 }
 
+#[tokio::test(flavor = "current_thread")]
+async fn rpc_preserves_schema_success_and_terminal_failure_classification() {
+    let root = temp_root("request-errors");
+    let schema = serde_json::json!({
+        "type": "object",
+        "properties": {"answer": {"type": "string"}},
+        "required": ["answer"],
+        "additionalProperties": false
+    });
+    let provider = Arc::new(ScriptedModelProvider::new(
+        ProviderId::from_str("fake").unwrap(),
+        vec![model()],
+        [
+            ScriptedModelResponse::text([r#"{"answer":"tea"}"#]),
+            ScriptedModelResponse::text(["not JSON"]),
+        ],
+    ));
+    let args = rpc_args(&root, None);
+    let bootstrap = bootstrap(&root, Arc::clone(&provider));
+    let (service, selection) = bootstrap.build(&args).unwrap();
+    let (mut client_input, server_input) = tokio::io::duplex(64 * 1024);
+    let (server_output, client_output) = tokio::io::duplex(64 * 1024);
+    let server = tea_cli::rpc::run_service(&service, selection, server_input, server_output);
+    let client = async {
+        let mut output = BufReader::new(client_output);
+        assert_eq!(receive_json(&mut output).await["type"], "ready");
+
+        client_input.write_all(b"{malformed}\n").await.unwrap();
+        let parse_error = receive_json(&mut output).await;
+        assert!(parse_error.get("id").is_none());
+        assert_eq!(
+            parse_error["payload"]["data"]["error"]["code"],
+            "parse_error"
+        );
+
+        send_json(
+            &mut client_input,
+            serde_json::json!({
+                "rpcVersion":"1.0",
+                "id":"typed-invalid",
+                "type":"prompt",
+                "payload":{"text":"hello","finalOutputForma":{"type":"json_object"}}
+            }),
+        )
+        .await;
+        let invalid_request = receive_json(&mut output).await;
+        assert_eq!(invalid_request["id"], "typed-invalid");
+        assert_eq!(
+            invalid_request["payload"]["data"]["error"]["code"],
+            "invalid_request"
+        );
+
+        let success = send_schema_prompt(
+            &mut client_input,
+            &mut output,
+            "schema-success",
+            "return valid JSON",
+            &schema,
+        )
+        .await;
+        assert!(success.iter().any(|message| {
+            message["id"] == "schema-success" && message["payload"]["type"] == "command_accepted"
+        }));
+        assert!(
+            success
+                .iter()
+                .find(|message| message["type"] == "command_finished")
+                .unwrap()
+                .get("error")
+                .is_none()
+        );
+
+        let malformed = send_schema_prompt(
+            &mut client_input,
+            &mut output,
+            "schema-malformed",
+            "return invalid JSON",
+            &schema,
+        )
+        .await;
+        assert!(malformed.iter().any(|message| {
+            message["id"] == "schema-malformed" && message["payload"]["type"] == "command_accepted"
+        }));
+        let failure = malformed
+            .iter()
+            .find(|message| message["type"] == "command_finished")
+            .unwrap();
+        assert_eq!(failure["error"]["code"], "malformed_response");
+        client_input.shutdown().await.unwrap();
+    };
+    let (server, ()) = tokio::join!(server, client);
+    assert!(server.is_ok());
+    service.shutdown().await;
+    let requests = provider.captured_requests().unwrap();
+    assert_eq!(requests.len(), 2);
+    for request in requests {
+        assert!(!request.tools().is_empty());
+        assert_eq!(
+            request.final_output_format(),
+            Some(&FinalOutputFormat::JsonSchema {
+                schema: schema.clone()
+            })
+        );
+    }
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn rpc_rejects_schema_tool_mismatch_without_command_acceptance() {
+    let root = temp_root("structured-preflight");
+    let provider = Arc::new(ScriptedModelProvider::new(
+        ProviderId::from_str("fake").unwrap(),
+        vec![
+            ModelSpec::new(
+                ModelId::from_str("fake/model").unwrap(),
+                ProviderId::from_str("fake").unwrap(),
+                ModelDisplayName::from_str("Fake Model").unwrap(),
+                TokenCount::new(32_000).unwrap(),
+                TokenCount::new(4_000).unwrap(),
+                ModelCapabilities::text()
+                    .with_tools(true)
+                    .with_final_json_schema(),
+            )
+            .unwrap(),
+        ],
+        [ScriptedModelResponse::text([r#"{"answer":"unused"}"#])],
+    ));
+    let args = rpc_args(&root, None);
+    let bootstrap = bootstrap(&root, Arc::clone(&provider));
+    let (service, selection) = bootstrap.build(&args).unwrap();
+    let (mut client_input, server_input) = tokio::io::duplex(64 * 1024);
+    let (server_output, client_output) = tokio::io::duplex(64 * 1024);
+    let server = tea_cli::rpc::run_service(&service, selection, server_input, server_output);
+    let client = async {
+        let mut output = BufReader::new(client_output);
+        assert_eq!(receive_json(&mut output).await["type"], "ready");
+        send_json(
+            &mut client_input,
+            serde_json::json!({
+                "rpcVersion": "1.0",
+                "id": "unsupported",
+                "type": "prompt",
+                "payload": {
+                    "text": "return JSON",
+                    "finalOutputFormat": {
+                        "type": "json_schema",
+                        "schema": {"type": "object"}
+                    }
+                }
+            }),
+        )
+        .await;
+
+        let rejected = receive_json(&mut output).await;
+        assert_eq!(rejected["id"], "unsupported");
+        assert_eq!(rejected["type"], "response");
+        assert_eq!(rejected["payload"]["type"], "error");
+        assert_eq!(
+            rejected["payload"]["data"]["error"]["code"],
+            "invalid_request"
+        );
+        assert!(
+            rejected["payload"]["data"]["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("JSON-Schema final output with tools")
+        );
+        client_input.shutdown().await.unwrap();
+    };
+    let (server, ()) = tokio::join!(server, client);
+    assert!(server.is_ok());
+    assert!(provider.captured_requests().unwrap().is_empty());
+    service.shutdown().await;
+    fs::remove_dir_all(root).unwrap();
+}
+
 async fn drain_output(output: &mut BufReader<DuplexStream>) {
     let mut trailing = String::new();
     while output.read_line(&mut trailing).await.unwrap() != 0 {
@@ -319,7 +569,11 @@ async fn client_steers_queries_disconnects_and_resumes_from_durable_cursor() {
         send_json(
             &mut client_input,
             serde_json::json!({
-                "rpcVersion":"1.0","id":"prompt","type":"prompt","payload":{"text":"work"}
+                "rpcVersion":"1.0","id":"prompt","type":"prompt",
+                "payload":{
+                    "text":"work",
+                    "finalOutputFormat":{"type":"json_object"}
+                }
             }),
         )
         .await;
@@ -379,6 +633,12 @@ async fn client_steers_queries_disconnects_and_resumes_from_durable_cursor() {
     let (server_result, (session_id, tail)) = tokio::join!(server, client);
     server_result.unwrap();
     service.shutdown().await;
+    let requests = provider.captured_requests().unwrap();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(
+        requests[0].final_output_format(),
+        Some(&FinalOutputFormat::JsonObject)
+    );
 
     let reconnect_args = rpc_args(&root, Some(session_id));
     let reconnect_bootstrap = bootstrap(&root, provider);

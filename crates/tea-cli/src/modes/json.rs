@@ -40,8 +40,16 @@ pub async fn run(
         return Err(CliFailure::usage("JSON event mode requires --json"));
     }
     let prompt = super::print::initial_prompt(args, input, stdin_is_terminal, bootstrap)?;
+    let final_output_format = bootstrap.final_output_format(args)?;
     let (service, selection) = bootstrap.build_async(args).await?;
-    let result = Box::pin(run_service(&service, selection, &prompt, output)).await;
+    let result = Box::pin(run_service(
+        &service,
+        selection,
+        &prompt,
+        final_output_format,
+        output,
+    ))
+    .await;
     service.shutdown().await;
     result
 }
@@ -50,6 +58,7 @@ async fn run_service(
     service: &CodingAgentService,
     selection: SessionSelection,
     prompt: &str,
+    final_output_format: Option<tea_protocol::FinalOutputFormat>,
     output: Box<dyn Write + Send>,
 ) -> Result<(), CliFailure> {
     let session_id = super::print::select_session(service, selection).await?;
@@ -66,7 +75,8 @@ async fn run_service(
         .await
         .map_err(writer_failure)?;
     service
-        .prompt(session_id, prompt)
+        .prompt(session_id, prompt, final_output_format)
+        .await
         .map_err(CliFailure::from)?;
 
     let mut wait = Box::pin(service.wait(session_id));

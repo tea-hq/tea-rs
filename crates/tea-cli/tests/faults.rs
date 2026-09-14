@@ -149,29 +149,31 @@ async fn print_broken_stdout_fails_and_shuts_down_within_deadline() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn json_provider_failure_is_redacted_and_shuts_down_within_deadline() {
-    let root = temp_root("json");
-    let bytes = Arc::new(Mutex::new(Vec::new()));
-    let result = tokio::time::timeout(
-        Duration::from_secs(1),
-        Box::pin(tea_cli::modes::json::run(
-            &args(&root, "--json"),
-            &bootstrap(
-                &root,
-                ScriptedModelResponse::failure(ModelFailureCode::Authentication, SECRET),
-            ),
-            &mut io::empty(),
-            true,
-            Box::new(SharedOutput(Arc::clone(&bytes))),
-        )),
-    )
-    .await
-    .expect("JSON mode shutdown deadline")
-    .unwrap_err();
-    assert_eq!(result.category(), ExitCategory::Provider);
-    assert!(!format!("{result:?}").contains(SECRET));
-    assert!(!String::from_utf8_lossy(&bytes.lock().unwrap()).contains(SECRET));
-    fs::remove_dir_all(root).unwrap();
+async fn json_provider_failures_are_classified_and_redacted() {
+    for code in [
+        ModelFailureCode::Authentication,
+        ModelFailureCode::MalformedResponse,
+    ] {
+        let root = temp_root(&format!("json-{code:?}"));
+        let bytes = Arc::new(Mutex::new(Vec::new()));
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            Box::pin(tea_cli::modes::json::run(
+                &args(&root, "--json"),
+                &bootstrap(&root, ScriptedModelResponse::failure(code, SECRET)),
+                &mut io::empty(),
+                true,
+                Box::new(SharedOutput(Arc::clone(&bytes))),
+            )),
+        )
+        .await
+        .expect("JSON mode shutdown deadline")
+        .unwrap_err();
+        assert_eq!(result.category(), ExitCategory::Provider);
+        assert!(!format!("{result:?}").contains(SECRET));
+        assert!(!String::from_utf8_lossy(&bytes.lock().unwrap()).contains(SECRET));
+        fs::remove_dir_all(root).unwrap();
+    }
 }
 
 async fn rpc_input_failure(root: &Path, input: Vec<u8>) -> tea_cli::CliFailure {

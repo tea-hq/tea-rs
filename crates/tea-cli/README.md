@@ -48,6 +48,22 @@ Prompt arguments, workspace-confined `@file` content, and piped UTF-8 stdin are 
 
 Shared options cover cwd, provider/model/profile, an invocation-local redacted `--api-key`, tools, explicit context files, new/continue/explicit/in-memory sessions, application state paths, project trust, and verbosity. Non-interactive default trust fails closed only when project-local resources exist and no saved decision applies; `--trust once`, `persist`, `reject`, and `ignore` are explicit alternatives. Project settings and declarative resources remain workspace-confined even when trusted.
 
+The headless prompt modes accept two mutually exclusive structured-output flags:
+
+```bash
+tea --print --output-format json-object "return the result"
+tea --json --output-schema result.schema.json "return the result"
+```
+
+`--output-format json-object` requires a JSON object without imposing a field schema. `--output-schema FILE` loads a workspace-confined UTF-8 JSON file and requires a self-contained Draft 2020-12 JSON Schema. The schema root must be an object, encoded size is limited to 256 KiB, nesting depth is limited to 32, and only local `#...` references are accepted; absolute, escaping, missing, malformed, externally referenced, or otherwise invalid schema files fail before a service or session is created. Providers must explicitly advertise the requested capability, with no prompt-only fallback.
+
+The coding profile activates model-visible tools by default. A JSON Schema run
+with any active function or hosted tool therefore also requires the selected
+model/endpoint to advertise the independent `final_json_schema_with_tools`
+capability. Schema-only support and tool support do not imply that combination.
+
+Structured output changes the final assistant text contract, not the CLI output type. Print mode still writes the validated JSON text followed by one LF. JSON event mode still emits canonical text-delta and lifecycle events; clients parse the completed assistant text as JSON when they need a value. A provider refusal remains a refusal, and a successful provider response that is not a JSON object or does not match the supplied schema fails the run rather than being returned as success.
+
 Stable non-zero process categories are: usage `2`, trust/config `3`, provider `4`, policy/approval `5`, cancellation `6`, and internal/persistence `70`. `SIGINT` cooperatively cancels the owned run and leaves stdout empty.
 
 ## Skill resources
@@ -97,11 +113,26 @@ tea --rpc --continue --model gpt-5.4 --trust once
 RPC stdin and stdout contain compact JSON values separated by byte `LF`; a `CR` immediately before `LF` is accepted. Unicode line and paragraph separators inside JSON strings are ordinary content. The first output is a versioned `ready` frame with `sessionId` and path-independent `workspaceId`. Every request includes `rpcVersion: "1.0"`, an optional bounded string `id`, a `type`, and a typed `payload`:
 
 ```json
-{"rpcVersion":"1.0","id":"p1","type":"prompt","payload":{"text":"inspect the changes"}}
+{"rpcVersion":"1.0","id":"p1","type":"prompt","payload":{"text":"inspect the changes","finalOutputFormat":{"type":"json_object"}}}
+{"rpcVersion":"1.0","id":"p2","type":"prompt","payload":{"text":"summarize","finalOutputFormat":{"type":"json_schema","schema":{"type":"object","properties":{"summary":{"type":"string"}},"required":["summary"],"additionalProperties":false}}}}
 {"rpcVersion":"1.0","id":"s1","type":"query_snapshot","payload":{"afterSequence":"12","limit":32}}
 ```
 
-Prompt and approval requests receive a correlated `command_accepted` response and later an asynchronous `command_finished` frame. Runtime observations are emitted as `event` frames whose payload is an unchanged canonical `EventEnvelope`. Host queries cover state, paginated durable snapshots, statistics, branch tree, sessions, and models; mutations cover new/open/name, prompt, steer, follow-up, abort, approval, model, compact, and fork. Session rebinds and subscription replacement require a snapshot query rather than inferring durable state from deltas.
+Prompt requests may carry the same optional `finalOutputFormat` union shown above. Prompt and approval requests receive a correlated `command_accepted` response and later an asynchronous `command_finished` frame. A structured-output contract violation is reported there with error code `malformed_response`. Runtime observations are emitted as `event` frames whose payload is an unchanged canonical `EventEnvelope`; structured success is therefore still observable as assistant JSON text, not a separately typed RPC result. Host queries cover state, paginated durable snapshots, statistics, branch tree, sessions, and models; mutations cover new/open/name, prompt, steer, follow-up, abort, approval, model, compact, and fork. Session rebinds and subscription replacement require a snapshot query rather than inferring durable state from deltas.
+
+The app-server uses the same per-prompt union in JSON-RPC params:
+
+```json
+{"jsonrpc":"2.0","id":"p1","method":"session/prompt","params":{"sessionId":"0195a0b1-5e3a-7d72-a902-c4e85d828bf1","text":"summarize","finalOutputFormat":{"type":"json_object"}}}
+```
+
+App-server prompt acceptance keeps its existing wire shape. A structured success arrives as JSON text in the ordinary assistant message events. Failed `event/turn_completed` notifications include the stable `errorCode`; structured-output contract violations use `malformed_response`, and successful notifications omit the field.
+
+The ignored live app-server smoke uses the provider and model configured in `~/.tea` rather than `.env` provider variables. Run its structured-output path with:
+
+```bash
+TEA_APP_SERVER_STRUCTURED_LIVE_SMOKE=1 cargo test -p tea-cli --test app_server_live_smoke -- --ignored --nocapture
+```
 
 Input and output frames are capped at 1 MiB. Snapshot pages contain at most 64 canonical records. The output writer has 32 slots and a 500 ms enqueue/write/flush deadline. A complete malformed frame receives one `parse_error` response and the next LF frame is still processed. Oversized or unterminated input, I/O failure, EOF, signal, disconnect, or a slow writer ends the connection; the owning mode then cancels and awaits service work. RPC stdout never contains diagnostics, ANSI escapes, or banners.
 

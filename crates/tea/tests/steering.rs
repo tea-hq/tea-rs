@@ -122,6 +122,7 @@ async fn steer_coalesces_into_next_turn() {
         .send(envelope(
             AgentCommand::Prompt {
                 message: user_message("summarize"),
+                final_output_format: None,
             },
             Some(session_id),
         ))

@@ -21,13 +21,20 @@ use tea_testkit::{ScriptedModelProvider, ScriptedModelResponse};
 fn provider(
     scripts: impl IntoIterator<Item = ScriptedModelResponse>,
 ) -> Arc<ScriptedModelProvider> {
+    provider_with_capabilities(scripts, ModelCapabilities::text().with_tools(true))
+}
+
+fn provider_with_capabilities(
+    scripts: impl IntoIterator<Item = ScriptedModelResponse>,
+    capabilities: ModelCapabilities,
+) -> Arc<ScriptedModelProvider> {
     let model = ModelSpec::new(
         ModelId::from_str("fake/model").unwrap(),
         ProviderId::from_str("fake").unwrap(),
         ModelDisplayName::from_str("Fake Model").unwrap(),
         TokenCount::new(32_000).unwrap(),
         TokenCount::new(4_000).unwrap(),
-        ModelCapabilities::text().with_tools(true),
+        capabilities,
     )
     .unwrap();
     Arc::new(ScriptedModelProvider::new(
@@ -153,23 +160,40 @@ fn pending_request(snapshot: &tea_session::SessionSnapshot) -> &tea_policy::Appr
 }
 
 #[tokio::test(flavor = "current_thread")]
+#[allow(clippy::too_many_lines)]
 async fn pending_request_survives_restart_and_resolves_exactly_once() {
     let fixture = Fixture::new("restart");
-    let provider = provider([
-        tool_response(
-            "edit-1",
-            "edit",
-            serde_json::json!({
-                "path":"file.txt",
-                "oldText":"old",
-                "newText":"new"
-            }),
-        ),
-        ScriptedModelResponse::text(["done"]),
-    ]);
+    let format = tea_protocol::FinalOutputFormat::JsonSchema {
+        schema: serde_json::json!({
+            "type": "object",
+            "properties": {"status": {"type": "string"}},
+            "required": ["status"],
+            "additionalProperties": false
+        }),
+    };
+    let provider = provider_with_capabilities(
+        [
+            tool_response(
+                "edit-1",
+                "edit",
+                serde_json::json!({
+                    "path":"file.txt",
+                    "oldText":"old",
+                    "newText":"new"
+                }),
+            ),
+            ScriptedModelResponse::text([r#"{"status":"done"}"#]),
+        ],
+        ModelCapabilities::text()
+            .with_tools(true)
+            .with_final_json_schema_with_tools(),
+    );
     let service = fixture.service(Arc::clone(&provider));
     let session_id = service.create_session().await.unwrap();
-    service.prompt(session_id, "edit the file").unwrap();
+    service
+        .prompt(session_id, "edit the file", Some(format.clone()))
+        .await
+        .unwrap();
     let approval_id = match service.wait(session_id).await.unwrap() {
         tea::RuntimeCommandOutcome::RunCompleted {
             pending_approval_id: Some(approval_id),
@@ -188,6 +212,17 @@ async fn pending_request_survives_restart_and_resolves_exactly_once() {
     rebuilt.open_session(session_id).await.unwrap();
     let reopened = rebuilt.session_snapshot(session_id).await.unwrap();
     assert_eq!(pending_request(&reopened), &request);
+    let reopened_format = reopened
+        .approval_artifacts()
+        .iter()
+        .find_map(|entry| match entry {
+            ApprovalArtifactEntry::Requested {
+                final_output_format,
+                ..
+            } => final_output_format.as_ref(),
+            ApprovalArtifactEntry::Resolved { .. } => None,
+        });
+    assert_eq!(reopened_format, Some(&format));
 
     rebuilt
         .approve(session_id, approval_id, ApprovalDecision::AllowSession)
@@ -251,6 +286,13 @@ async fn pending_request_survives_restart_and_resolves_exactly_once() {
         "new\n"
     );
     assert_eq!(provider.remaining_scripts().unwrap(), 0);
+    let requests = provider.captured_requests().unwrap();
+    assert_eq!(requests.len(), 2);
+    assert!(
+        requests
+            .iter()
+            .all(|request| request.final_output_format() == Some(&format))
+    );
     rebuilt.shutdown().await;
 }
 
@@ -271,7 +313,10 @@ async fn denial_is_terminal_and_never_starts_the_tool() {
     ]);
     let service = fixture.service(provider);
     let session_id = service.create_session().await.unwrap();
-    service.prompt(session_id, "edit the file").unwrap();
+    service
+        .prompt(session_id, "edit the file", None)
+        .await
+        .unwrap();
     let approval_id = match service.wait(session_id).await.unwrap() {
         tea::RuntimeCommandOutcome::RunCompleted {
             pending_approval_id: Some(approval_id),
@@ -316,7 +361,10 @@ async fn missing_and_expired_artifacts_fail_before_execution() {
     ]);
     let service = fixture.service(Arc::clone(&provider));
     let session_id = service.create_session().await.unwrap();
-    service.prompt(session_id, "edit the file").unwrap();
+    service
+        .prompt(session_id, "edit the file", None)
+        .await
+        .unwrap();
     let approval_id = match service.wait(session_id).await.unwrap() {
         tea::RuntimeCommandOutcome::RunCompleted {
             pending_approval_id: Some(approval_id),
@@ -401,7 +449,10 @@ async fn cancellation_after_execution_start_is_durable_and_never_replayed() {
     ]);
     let service = fixture.service(Arc::clone(&provider));
     let session_id = service.create_session().await.unwrap();
-    service.prompt(session_id, "run the command").unwrap();
+    service
+        .prompt(session_id, "run the command", None)
+        .await
+        .unwrap();
     let approval_id = match service.wait(session_id).await.unwrap() {
         tea::RuntimeCommandOutcome::RunCompleted {
             pending_approval_id: Some(approval_id),

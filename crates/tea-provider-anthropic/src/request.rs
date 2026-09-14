@@ -4,8 +4,11 @@ use std::collections::BTreeMap;
 use std::fmt;
 
 use serde_json::{Map, Value, json};
-use tea_model::{HostedToolDefinition, ModelRequest, ModelToolDefinition};
-use tea_protocol::{CanonicalMessage, ContentBlock, ImageSource, ProviderContinuation, ToolCallId};
+use tea_model::{HostedToolDefinition, HostedToolKind, ModelRequest, ModelToolDefinition};
+use tea_protocol::{
+    CanonicalMessage, ContentBlock, FinalOutputFormat, ImageSource, ProviderContinuation,
+    ToolCallId,
+};
 
 use crate::WEB_SEARCH_CONTINUATION_FORMAT;
 use crate::credential::AnthropicConfig;
@@ -61,6 +64,57 @@ pub fn build_messages_body(
     if let Some(system) = request.system_prompt() {
         body.insert("system".to_owned(), json!(system));
     }
+    if let Some(format) = request.final_output_format() {
+        format
+            .validate()
+            .map_err(|_| invalid("Anthropic final-output JSON Schema is invalid"))?;
+    }
+    match request.final_output_format() {
+        Some(FinalOutputFormat::JsonObject) => {
+            return Err(invalid(
+                "Anthropic Messages does not support schema-less final JSON output",
+            ));
+        }
+        Some(FinalOutputFormat::JsonSchema { .. }) if !config.supports_final_json_schema() => {
+            return Err(invalid(
+                "Anthropic final JSON Schema output is not enabled for this model and endpoint",
+            ));
+        }
+        Some(FinalOutputFormat::JsonSchema { schema }) => {
+            if request
+                .tools()
+                .iter()
+                .any(|tool| tool.hosted_kind() == Some(HostedToolKind::WebSearch))
+            {
+                return Err(invalid(
+                    "Anthropic final JSON Schema output does not support web search citations",
+                ));
+            }
+            if request.messages().iter().any(message_contains_citation) {
+                return Err(invalid(
+                    "Anthropic final JSON Schema output does not support citation content",
+                ));
+            }
+            if matches!(
+                request.messages().last(),
+                Some(CanonicalMessage::Assistant { .. })
+            ) {
+                return Err(invalid(
+                    "Anthropic final JSON Schema output does not support assistant prefilling",
+                ));
+            }
+            body.insert(
+                "output_config".to_owned(),
+                json!({
+                    "format": {
+                        "type": "json_schema",
+                        "schema": schema,
+                    }
+                }),
+            );
+        }
+        None => {}
+    }
     let provider_call_ids = provider_tool_call_ids(request.messages());
     let messages = map_messages(request.messages(), &provider_call_ids)?;
     body.insert("messages".to_owned(), Value::Array(messages));
@@ -73,6 +127,17 @@ pub fn build_messages_body(
         body.insert("tools".to_owned(), Value::Array(tools));
     }
     Ok(Value::Object(body))
+}
+
+fn message_contains_citation(message: &CanonicalMessage) -> bool {
+    let content = match message {
+        CanonicalMessage::User { content, .. }
+        | CanonicalMessage::Assistant { content, .. }
+        | CanonicalMessage::ToolResult { content, .. } => content,
+    };
+    content
+        .iter()
+        .any(|block| matches!(block, ContentBlock::Citation { .. }))
 }
 
 /// Returns the Anthropic Messages endpoint for a configuration.

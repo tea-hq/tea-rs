@@ -5,15 +5,15 @@ use std::str::FromStr;
 
 use serde_json::{Value, json};
 use tea_model::{
-    HostedToolOptions, ModelRequest, ModelToolDefinition, ReasoningEffort, ReasoningOptions,
-    WebSearchLocation, WebSearchOptions,
+    HostedToolOptions, MAX_SYSTEM_PROMPT_BYTES, ModelRequest, ModelToolDefinition, ReasoningEffort,
+    ReasoningOptions, WebSearchLocation, WebSearchOptions,
 };
 use tea_protocol::{
     CanonicalMessage, ContentBlock, ExternalSource, MessageId, ModelId, ProtocolMetadata,
-    ProtocolTimestamp, SourceCitation, ToolCallId,
+    ProtocolTimestamp, ProviderId, SourceCitation, ToolCallId,
 };
 use tea_provider_openai::{
-    OpenAiReasoningEffortMap,
+    OpenAiCompatibilityProfile, OpenAiErrorCode, OpenAiReasoningEffortMap,
     credential::{CredentialResolver, MapCredentialResolver, OpenAiApiMode, OpenAiConfig},
     request::{
         build_chat_completions_body, build_chat_completions_body_with_reasoning_map,
@@ -30,6 +30,7 @@ fn config() -> OpenAiConfig {
         ("TEA_OPENAI_BASE_URL", "https://api.example.test/v1"),
         ("TEA_OPENAI_API_KEY", "sk-test-key"),
         ("TEA_OPENAI_MODEL", "gpt-4o-mini"),
+        ("TEA_OPENAI_COMPATIBILITY_PROFILE", "open-ai"),
     ]);
     MapCredentialResolver::new(map).resolve().unwrap()
 }
@@ -39,6 +40,7 @@ fn responses_config() -> OpenAiConfig {
         ("TEA_OPENAI_API_KEY", "sk-test-key"),
         ("TEA_OPENAI_MODEL", "gpt-4o-mini"),
         ("TEA_OPENAI_API_MODE", "responses"),
+        ("TEA_OPENAI_COMPATIBILITY_PROFILE", "open-ai"),
     ]);
     MapCredentialResolver::new(map).resolve().unwrap()
 }
@@ -143,6 +145,35 @@ fn base_request() -> ModelRequest {
     .unwrap()
 }
 
+fn structured_output_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {"answer": {"type": "string"}},
+        "required": ["answer"],
+        "additionalProperties": false
+    })
+}
+
+fn profiled_config(api_mode: OpenAiApiMode, profile: OpenAiCompatibilityProfile) -> OpenAiConfig {
+    config()
+        .with_api_mode(api_mode)
+        .with_compatibility_profile(profile)
+}
+
+fn unprofiled_custom_config(api_mode: OpenAiApiMode) -> OpenAiConfig {
+    MapCredentialResolver::for_provider(
+        ProviderId::from_str("custom-openai-compatible").unwrap(),
+        env_map(&[
+            ("TEA_OPENAI_BASE_URL", "https://custom.example.test/v1"),
+            ("TEA_OPENAI_API_KEY", "sk-test-key"),
+            ("TEA_OPENAI_MODEL", "custom-model"),
+        ]),
+    )
+    .resolve()
+    .unwrap()
+    .with_api_mode(api_mode)
+}
+
 fn web_search(options: WebSearchOptions) -> ModelToolDefinition {
     ModelToolDefinition::hosted(
         "Searches the public web.",
@@ -162,6 +193,7 @@ fn maps_messages_roles_and_model() {
     assert_eq!(body["model"], "gpt-4o-mini");
     assert_eq!(body["stream"], true);
     assert_eq!(body["stream_options"]["include_usage"], true);
+    assert!(body.get("n").is_none());
     let messages = body["messages"].as_array().unwrap();
     assert_eq!(messages.len(), 3);
     assert_eq!(messages[0]["role"], "user");
@@ -169,6 +201,496 @@ fn maps_messages_roles_and_model() {
     assert_eq!(messages[1]["role"], "assistant");
     assert_eq!(messages[1]["content"], "hi");
     assert_eq!(messages[2]["role"], "user");
+    assert!(body.get("response_format").is_none());
+    assert!(body.get("provider").is_none());
+}
+
+#[test]
+fn structured_output_maps_chat_json_object_exactly() {
+    let request =
+        base_request().with_final_output_format(tea_protocol::FinalOutputFormat::JsonObject);
+    for profile in [
+        OpenAiCompatibilityProfile::OpenAi,
+        OpenAiCompatibilityProfile::AzureOpenAi,
+        OpenAiCompatibilityProfile::Xai,
+        OpenAiCompatibilityProfile::DeepSeek,
+        OpenAiCompatibilityProfile::Vllm,
+        OpenAiCompatibilityProfile::GeminiOpenAi,
+        OpenAiCompatibilityProfile::OllamaLocal,
+        OpenAiCompatibilityProfile::OpenRouter,
+        OpenAiCompatibilityProfile::Groq,
+        OpenAiCompatibilityProfile::Mistral,
+        OpenAiCompatibilityProfile::Together,
+        OpenAiCompatibilityProfile::Vllm,
+    ] {
+        let body = build_chat_completions_body(
+            &request,
+            &profiled_config(OpenAiApiMode::ChatCompletions, profile),
+        )
+        .unwrap();
+
+        assert_eq!(
+            body["response_format"],
+            json!({"type": "json_object"}),
+            "unexpected JSON object wire shape for {profile:?}"
+        );
+        assert_eq!(
+            body["messages"][0],
+            json!({
+                "role": "system",
+                "content": "Return the final response as a JSON object. Do not use Markdown."
+            }),
+            "JSON-object prompt fallback missing for {profile:?}"
+        );
+        if profile == OpenAiCompatibilityProfile::OpenRouter {
+            assert_eq!(body["provider"], json!({"require_parameters": true}));
+        } else {
+            assert!(body.get("provider").is_none());
+        }
+    }
+}
+
+#[test]
+fn structured_output_maps_chat_json_schema_exactly() {
+    let schema = structured_output_schema();
+    let request =
+        base_request().with_final_output_format(tea_protocol::FinalOutputFormat::JsonSchema {
+            schema: schema.clone(),
+        });
+    let expected = json!({
+        "type": "json_schema",
+        "json_schema": {
+            "name": "tea_output",
+            "strict": true,
+            "schema": schema
+        }
+    });
+    for profile in [
+        OpenAiCompatibilityProfile::OpenAi,
+        OpenAiCompatibilityProfile::AzureOpenAi,
+        OpenAiCompatibilityProfile::Xai,
+        OpenAiCompatibilityProfile::GeminiOpenAi,
+        OpenAiCompatibilityProfile::OllamaLocal,
+        OpenAiCompatibilityProfile::OpenRouter,
+        OpenAiCompatibilityProfile::Groq,
+        OpenAiCompatibilityProfile::Mistral,
+        OpenAiCompatibilityProfile::Together,
+        OpenAiCompatibilityProfile::Vllm,
+    ] {
+        let body = build_chat_completions_body(
+            &request,
+            &profiled_config(OpenAiApiMode::ChatCompletions, profile),
+        )
+        .unwrap();
+
+        assert_eq!(
+            body["response_format"], expected,
+            "unexpected JSON Schema wire shape for {profile:?}"
+        );
+        let streams = profile != OpenAiCompatibilityProfile::Groq;
+        assert_eq!(body["stream"], streams);
+        assert_eq!(body.get("stream_options").is_some(), streams);
+        if profile == OpenAiCompatibilityProfile::Together {
+            assert_eq!(body["messages"][0]["role"], "system");
+            let instruction = body["messages"][0]["content"].as_str().unwrap();
+            assert!(instruction.starts_with(
+                "Return the final response as JSON only. Do not use Markdown.\nJSON Schema:\n"
+            ));
+            assert!(instruction.ends_with(&serde_json::to_string(&schema).unwrap()));
+        } else {
+            assert_eq!(body["messages"][0]["role"], "user");
+        }
+        if profile == OpenAiCompatibilityProfile::OpenRouter {
+            assert_eq!(body["provider"], json!({"require_parameters": true}));
+        } else {
+            assert!(body.get("provider").is_none());
+        }
+    }
+}
+
+#[test]
+fn structured_output_openrouter_requires_parameter_support() {
+    for format in [
+        tea_protocol::FinalOutputFormat::JsonObject,
+        tea_protocol::FinalOutputFormat::JsonSchema {
+            schema: structured_output_schema(),
+        },
+    ] {
+        let request = base_request().with_final_output_format(format);
+        let body = build_chat_completions_body(
+            &request,
+            &profiled_config(
+                OpenAiApiMode::ChatCompletions,
+                OpenAiCompatibilityProfile::OpenRouter,
+            ),
+        )
+        .unwrap();
+
+        assert_eq!(body["provider"], json!({"require_parameters": true}));
+    }
+}
+
+#[test]
+fn structured_output_maps_responses_dialects_exactly() {
+    for profile in [
+        OpenAiCompatibilityProfile::OpenAi,
+        OpenAiCompatibilityProfile::AzureOpenAi,
+        OpenAiCompatibilityProfile::Xai,
+        OpenAiCompatibilityProfile::DeepSeek,
+    ] {
+        let object_request =
+            base_request().with_final_output_format(tea_protocol::FinalOutputFormat::JsonObject);
+        let config = profiled_config(OpenAiApiMode::Responses, profile);
+        let object_body = build_responses_body(&object_request, &config).unwrap();
+        assert_eq!(
+            object_body["text"]["format"],
+            json!({"type": "json_object"}),
+            "unexpected JSON object wire shape for {profile:?}"
+        );
+        assert_eq!(
+            object_body["instructions"],
+            "Return the final response as a JSON object. Do not use Markdown.",
+            "JSON-object prompt fallback missing for {profile:?}"
+        );
+
+        let schema = structured_output_schema();
+        let schema_request =
+            base_request().with_final_output_format(tea_protocol::FinalOutputFormat::JsonSchema {
+                schema: schema.clone(),
+            });
+        let schema_body = build_responses_body(&schema_request, &config).unwrap();
+        let expected = if profile == OpenAiCompatibilityProfile::DeepSeek {
+            json!({
+                "type": "json_schema",
+                "name": "tea_output",
+                "schema": schema
+            })
+        } else {
+            json!({
+                "type": "json_schema",
+                "name": "tea_output",
+                "strict": true,
+                "schema": schema
+            })
+        };
+        assert_eq!(
+            schema_body["text"]["format"], expected,
+            "unexpected JSON Schema wire shape for {profile:?}"
+        );
+        assert!(schema_body.get("instructions").is_none());
+    }
+}
+
+#[test]
+fn structured_output_responses_combines_schema_with_hosted_web_search() {
+    let schema = structured_output_schema();
+    let request = base_request()
+        .with_final_output_format(tea_protocol::FinalOutputFormat::JsonSchema {
+            schema: schema.clone(),
+        })
+        .with_tools(vec![web_search(WebSearchOptions::new())], false)
+        .unwrap();
+
+    for profile in [
+        OpenAiCompatibilityProfile::OpenAi,
+        OpenAiCompatibilityProfile::Xai,
+    ] {
+        let body = build_responses_body(
+            &request,
+            &profiled_config(OpenAiApiMode::Responses, profile),
+        )
+        .unwrap();
+
+        assert_eq!(
+            body["text"]["format"],
+            json!({
+                "type": "json_schema",
+                "name": "tea_output",
+                "strict": true,
+                "schema": schema
+            }),
+            "unexpected JSON Schema wire shape for {profile:?}"
+        );
+        assert_eq!(body["tools"][0]["type"], "web_search");
+        assert_eq!(body["tool_choice"], "auto");
+        assert_eq!(body["parallel_tool_calls"], false);
+        assert!(
+            body["include"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("web_search_call.action.sources"))
+        );
+    }
+}
+
+#[test]
+fn vllm_responses_schema_rejects_unverified_tool_combinations() {
+    let config = profiled_config(OpenAiApiMode::Responses, OpenAiCompatibilityProfile::Vllm);
+    for tools in [
+        vec![
+            ModelToolDefinition::new("read_file", "Reads one file.", json!({"type": "object"}))
+                .unwrap(),
+        ],
+        vec![web_search(WebSearchOptions::new())],
+    ] {
+        let request = base_request()
+            .with_final_output_format(tea_protocol::FinalOutputFormat::JsonSchema {
+                schema: structured_output_schema(),
+            })
+            .with_tools(tools, false)
+            .unwrap();
+        let error = build_responses_body(&request, &config).unwrap_err();
+
+        assert_eq!(error.code(), OpenAiErrorCode::InvalidRequest);
+        assert!(error.message().contains("cannot be combined with tools"));
+    }
+}
+
+#[test]
+fn together_schema_instruction_preserves_the_caller_system_prompt() {
+    let schema = structured_output_schema();
+    let request = base_request()
+        .with_system_prompt("Keep the caller's policy unchanged.")
+        .unwrap()
+        .with_final_output_format(tea_protocol::FinalOutputFormat::JsonSchema {
+            schema: schema.clone(),
+        });
+    let body = build_chat_completions_body(
+        &request,
+        &profiled_config(
+            OpenAiApiMode::ChatCompletions,
+            OpenAiCompatibilityProfile::Together,
+        ),
+    )
+    .unwrap();
+    let instruction = body["messages"][0]["content"].as_str().unwrap();
+
+    assert!(instruction.starts_with("Keep the caller's policy unchanged.\n\n"));
+    assert!(instruction.contains("Return the final response as JSON only."));
+    assert!(instruction.ends_with(&serde_json::to_string(&schema).unwrap()));
+    assert_eq!(body["messages"].as_array().unwrap().len(), 4);
+    assert_eq!(body["response_format"]["type"], "json_schema");
+}
+
+#[test]
+fn groq_strict_schema_uses_non_streaming_chat_and_rejects_tools() {
+    let request =
+        base_request().with_final_output_format(tea_protocol::FinalOutputFormat::JsonSchema {
+            schema: structured_output_schema(),
+        });
+    let config = profiled_config(
+        OpenAiApiMode::ChatCompletions,
+        OpenAiCompatibilityProfile::Groq,
+    );
+    let body = build_chat_completions_body(&request, &config).unwrap();
+    assert_eq!(body["stream"], false);
+    assert!(body.get("stream_options").is_none());
+    assert_eq!(body["response_format"]["json_schema"]["strict"], true);
+
+    let with_tools = request
+        .with_tools(
+            vec![
+                ModelToolDefinition::new("read_file", "Reads one file.", json!({"type": "object"}))
+                    .unwrap(),
+            ],
+            false,
+        )
+        .unwrap();
+    let error = build_chat_completions_body(&with_tools, &config).unwrap_err();
+    assert_eq!(error.code(), OpenAiErrorCode::InvalidRequest);
+    assert!(error.message().contains("cannot be combined with tools"));
+}
+
+#[test]
+fn json_object_mapper_always_adds_an_explicit_instruction() {
+    let request = ModelRequest::new(
+        ModelId::from_str("gpt-4o-mini").unwrap(),
+        vec![user("Return exactly one JsOn object with an answer field.")],
+    )
+    .unwrap()
+    .with_final_output_format(tea_protocol::FinalOutputFormat::JsonObject);
+
+    let chat = build_chat_completions_body(&request, &config()).unwrap();
+    assert_eq!(chat["messages"].as_array().unwrap().len(), 2);
+    assert_eq!(chat["messages"][0]["role"], "system");
+    assert_eq!(
+        chat["messages"][0]["content"],
+        "Return the final response as a JSON object. Do not use Markdown."
+    );
+
+    let responses = build_responses_body(&request, &responses_config()).unwrap();
+    assert_eq!(
+        responses["instructions"],
+        "Return the final response as a JSON object. Do not use Markdown."
+    );
+}
+
+#[test]
+fn json_object_prompt_fallback_extends_an_existing_system_prompt() {
+    let request = base_request()
+        .with_system_prompt("Follow the application contract.")
+        .unwrap()
+        .with_final_output_format(tea_protocol::FinalOutputFormat::JsonObject);
+    let expected = "Follow the application contract.\n\nReturn the final response as a JSON object. Do not use Markdown.";
+
+    let chat = build_chat_completions_body(&request, &config()).unwrap();
+    assert_eq!(chat["messages"][0]["role"], "system");
+    assert_eq!(chat["messages"][0]["content"], expected);
+    assert_eq!(chat["messages"].as_array().unwrap().len(), 4);
+
+    let responses = build_responses_body(&request, &responses_config()).unwrap();
+    assert_eq!(responses["instructions"], expected);
+}
+
+#[test]
+fn json_object_prompt_fallback_is_idempotent() {
+    const INSTRUCTION: &str = "Return the final response as a JSON object. Do not use Markdown.";
+    let request = base_request()
+        .with_system_prompt(INSTRUCTION)
+        .unwrap()
+        .with_final_output_format(tea_protocol::FinalOutputFormat::JsonObject);
+
+    let chat = build_chat_completions_body(&request, &config()).unwrap();
+    assert_eq!(chat["messages"][0]["content"], INSTRUCTION);
+
+    let responses = build_responses_body(&request, &responses_config()).unwrap();
+    assert_eq!(responses["instructions"], INSTRUCTION);
+}
+
+#[test]
+fn json_object_instruction_enforces_system_prompt_bounds() {
+    const INSTRUCTION: &str = "Return the final response as a JSON object. Do not use Markdown.";
+    let original_limit = MAX_SYSTEM_PROMPT_BYTES - 2 - INSTRUCTION.len();
+    let fitting = base_request()
+        .with_system_prompt("x".repeat(original_limit))
+        .unwrap()
+        .with_final_output_format(tea_protocol::FinalOutputFormat::JsonObject);
+
+    let chat = build_chat_completions_body(&fitting, &config()).unwrap();
+    assert_eq!(
+        chat["messages"][0]["content"].as_str().unwrap().len(),
+        MAX_SYSTEM_PROMPT_BYTES
+    );
+    let responses = build_responses_body(&fitting, &responses_config()).unwrap();
+    assert_eq!(
+        responses["instructions"].as_str().unwrap().len(),
+        MAX_SYSTEM_PROMPT_BYTES
+    );
+
+    let oversized = base_request()
+        .with_system_prompt("x".repeat(original_limit + 1))
+        .unwrap()
+        .with_final_output_format(tea_protocol::FinalOutputFormat::JsonObject);
+    for error in [
+        build_chat_completions_body(&oversized, &config()).unwrap_err(),
+        build_responses_body(&oversized, &responses_config()).unwrap_err(),
+    ] {
+        assert_eq!(error.code(), OpenAiErrorCode::InvalidRequest);
+        assert!(error.message().contains("system prompt bounds"));
+    }
+}
+
+#[test]
+fn structured_output_rejects_unsupported_profile_and_mode_before_transport() {
+    let schema_request =
+        base_request().with_final_output_format(tea_protocol::FinalOutputFormat::JsonSchema {
+            schema: structured_output_schema(),
+        });
+    let deepseek_chat = profiled_config(
+        OpenAiApiMode::ChatCompletions,
+        OpenAiCompatibilityProfile::DeepSeek,
+    );
+    let error = build_chat_completions_body(&schema_request, &deepseek_chat).unwrap_err();
+    assert_eq!(error.code(), OpenAiErrorCode::InvalidRequest);
+
+    for profile in [
+        OpenAiCompatibilityProfile::GeminiOpenAi,
+        OpenAiCompatibilityProfile::OllamaLocal,
+        OpenAiCompatibilityProfile::OpenRouter,
+        OpenAiCompatibilityProfile::Groq,
+        OpenAiCompatibilityProfile::Mistral,
+        OpenAiCompatibilityProfile::Together,
+    ] {
+        for format in [
+            tea_protocol::FinalOutputFormat::JsonObject,
+            tea_protocol::FinalOutputFormat::JsonSchema {
+                schema: structured_output_schema(),
+            },
+        ] {
+            let request = base_request().with_final_output_format(format);
+            let error = build_responses_body(
+                &request,
+                &profiled_config(OpenAiApiMode::Responses, profile),
+            )
+            .unwrap_err();
+            assert_eq!(
+                error.code(),
+                OpenAiErrorCode::InvalidRequest,
+                "Responses must fail closed for {profile:?}"
+            );
+        }
+    }
+
+    let unprofiled = unprofiled_custom_config(OpenAiApiMode::ChatCompletions);
+    assert!(unprofiled.compatibility_profile().is_none());
+    for format in [
+        tea_protocol::FinalOutputFormat::JsonObject,
+        tea_protocol::FinalOutputFormat::JsonSchema {
+            schema: structured_output_schema(),
+        },
+    ] {
+        let request = base_request().with_final_output_format(format);
+        let error = build_chat_completions_body(&request, &unprofiled).unwrap_err();
+        assert_eq!(error.code(), OpenAiErrorCode::InvalidRequest);
+    }
+}
+
+#[test]
+fn structured_output_rejects_invalid_schema_before_transport() {
+    let request =
+        base_request().with_final_output_format(tea_protocol::FinalOutputFormat::JsonSchema {
+            schema: json!({"type": 7}),
+        });
+
+    for api_mode in [OpenAiApiMode::ChatCompletions, OpenAiApiMode::Responses] {
+        let config = profiled_config(api_mode, OpenAiCompatibilityProfile::OpenAi);
+        let error = match api_mode {
+            OpenAiApiMode::ChatCompletions => {
+                build_chat_completions_body(&request, &config).unwrap_err()
+            }
+            OpenAiApiMode::Responses => build_responses_body(&request, &config).unwrap_err(),
+        };
+
+        assert_eq!(error.code(), OpenAiErrorCode::InvalidRequest);
+        assert!(error.message().contains("final-output format is invalid"));
+    }
+}
+
+#[test]
+fn structured_output_rejects_azure_schema_with_parallel_tools() {
+    let request = base_request()
+        .with_final_output_format(tea_protocol::FinalOutputFormat::JsonSchema {
+            schema: structured_output_schema(),
+        })
+        .with_tools(
+            vec![
+                ModelToolDefinition::new("read_file", "Reads one file.", json!({"type": "object"}))
+                    .unwrap(),
+            ],
+            true,
+        )
+        .unwrap();
+    for api_mode in [OpenAiApiMode::ChatCompletions, OpenAiApiMode::Responses] {
+        let config = profiled_config(api_mode, OpenAiCompatibilityProfile::AzureOpenAi);
+        let error = match api_mode {
+            OpenAiApiMode::ChatCompletions => {
+                build_chat_completions_body(&request, &config).unwrap_err()
+            }
+            OpenAiApiMode::Responses => build_responses_body(&request, &config).unwrap_err(),
+        };
+
+        assert_eq!(error.code(), OpenAiErrorCode::InvalidRequest);
+    }
 }
 
 #[test]
@@ -436,6 +958,7 @@ fn maps_responses_messages_tools_and_results() {
     assert_eq!(body["tools"][0]["name"], "read_file");
     assert_eq!(body["tools"][0]["strict"], false);
     assert!(body["tools"][0].get("function").is_none());
+    assert!(body.get("text").is_none());
 
     let input = body["input"].as_array().unwrap();
     assert_eq!(input[0]["type"], "message");

@@ -3,12 +3,16 @@
 use std::collections::BTreeMap;
 
 use serde_json::{Map, Value, json};
-use tea_model::ModelRequest;
-use tea_protocol::{CanonicalMessage, ContentBlock, ToolCallId};
+use tea_model::{MAX_SYSTEM_PROMPT_BYTES, ModelRequest};
+use tea_protocol::{
+    CanonicalMessage, ContentBlock, FINAL_JSON_OBJECT_INSTRUCTION, FinalOutputFormat, ToolCallId,
+};
 
-use crate::credential::OpenAiConfig;
+use crate::credential::{OpenAiApiMode, OpenAiCompatibilityProfile, OpenAiConfig};
 use crate::error::{OpenAiError, OpenAiErrorCode};
 use crate::reasoning::{OpenAiReasoningEffortMap, request_wire_effort};
+
+pub(crate) const JSON_OBJECT_INSTRUCTION: &str = FINAL_JSON_OBJECT_INSTRUCTION;
 
 /// Builds the `OpenAI` Chat Completions JSON body for one request.
 ///
@@ -31,14 +35,22 @@ pub fn build_chat_completions_body(
 /// non-off reasoning effort has no model-level wire mapping.
 pub fn build_chat_completions_body_with_reasoning_map(
     request: &ModelRequest,
-    _config: &OpenAiConfig,
+    config: &OpenAiConfig,
     reasoning_map: Option<&OpenAiReasoningEffortMap>,
 ) -> Result<Value, OpenAiError> {
+    let final_output = validated_final_output(request, config, OpenAiApiMode::ChatCompletions)?;
+    let stream = !matches!(
+        final_output,
+        Some((profile, FinalOutputFormat::JsonSchema { .. }))
+            if !profile.supports_streaming_final_json_schema(OpenAiApiMode::ChatCompletions)
+    );
     let mut body = Map::new();
     body.insert("model".to_owned(), json!(request.model_id().as_str()));
-    body.insert("stream".to_owned(), json!(true));
-    // Request usage in the final stream chunk so the adapter can normalize tokens.
-    body.insert("stream_options".to_owned(), json!({"include_usage": true}));
+    body.insert("stream".to_owned(), json!(stream));
+    if stream {
+        // Request usage in the final stream chunk so the adapter can normalize tokens.
+        body.insert("stream_options".to_owned(), json!({"include_usage": true}));
+    }
 
     let mut messages = Vec::with_capacity(request.messages().len() + 1);
     if let Some(system) = request.system_prompt() {
@@ -47,6 +59,27 @@ pub fn build_chat_completions_body_with_reasoning_map(
     let provider_call_ids = provider_tool_call_ids(request.messages());
     for message in request.messages() {
         messages.push(map_message(message, &provider_call_ids)?);
+    }
+    let structured_instruction = match final_output {
+        Some((_, FinalOutputFormat::JsonObject)) => {
+            Some(json_object_instructions(request.system_prompt())?)
+        }
+        Some((OpenAiCompatibilityProfile::Together, FinalOutputFormat::JsonSchema { schema })) => {
+            Some(together_schema_instructions(
+                request.system_prompt(),
+                schema,
+            )?)
+        }
+        _ => None,
+    };
+    if let Some(instruction) = structured_instruction {
+        if request.system_prompt().is_some()
+            && let Some(message) = messages.first_mut().and_then(Value::as_object_mut)
+        {
+            message.insert("content".to_owned(), json!(instruction));
+        } else {
+            messages.insert(0, json!({"role": "system", "content": instruction}));
+        }
     }
     body.insert("messages".to_owned(), Value::Array(messages));
 
@@ -92,7 +125,142 @@ pub fn build_chat_completions_body_with_reasoning_map(
         body.insert(key.to_owned(), json!(max_output.get()));
     }
 
+    if let Some((profile, format)) = final_output {
+        let response_format = match format {
+            FinalOutputFormat::JsonObject => json!({"type": "json_object"}),
+            FinalOutputFormat::JsonSchema { schema } => json!({
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "tea_output",
+                    "strict": profile.uses_strict_json_schema(OpenAiApiMode::ChatCompletions),
+                    "schema": schema,
+                }
+            }),
+        };
+        body.insert("response_format".to_owned(), response_format);
+        if profile.requires_parameter_support() {
+            body.insert("provider".to_owned(), json!({"require_parameters": true}));
+        }
+    }
+
     Ok(Value::Object(body))
+}
+
+pub(crate) fn json_object_instructions(existing: Option<&str>) -> Result<String, OpenAiError> {
+    if let Some(existing) = existing
+        && existing.lines().any(|line| line == JSON_OBJECT_INSTRUCTION)
+    {
+        return Ok(existing.to_owned());
+    }
+    append_system_instruction(
+        existing,
+        JSON_OBJECT_INSTRUCTION,
+        "JSON-object instruction exceeds system prompt bounds",
+    )
+}
+
+fn together_schema_instructions(
+    existing: Option<&str>,
+    schema: &Value,
+) -> Result<String, OpenAiError> {
+    let schema = serde_json::to_string(schema).map_err(|_| {
+        invalid_structured_output("Together JSON Schema instruction could not be serialized")
+    })?;
+    let instruction = format!(
+        "Return the final response as JSON only. Do not use Markdown.\nJSON Schema:\n{schema}"
+    );
+    if existing.is_some_and(|existing| {
+        existing
+            .strip_suffix(&instruction)
+            .is_some_and(|prefix| prefix.is_empty() || prefix.ends_with("\n\n"))
+    }) {
+        return Ok(existing.unwrap_or_default().to_owned());
+    }
+    append_system_instruction(
+        existing,
+        &instruction,
+        "Together JSON Schema instruction exceeds system prompt bounds",
+    )
+}
+
+fn append_system_instruction(
+    existing: Option<&str>,
+    instruction: &str,
+    overflow_message: &'static str,
+) -> Result<String, OpenAiError> {
+    let existing_bytes = existing.map_or(0, str::len);
+    let separator_bytes = usize::from(existing.is_some()) * 2;
+    let encoded_bytes = existing_bytes
+        .checked_add(separator_bytes)
+        .and_then(|bytes| bytes.checked_add(instruction.len()))
+        .ok_or_else(|| invalid_structured_output(overflow_message))?;
+    if encoded_bytes > MAX_SYSTEM_PROMPT_BYTES {
+        return Err(invalid_structured_output(overflow_message));
+    }
+    Ok(match existing {
+        Some(existing) => format!("{existing}\n\n{instruction}"),
+        None => instruction.to_owned(),
+    })
+}
+
+pub(crate) fn validated_final_output<'a>(
+    request: &'a ModelRequest,
+    config: &OpenAiConfig,
+    api_mode: OpenAiApiMode,
+) -> Result<Option<(OpenAiCompatibilityProfile, &'a FinalOutputFormat)>, OpenAiError> {
+    let Some(format) = request.final_output_format() else {
+        return Ok(None);
+    };
+    format.validate().map_err(|error| {
+        OpenAiError::new(
+            OpenAiErrorCode::InvalidRequest,
+            format!("OpenAI final-output format is invalid: {error}"),
+        )
+    })?;
+    if config.api_mode() != api_mode {
+        return Err(invalid_structured_output(
+            "structured output request builder does not match the configured API mode",
+        ));
+    }
+    let Some(profile) = config.compatibility_profile() else {
+        return Err(invalid_structured_output(
+            "structured output requires an explicit compatibility profile",
+        ));
+    };
+    let supported = match format {
+        FinalOutputFormat::JsonObject => profile.supports_final_json_object(api_mode),
+        FinalOutputFormat::JsonSchema { .. } => profile.supports_final_json_schema(api_mode),
+    };
+    if !supported {
+        return Err(invalid_structured_output(
+            "structured output is unsupported by the compatibility profile and API mode",
+        ));
+    }
+    if matches!(format, FinalOutputFormat::JsonSchema { .. })
+        && !request.tools().is_empty()
+        && !profile.supports_final_json_schema_with_tools(api_mode)
+    {
+        return Err(invalid_structured_output(
+            "JSON Schema output cannot be combined with tools for this profile",
+        ));
+    }
+    if matches!(format, FinalOutputFormat::JsonSchema { .. })
+        && request.allow_parallel_tool_calls()
+        && request
+            .tools()
+            .iter()
+            .any(|tool| tool.as_function().is_some())
+        && !profile.supports_parallel_tools_with_json_schema()
+    {
+        return Err(invalid_structured_output(
+            "JSON Schema output cannot be combined with parallel function calls for this profile",
+        ));
+    }
+    Ok(Some((profile, format)))
+}
+
+fn invalid_structured_output(message: &'static str) -> OpenAiError {
+    OpenAiError::new(OpenAiErrorCode::InvalidRequest, message)
 }
 
 /// Returns the full Chat Completions endpoint URL for the supplied config.

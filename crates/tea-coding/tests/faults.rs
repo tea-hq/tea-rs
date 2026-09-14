@@ -215,7 +215,10 @@ async fn append_failure_rolls_back_and_the_service_can_retry() {
         .len();
 
     store.set_append_failure(true);
-    service.prompt(session_id, "must roll back").unwrap();
+    service
+        .prompt(session_id, "must roll back", None)
+        .await
+        .unwrap();
     let error = service.wait(session_id).await.unwrap_err();
     assert!(!error.message().contains("injected append failure"));
     assert!(error.message().len() <= 4096);
@@ -231,7 +234,10 @@ async fn append_failure_rolls_back_and_the_service_can_retry() {
     assert_eq!(provider.remaining_scripts().unwrap(), 1);
 
     store.set_append_failure(false);
-    service.prompt(session_id, "retry safely").unwrap();
+    service
+        .prompt(session_id, "retry safely", None)
+        .await
+        .unwrap();
     service.wait(session_id).await.unwrap();
     assert_eq!(provider.remaining_scripts().unwrap(), 0);
     service.shutdown().await;
@@ -258,7 +264,7 @@ async fn provider_failures_before_and_during_stream_are_durable_and_bounded() {
 
     for prompt in ["fail before stream", "fail during stream"] {
         let session_id = service.create_session().await.unwrap();
-        service.prompt(session_id, prompt).unwrap();
+        service.prompt(session_id, prompt, None).await.unwrap();
         let error = service.wait(session_id).await.unwrap_err();
         assert!(!format!("{error:?}").contains("seeded-provider-secret"));
         let snapshot = service.session_snapshot(session_id).await.unwrap();
@@ -310,7 +316,7 @@ async fn wait_preserves_provider_neutral_terminal_failure_codes() {
         (ModelFailureCode::Internal, CodingErrorCode::Internal),
         (
             ModelFailureCode::MalformedResponse,
-            CodingErrorCode::Internal,
+            CodingErrorCode::MalformedResponse,
         ),
     ];
     let provider = provider(cases.map(|(source, _)| {
@@ -333,7 +339,8 @@ async fn wait_preserves_provider_neutral_terminal_failure_codes() {
     for (source, expected) in cases {
         let session_id = service.create_session().await.unwrap();
         service
-            .prompt(session_id, format!("exercise {source:?}"))
+            .prompt(session_id, format!("exercise {source:?}"), None)
+            .await
             .unwrap();
         let error = service.wait(session_id).await.unwrap_err();
         assert_eq!(error.code(), expected, "source code: {source:?}");
@@ -372,7 +379,7 @@ async fn tool_failures_before_and_after_a_side_effect_are_not_retried() {
     let service = fixture.service(Arc::clone(&provider), Arc::new(InMemorySessionStore::new()));
 
     let edit_session = service.create_session().await.unwrap();
-    service.prompt(edit_session, "edit").unwrap();
+    service.prompt(edit_session, "edit", None).await.unwrap();
     let edit_approval = approval_id(service.wait(edit_session).await.unwrap());
     service
         .approve(edit_session, edit_approval, ApprovalDecision::AllowOnce)
@@ -384,7 +391,7 @@ async fn tool_failures_before_and_after_a_side_effect_are_not_retried() {
     );
 
     let bash_session = service.create_session().await.unwrap();
-    service.prompt(bash_session, "bash").unwrap();
+    service.prompt(bash_session, "bash", None).await.unwrap();
     let bash_approval = approval_id(service.wait(bash_session).await.unwrap());
     service
         .approve(bash_session, bash_approval, ApprovalDecision::AllowOnce)
@@ -407,7 +414,10 @@ async fn event_sink_backpressure_cannot_block_service_shutdown() {
     let service = fixture.service(Arc::clone(&provider), Arc::new(InMemorySessionStore::new()));
     let session_id = service.create_session().await.unwrap();
     let receiver = service.subscribe(session_id).unwrap();
-    service.prompt(session_id, "fill subscriber").unwrap();
+    service
+        .prompt(session_id, "fill subscriber", None)
+        .await
+        .unwrap();
     tokio::time::timeout(Duration::from_secs(1), async {
         loop {
             if provider.captured_requests().unwrap().len() == 1 && receiver.len() == 256 {
@@ -431,7 +441,10 @@ async fn abrupt_owner_drop_allows_reopen_and_a_new_run() {
     let first_provider = provider([ScriptedModelResponse::await_cancellation()]);
     let service = fixture.service(Arc::clone(&first_provider), Arc::clone(&store));
     let session_id = service.create_session().await.unwrap();
-    service.prompt(session_id, "interrupted prompt").unwrap();
+    service
+        .prompt(session_id, "interrupted prompt", None)
+        .await
+        .unwrap();
     tokio::time::timeout(Duration::from_secs(1), async {
         loop {
             if first_provider.captured_requests().unwrap().len() == 1 {
@@ -449,7 +462,7 @@ async fn abrupt_owner_drop_allows_reopen_and_a_new_run() {
         store,
     );
     rebuilt.open_session(session_id).await.unwrap();
-    rebuilt.prompt(session_id, "continue").unwrap();
+    rebuilt.prompt(session_id, "continue", None).await.unwrap();
     rebuilt.wait(session_id).await.unwrap();
     let snapshot = rebuilt.session_snapshot(session_id).await.unwrap();
     assert!(snapshot.records().iter().any(|record| matches!(

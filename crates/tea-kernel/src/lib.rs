@@ -38,7 +38,7 @@ pub(crate) use context_window::ContextWindowAccountant;
 pub use error::{KernelError, KernelErrorCode};
 pub use event::{DiscardEventSink, KernelEventFuture, KernelEventSink};
 pub use id::{KernelIdSource, UuidV7KernelIdSource};
-pub use kernel::{AgentKernel, KernelRunOutcome};
+pub use kernel::{AgentKernel, KernelRunOutcome, validate_new_run_state};
 pub use queue::KernelInputQueue;
 pub use request::TurnRequestSnapshot;
 pub use retry::ModelRetryPolicy;

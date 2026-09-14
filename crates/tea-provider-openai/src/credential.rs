@@ -10,6 +10,7 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::str::FromStr;
 
+use serde::{Deserialize, Serialize};
 use tea_model::ProviderId;
 use tea_protocol::ModelId;
 
@@ -17,6 +18,8 @@ use crate::error::{OpenAiError, OpenAiErrorCode};
 
 /// Default provider identity advertised by this adapter.
 pub const PROVIDER_ID: &str = "openai";
+
+const DEFAULT_OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
 
 /// `OpenAI` HTTP API used for model requests.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -26,6 +29,143 @@ pub enum OpenAiApiMode {
     ChatCompletions,
     /// The `/responses` endpoint.
     Responses,
+}
+
+/// Exact structured-output dialect supported by an OpenAI-compatible endpoint.
+///
+/// Non-default endpoints configure this value explicitly. The built-in resolver
+/// supplies [`OpenAiCompatibilityProfile::OpenAi`] only for the exact default
+/// `OpenAI` base URL; it never infers a profile from provider or model names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum OpenAiCompatibilityProfile {
+    /// Native `OpenAI` Chat Completions and Responses semantics.
+    OpenAi,
+    /// Azure `OpenAI` v1 Chat Completions and Responses semantics.
+    AzureOpenAi,
+    /// xAI Chat Completions and Responses semantics.
+    Xai,
+    /// `DeepSeek` Chat Completions and Responses semantics.
+    DeepSeek,
+    /// Gemini's documented `OpenAI` Chat Completions compatibility endpoint.
+    GeminiOpenAi,
+    /// A local Ollama `OpenAI` Chat Completions compatibility endpoint.
+    OllamaLocal,
+    /// `OpenRouter` Chat Completions with parameter-aware route selection.
+    OpenRouter,
+    /// Groq Chat Completions and beta Responses semantics.
+    Groq,
+    /// Mistral Chat Completions semantics.
+    Mistral,
+    /// Together AI Chat Completions semantics.
+    Together,
+    /// A vLLM `OpenAI` Chat Completions and Responses server.
+    Vllm,
+}
+
+impl OpenAiCompatibilityProfile {
+    /// Returns whether the profile documents this API mode.
+    #[must_use]
+    pub const fn supports_api_mode(self, api_mode: OpenAiApiMode) -> bool {
+        match api_mode {
+            OpenAiApiMode::ChatCompletions => true,
+            OpenAiApiMode::Responses => {
+                matches!(
+                    self,
+                    Self::OpenAi
+                        | Self::AzureOpenAi
+                        | Self::Xai
+                        | Self::DeepSeek
+                        | Self::Groq
+                        | Self::Vllm
+                )
+            }
+        }
+    }
+
+    /// Returns whether the profile supports JSON-object final output in this mode.
+    #[must_use]
+    pub const fn supports_final_json_object(self, api_mode: OpenAiApiMode) -> bool {
+        match api_mode {
+            OpenAiApiMode::ChatCompletions => true,
+            OpenAiApiMode::Responses => {
+                matches!(
+                    self,
+                    Self::OpenAi | Self::AzureOpenAi | Self::Xai | Self::DeepSeek | Self::Vllm
+                )
+            }
+        }
+    }
+
+    /// Returns whether the profile supports JSON-Schema final output in this mode.
+    #[must_use]
+    pub const fn supports_final_json_schema(self, api_mode: OpenAiApiMode) -> bool {
+        match api_mode {
+            OpenAiApiMode::ChatCompletions => !matches!(self, Self::DeepSeek),
+            OpenAiApiMode::Responses => {
+                matches!(
+                    self,
+                    Self::OpenAi | Self::AzureOpenAi | Self::Xai | Self::DeepSeek | Self::Vllm
+                )
+            }
+        }
+    }
+
+    /// Returns whether JSON Schema may be combined with tools in this mode.
+    ///
+    /// A model still has to advertise the corresponding combination capability.
+    #[must_use]
+    pub const fn supports_final_json_schema_with_tools(self, api_mode: OpenAiApiMode) -> bool {
+        self.supports_final_json_schema(api_mode)
+            && !matches!(self, Self::Groq)
+            && !matches!((self, api_mode), (Self::Vllm, OpenAiApiMode::Responses))
+    }
+
+    /// Returns whether JSON Schema output uses an SSE response in this mode.
+    #[must_use]
+    pub const fn supports_streaming_final_json_schema(self, api_mode: OpenAiApiMode) -> bool {
+        self.supports_final_json_schema(api_mode) && !matches!(self, Self::Groq)
+    }
+
+    /// Returns whether structured output must select only parameter-capable routes.
+    #[must_use]
+    pub const fn requires_parameter_support(self) -> bool {
+        matches!(self, Self::OpenRouter)
+    }
+
+    /// Returns whether JSON Schema may be combined with parallel function calls.
+    #[must_use]
+    pub const fn supports_parallel_tools_with_json_schema(self) -> bool {
+        !matches!(self, Self::AzureOpenAi | Self::Groq)
+    }
+
+    pub(crate) const fn uses_strict_json_schema(self, api_mode: OpenAiApiMode) -> bool {
+        !matches!((self, api_mode), (Self::DeepSeek, OpenAiApiMode::Responses))
+    }
+}
+
+impl FromStr for OpenAiCompatibilityProfile {
+    type Err = OpenAiError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "open-ai" => Ok(Self::OpenAi),
+            "azure-open-ai" => Ok(Self::AzureOpenAi),
+            "xai" => Ok(Self::Xai),
+            "deep-seek" => Ok(Self::DeepSeek),
+            "gemini-open-ai" => Ok(Self::GeminiOpenAi),
+            "ollama-local" => Ok(Self::OllamaLocal),
+            "open-router" => Ok(Self::OpenRouter),
+            "groq" => Ok(Self::Groq),
+            "mistral" => Ok(Self::Mistral),
+            "together" => Ok(Self::Together),
+            "vllm" => Ok(Self::Vllm),
+            _ => Err(OpenAiError::new(
+                OpenAiErrorCode::InvalidRequest,
+                "TEA_OPENAI_COMPATIBILITY_PROFILE is invalid",
+            )),
+        }
+    }
 }
 
 /// Bounded API key value that never appears in debug output.
@@ -72,6 +212,7 @@ impl FromStr for ApiKey {
 
 /// Immutable OpenAI-compatible connection configuration.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(clippy::struct_excessive_bools)]
 pub struct OpenAiConfig {
     provider_id: ProviderId,
     model_id: ModelId,
@@ -80,10 +221,15 @@ pub struct OpenAiConfig {
     api_key_header: String,
     api_key_prefix: String,
     api_mode: OpenAiApiMode,
+    compatibility_profile: Option<OpenAiCompatibilityProfile>,
     org_id: Option<String>,
     project_id: Option<String>,
     reasoning_effort: Option<String>,
     vision: bool,
+    final_json_object: bool,
+    final_json_schema: bool,
+    final_json_schema_with_tools: bool,
+    hosted_web_search: bool,
     timeout_millis: u64,
 }
 
@@ -91,7 +237,9 @@ impl OpenAiConfig {
     /// Creates an explicit OpenAI-compatible connection configuration.
     ///
     /// The configuration uses the default provider identity, bearer-token
-    /// authentication, Chat Completions API mode, and a 60-second timeout.
+    /// authentication, Chat Completions API mode, no compatibility profile,
+    /// and a 60-second timeout. Callers enabling structured output must select
+    /// an explicit profile with [`Self::with_compatibility_profile`].
     ///
     /// # Errors
     ///
@@ -116,10 +264,15 @@ impl OpenAiConfig {
             api_key_header: "Authorization".to_owned(),
             api_key_prefix: "Bearer ".to_owned(),
             api_mode: OpenAiApiMode::ChatCompletions,
+            compatibility_profile: None,
             org_id: None,
             project_id: None,
             reasoning_effort: None,
             vision: false,
+            final_json_object: false,
+            final_json_schema: false,
+            final_json_schema_with_tools: false,
+            hosted_web_search: false,
             timeout_millis: 60_000,
         })
     }
@@ -165,6 +318,17 @@ impl OpenAiConfig {
         self.api_mode = api_mode;
         self
     }
+    /// Returns the configured structured-output compatibility profile.
+    #[must_use]
+    pub const fn compatibility_profile(&self) -> Option<OpenAiCompatibilityProfile> {
+        self.compatibility_profile
+    }
+    /// Selects an explicit structured-output compatibility profile.
+    #[must_use]
+    pub const fn with_compatibility_profile(mut self, profile: OpenAiCompatibilityProfile) -> Self {
+        self.compatibility_profile = Some(profile);
+        self
+    }
     /// Returns the optional organization id.
     #[must_use]
     pub fn org_id(&self) -> Option<&str> {
@@ -184,6 +348,56 @@ impl OpenAiConfig {
     #[must_use]
     pub const fn vision(&self) -> bool {
         self.vision
+    }
+    /// Returns whether the configured model explicitly supports JSON-object output.
+    #[must_use]
+    pub const fn final_json_object(&self) -> bool {
+        self.final_json_object
+    }
+    /// Explicitly enables or disables JSON-object output for the configured model.
+    #[must_use]
+    pub const fn with_final_json_object(mut self, enabled: bool) -> Self {
+        self.final_json_object = enabled;
+        self
+    }
+    /// Returns whether the configured model explicitly supports JSON Schema output.
+    #[must_use]
+    pub const fn final_json_schema(&self) -> bool {
+        self.final_json_schema
+    }
+    /// Explicitly enables or disables JSON Schema output for the configured model.
+    #[must_use]
+    pub const fn with_final_json_schema(mut self, enabled: bool) -> Self {
+        self.final_json_schema = enabled;
+        if !enabled {
+            self.final_json_schema_with_tools = false;
+        }
+        self
+    }
+    /// Returns whether the configured model explicitly supports JSON Schema with tools.
+    #[must_use]
+    pub const fn final_json_schema_with_tools(&self) -> bool {
+        self.final_json_schema_with_tools
+    }
+    /// Explicitly enables or disables JSON Schema output combined with tools.
+    #[must_use]
+    pub const fn with_final_json_schema_with_tools(mut self, enabled: bool) -> Self {
+        self.final_json_schema_with_tools = enabled;
+        if enabled {
+            self.final_json_schema = true;
+        }
+        self
+    }
+    /// Returns whether the configured model explicitly supports Responses hosted web search.
+    #[must_use]
+    pub const fn hosted_web_search(&self) -> bool {
+        self.hosted_web_search
+    }
+    /// Explicitly enables or disables Responses hosted web search for the configured model.
+    #[must_use]
+    pub const fn with_hosted_web_search(mut self, enabled: bool) -> Self {
+        self.hosted_web_search = enabled;
+        self
     }
     /// Returns the per-request timeout in milliseconds.
     #[must_use]
@@ -219,7 +433,11 @@ impl EnvCredentialResolver {
 
 impl CredentialResolver for EnvCredentialResolver {
     fn resolve(&self) -> Result<OpenAiConfig, OpenAiError> {
-        resolve_config(default_provider_id(), |key| std::env::var(key).ok())
+        resolve_config(
+            default_provider_id(),
+            Some(OpenAiCompatibilityProfile::OpenAi),
+            |key| std::env::var(key).ok(),
+        )
     }
 }
 
@@ -229,6 +447,7 @@ impl CredentialResolver for EnvCredentialResolver {
 #[derive(Clone)]
 pub struct MapCredentialResolver {
     provider_id: ProviderId,
+    compatibility_profile: Option<OpenAiCompatibilityProfile>,
     values: BTreeMap<String, String>,
 }
 
@@ -238,6 +457,7 @@ impl MapCredentialResolver {
     pub fn new(values: BTreeMap<String, String>) -> Self {
         Self {
             provider_id: default_provider_id(),
+            compatibility_profile: Some(OpenAiCompatibilityProfile::OpenAi),
             values,
         }
     }
@@ -247,6 +467,7 @@ impl MapCredentialResolver {
     pub fn for_provider(provider_id: ProviderId, values: BTreeMap<String, String>) -> Self {
         Self {
             provider_id,
+            compatibility_profile: None,
             values,
         }
     }
@@ -269,15 +490,18 @@ impl fmt::Debug for MapCredentialResolver {
 
 impl CredentialResolver for MapCredentialResolver {
     fn resolve(&self) -> Result<OpenAiConfig, OpenAiError> {
-        resolve_config(self.provider_id.clone(), |key| {
-            self.values.get(key).cloned()
-        })
+        resolve_config(
+            self.provider_id.clone(),
+            self.compatibility_profile,
+            |key| self.values.get(key).cloned(),
+        )
     }
 }
 
 /// Shared configuration builder parameterized by a value lookup.
 fn resolve_config(
     provider_id: ProviderId,
+    default_compatibility_profile: Option<OpenAiCompatibilityProfile>,
     get: impl Fn(&str) -> Option<String>,
 ) -> Result<OpenAiConfig, OpenAiError> {
     let api_key = get("TEA_OPENAI_API_KEY")
@@ -305,7 +529,7 @@ fn resolve_config(
         })?;
     let base_url = get("TEA_OPENAI_BASE_URL")
         .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| "https://api.openai.com/v1".to_owned());
+        .unwrap_or_else(|| DEFAULT_OPENAI_BASE_URL.to_owned());
     let api_key_header = get("TEA_OPENAI_API_KEY_HEADER")
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| "Authorization".to_owned());
@@ -329,12 +553,31 @@ fn resolve_config(
             ));
         }
     };
+    let compatibility_profile = get("TEA_OPENAI_COMPATIBILITY_PROFILE")
+        .filter(|value| !value.is_empty())
+        .map(|value| value.parse::<OpenAiCompatibilityProfile>())
+        .transpose()?
+        .or_else(|| {
+            (base_url == DEFAULT_OPENAI_BASE_URL)
+                .then_some(default_compatibility_profile)
+                .flatten()
+        });
+    if compatibility_profile.is_some_and(|profile| !profile.supports_api_mode(api_mode)) {
+        return Err(OpenAiError::new(
+            OpenAiErrorCode::InvalidRequest,
+            "OpenAI compatibility profile does not support the configured API mode",
+        ));
+    }
     let org_id = get("TEA_OPENAI_ORG_ID").filter(|value| !value.is_empty());
     let project_id = get("TEA_OPENAI_PROJECT_ID").filter(|value| !value.is_empty());
     let reasoning_effort = get("TEA_OPENAI_REASONING_EFFORT")
         .filter(|value| value.parse::<tea_protocol::ReasoningEffort>().is_ok());
-    let vision = get("TEA_OPENAI_VISION")
-        .is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("true"));
+    let vision = flag_enabled(get("TEA_OPENAI_VISION"));
+    let final_json_object = flag_enabled(get("TEA_OPENAI_FINAL_JSON_OBJECT"));
+    let final_json_schema_with_tools = flag_enabled(get("TEA_OPENAI_FINAL_JSON_SCHEMA_WITH_TOOLS"));
+    let final_json_schema =
+        final_json_schema_with_tools || flag_enabled(get("TEA_OPENAI_FINAL_JSON_SCHEMA"));
+    let hosted_web_search = flag_enabled(get("TEA_OPENAI_HOSTED_WEB_SEARCH"));
     let timeout_millis = get("TEA_OPENAI_REQUEST_TIMEOUT_MS")
         .and_then(|value| value.parse().ok())
         .filter(|value: &u64| *value > 0)
@@ -347,12 +590,21 @@ fn resolve_config(
         api_key_header,
         api_key_prefix,
         api_mode,
+        compatibility_profile,
         org_id,
         project_id,
         reasoning_effort,
         vision,
+        final_json_object,
+        final_json_schema,
+        final_json_schema_with_tools,
+        hosted_web_search,
         timeout_millis,
     })
+}
+
+fn flag_enabled(value: Option<String>) -> bool {
+    value.is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
 }
 
 fn default_provider_id() -> ProviderId {

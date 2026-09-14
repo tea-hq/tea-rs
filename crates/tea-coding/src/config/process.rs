@@ -8,7 +8,10 @@ use tea_model::{
     ModelCapabilities, ModelDisplayName, ModelProvider, ModelSpec, ProviderId, ReasoningProfile,
 };
 use tea_protocol::{ModelId, ReasoningEffort, TokenCount};
-use tea_provider_openai::{MapCredentialResolver, OpenAiProviderBuilder, OpenAiReasoningEffortMap};
+use tea_provider_openai::{
+    MapCredentialResolver, OpenAiCompatibilityProfile, OpenAiProviderBuilder,
+    OpenAiReasoningEffortMap,
+};
 
 use super::{
     CodingSettings, ModelDefinition, ProviderConfig, ProviderValueResolver, load_providers_file,
@@ -275,66 +278,20 @@ pub fn resolve_openai_compatible_provider(
 ) -> Result<ResolvedOpenAiProvider, CodingError> {
     let provider_id =
         ProviderId::from_str(provider_id).map_err(|_| invalid("provider selector is invalid"))?;
+    let is_builtin_openai =
+        provider.is_none() && provider_id.as_str() == tea_provider_openai::PROVIDER_ID;
     let process_environment = environment.clone();
     let mut values = environment;
     values.insert("TEA_OPENAI_MODEL".to_owned(), model_id.to_owned());
 
     let (catalog, reasoning_effort_maps) = if let Some(provider) = provider {
-        // Custom providers are configuration-authoritative. Only an explicit
-        // `$NAME` value may resolve through the captured process environment.
-        values.retain(|key, _| !key.starts_with("TEA_OPENAI_"));
-        values.insert("TEA_OPENAI_MODEL".to_owned(), model_id.to_owned());
-        let value_resolver = ProviderValueResolver::new(process_environment);
-        insert_provider_value(
+        apply_custom_openai_connection(
+            provider,
+            model_id,
+            api_key_override,
+            process_environment,
             &mut values,
-            "TEA_OPENAI_BASE_URL",
-            provider.base_url.as_deref(),
-        );
-        insert_provider_value(
-            &mut values,
-            "TEA_OPENAI_API_KEY_HEADER",
-            provider.api_key_header.as_deref(),
-        );
-        insert_provider_value(
-            &mut values,
-            "TEA_OPENAI_API_KEY_PREFIX",
-            provider.api_key_prefix.as_deref(),
-        );
-        insert_provider_value(
-            &mut values,
-            "TEA_OPENAI_API_MODE",
-            provider.api_mode.as_deref(),
-        );
-        insert_provider_value(&mut values, "TEA_OPENAI_ORG_ID", provider.org_id.as_deref());
-        insert_provider_value(
-            &mut values,
-            "TEA_OPENAI_PROJECT_ID",
-            provider.project_id.as_deref(),
-        );
-        insert_provider_value(
-            &mut values,
-            "TEA_OPENAI_REASONING_EFFORT",
-            provider.reasoning_effort.as_deref(),
-        );
-        if let Some(vision) = provider.vision {
-            values.insert("TEA_OPENAI_VISION".to_owned(), vision.to_string());
-        }
-        if let Some(timeout_millis) = provider.timeout_millis {
-            values.insert(
-                "TEA_OPENAI_REQUEST_TIMEOUT_MS".to_owned(),
-                timeout_millis.to_string(),
-            );
-        }
-        if let Some(api_key) = api_key_override {
-            values.insert("TEA_OPENAI_API_KEY".to_owned(), api_key.to_owned());
-        } else if let Some(api_key) = &provider.api_key {
-            values.insert(
-                "TEA_OPENAI_API_KEY".to_owned(),
-                value_resolver.resolve(api_key).ok_or_else(|| {
-                    credential("configured provider API key could not be resolved")
-                })?,
-            );
-        }
+        )?;
 
         if provider.models.is_empty() {
             if provider_id.as_str() != tea_provider_openai::PROVIDER_ID {
@@ -359,7 +316,7 @@ pub fn resolve_openai_compatible_provider(
         (None, BTreeMap::default())
     };
 
-    let resolver = if provider_id.as_str() == tea_provider_openai::PROVIDER_ID {
+    let resolver = if is_builtin_openai {
         MapCredentialResolver::new(values)
     } else {
         MapCredentialResolver::for_provider(provider_id, values)
@@ -370,6 +327,74 @@ pub fn resolve_openai_compatible_provider(
         catalog,
         reasoning_effort_maps,
     })
+}
+
+fn apply_custom_openai_connection(
+    provider: &ProviderConfig,
+    model_id: &str,
+    api_key_override: Option<&str>,
+    process_environment: BTreeMap<String, String>,
+    values: &mut BTreeMap<String, String>,
+) -> Result<(), CodingError> {
+    if !provider.structured_output_configuration_is_valid() {
+        return Err(invalid(
+            "provider structured-output profile, API mode, or model capabilities are invalid",
+        ));
+    }
+    // Custom providers are configuration-authoritative. Only an explicit
+    // `$NAME` value may resolve through the captured process environment.
+    values.retain(|key, _| !key.starts_with("TEA_OPENAI_"));
+    values.insert("TEA_OPENAI_MODEL".to_owned(), model_id.to_owned());
+    let value_resolver = ProviderValueResolver::new(process_environment);
+    insert_provider_value(values, "TEA_OPENAI_BASE_URL", provider.base_url.as_deref());
+    insert_provider_value(
+        values,
+        "TEA_OPENAI_API_KEY_HEADER",
+        provider.api_key_header.as_deref(),
+    );
+    insert_provider_value(
+        values,
+        "TEA_OPENAI_API_KEY_PREFIX",
+        provider.api_key_prefix.as_deref(),
+    );
+    insert_provider_value(values, "TEA_OPENAI_API_MODE", provider.api_mode.as_deref());
+    if let Some(profile) = provider.compatibility_profile {
+        values.insert(
+            "TEA_OPENAI_COMPATIBILITY_PROFILE".to_owned(),
+            compatibility_profile_name(profile).to_owned(),
+        );
+    }
+    insert_provider_value(values, "TEA_OPENAI_ORG_ID", provider.org_id.as_deref());
+    insert_provider_value(
+        values,
+        "TEA_OPENAI_PROJECT_ID",
+        provider.project_id.as_deref(),
+    );
+    insert_provider_value(
+        values,
+        "TEA_OPENAI_REASONING_EFFORT",
+        provider.reasoning_effort.as_deref(),
+    );
+    if let Some(vision) = provider.vision {
+        values.insert("TEA_OPENAI_VISION".to_owned(), vision.to_string());
+    }
+    if let Some(timeout_millis) = provider.timeout_millis {
+        values.insert(
+            "TEA_OPENAI_REQUEST_TIMEOUT_MS".to_owned(),
+            timeout_millis.to_string(),
+        );
+    }
+    if let Some(api_key) = api_key_override {
+        values.insert("TEA_OPENAI_API_KEY".to_owned(), api_key.to_owned());
+    } else if let Some(api_key) = &provider.api_key {
+        values.insert(
+            "TEA_OPENAI_API_KEY".to_owned(),
+            value_resolver
+                .resolve(api_key)
+                .ok_or_else(|| credential("configured provider API key could not be resolved"))?,
+        );
+    }
+    Ok(())
 }
 
 /// Resolved OpenAI-compatible connection values ready for host-specific assembly.
@@ -457,6 +482,15 @@ fn custom_model_spec(
     if reasoning.is_some() {
         capabilities = capabilities.with_reasoning();
     }
+    if model.capabilities.final_json_object {
+        capabilities = capabilities.with_final_json_object();
+    }
+    if model.capabilities.final_json_schema {
+        capabilities = capabilities.with_final_json_schema();
+    }
+    if model.capabilities.final_json_schema_with_tools {
+        capabilities = capabilities.with_final_json_schema_with_tools();
+    }
     for hosted_tool in &model.capabilities.hosted_tools {
         capabilities = capabilities.with_hosted_tool(hosted_tool.kind());
     }
@@ -477,6 +511,22 @@ fn custom_model_spec(
         return Ok((spec, None));
     };
     Ok((spec.with_reasoning_profile(profile), Some(map)))
+}
+
+const fn compatibility_profile_name(profile: OpenAiCompatibilityProfile) -> &'static str {
+    match profile {
+        OpenAiCompatibilityProfile::OpenAi => "open-ai",
+        OpenAiCompatibilityProfile::AzureOpenAi => "azure-open-ai",
+        OpenAiCompatibilityProfile::Xai => "xai",
+        OpenAiCompatibilityProfile::DeepSeek => "deep-seek",
+        OpenAiCompatibilityProfile::GeminiOpenAi => "gemini-open-ai",
+        OpenAiCompatibilityProfile::OllamaLocal => "ollama-local",
+        OpenAiCompatibilityProfile::OpenRouter => "open-router",
+        OpenAiCompatibilityProfile::Groq => "groq",
+        OpenAiCompatibilityProfile::Mistral => "mistral",
+        OpenAiCompatibilityProfile::Together => "together",
+        OpenAiCompatibilityProfile::Vllm => "vllm",
+    }
 }
 
 fn custom_model_reasoning(

@@ -10,7 +10,9 @@ use tea_session::SessionName;
 use tokio::io::{AsyncRead, AsyncWrite};
 
 use super::reader::{RpcFrameReader, RpcReadError};
-use super::types::{RpcError, RpcErrorCode, RpcOutput, RpcRequest, RpcRequestKind, RpcResponse};
+use super::types::{
+    RpcError, RpcErrorCode, RpcOutput, RpcRequest, RpcRequestId, RpcRequestKind, RpcResponse,
+};
 use super::writer::{RpcLineWriter, RpcWriteError};
 use crate::args::{CliArgs, SessionSelection};
 use crate::session_views::{
@@ -39,6 +41,12 @@ struct HandledRequest {
     accepted: Option<CommandAcceptance>,
 }
 
+#[derive(serde::Deserialize)]
+struct RequestCorrelation {
+    #[serde(default)]
+    id: Option<RpcRequestId>,
+}
+
 /// Builds and owns a service for strict JSONL/RPC mode.
 ///
 /// # Errors
@@ -60,6 +68,11 @@ where
     if !args.prompt.is_empty() {
         return Err(CliFailure::usage(
             "RPC mode accepts prompts only through request frames",
+        ));
+    }
+    if args.output_format.is_some() || args.output_schema.is_some() {
+        return Err(CliFailure::usage(
+            "RPC structured output must be supplied in prompt request frames",
         ));
     }
     let (service, selection) = bootstrap.build_async(args).await?;
@@ -115,15 +128,15 @@ where
                         break;
                     }
                 };
-                let Ok(request) = serde_json::from_slice::<RpcRequest>(&frame) else {
-                    writer
-                        .write(&RpcOutput::error(
-                            None,
-                            RpcError::new(RpcErrorCode::ParseError, "request JSON is malformed"),
-                        ))
-                        .await
-                        .map_err(write_failure)?;
-                    continue;
+                let request = match decode_request(&frame) {
+                    Ok(request) => request,
+                    Err((request_id, error)) => {
+                        writer
+                            .write(&RpcOutput::error(request_id, error))
+                            .await
+                            .map_err(write_failure)?;
+                        continue;
+                    }
                 };
                 let request_id = request.id().cloned();
                 let request = match request.into_parts() {
@@ -224,6 +237,25 @@ where
     }
 }
 
+fn decode_request(frame: &[u8]) -> Result<RpcRequest, (Option<RpcRequestId>, RpcError)> {
+    serde_json::from_slice(frame).map_err(|_| {
+        if serde_json::from_slice::<serde::de::IgnoredAny>(frame).is_err() {
+            (
+                None,
+                RpcError::new(RpcErrorCode::ParseError, "request JSON is malformed"),
+            )
+        } else {
+            let request_id = serde_json::from_slice::<RequestCorrelation>(frame)
+                .ok()
+                .and_then(|correlation| correlation.id);
+            (
+                request_id,
+                RpcError::new(RpcErrorCode::InvalidRequest, "request fields are invalid"),
+            )
+        }
+    })
+}
+
 async fn wait_owned(
     service: &CodingAgentService,
     acceptance: CommandAcceptance,
@@ -286,8 +318,14 @@ async fn handle_request(
                 .map_err(RpcError::from)?;
             RpcResponse::CommandCompleted { session_id }
         }
-        RpcRequestKind::Prompt { text } => {
-            let acceptance = service.prompt(session_id, text).map_err(RpcError::from)?;
+        RpcRequestKind::Prompt {
+            text,
+            final_output_format,
+        } => {
+            let acceptance = service
+                .prompt(session_id, text, final_output_format)
+                .await
+                .map_err(RpcError::from)?;
             accepted = Some(acceptance);
             RpcResponse::CommandAccepted {
                 command_id: acceptance.command_id(),

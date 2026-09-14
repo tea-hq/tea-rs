@@ -104,7 +104,12 @@ impl RpcRequest {
 
 /// Supported command and host-query request families.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
-#[serde(tag = "type", content = "payload", rename_all = "snake_case")]
+#[serde(
+    tag = "type",
+    content = "payload",
+    rename_all = "snake_case",
+    deny_unknown_fields
+)]
 pub enum RpcRequestKind {
     /// Create and select a new durable session.
     NewSession {},
@@ -123,6 +128,9 @@ pub enum RpcRequestKind {
     Prompt {
         /// User text.
         text: String,
+        /// Optional run-scoped structured final-output contract.
+        #[serde(rename = "finalOutputFormat", default)]
+        final_output_format: Option<tea_protocol::FinalOutputFormat>,
     },
     /// Steer the active run.
     Steer {
@@ -213,6 +221,8 @@ pub enum RpcErrorCode {
     Persistence,
     /// Provider execution or selection failed.
     Provider,
+    /// A model response violated the normalized or requested output contract.
+    MalformedResponse,
     /// Work was cancelled.
     Cancelled,
     /// An internal boundary failed.
@@ -271,6 +281,7 @@ impl From<CodingError> for RpcError {
             | CodingErrorCode::ContextOverflow
             | CodingErrorCode::Unavailable
             | CodingErrorCode::Transport => RpcErrorCode::Provider,
+            CodingErrorCode::MalformedResponse => RpcErrorCode::MalformedResponse,
             CodingErrorCode::Cancelled => RpcErrorCode::Cancelled,
             CodingErrorCode::Runtime | CodingErrorCode::Internal => RpcErrorCode::Internal,
         };

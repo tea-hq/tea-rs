@@ -1,12 +1,12 @@
 use std::sync::Arc;
 use tea_control::CancellationScope;
-use tea_kernel::{AgentKernel, KernelRunConfig};
+use tea_kernel::{AgentKernel, KernelRunConfig, TurnRequestSnapshot, validate_new_run_state};
 use tea_model::ModelRouter;
 use tea_policy::{ApprovalResolution, GrantScope, PolicyGrant, ResourcePattern};
 use tea_protocol::{
     AgentCommand, AgentCommandType, ApprovalDecision, BranchId, CanonicalMessage, CommandEnvelope,
-    MessageId, ModelRef, ProfileId, ProtocolMetadata, ReasoningEffort, RecordEnvelope, RecordId,
-    SessionId, SessionRecord, SessionSequence,
+    FinalOutputFormat, MessageId, ModelRef, ProfileId, ProtocolMetadata, ReasoningEffort,
+    RecordEnvelope, RecordId, SessionId, SessionRecord, SessionSequence,
 };
 use tea_session::ApprovalArtifactEntry;
 
@@ -31,6 +31,14 @@ impl Drop for ActiveRunGuard<'_> {
         self.cancellation.cancel();
         self.runtime.clear_active_run(self.session_id);
     }
+}
+
+struct PreparedPrompt {
+    snapshot: tea_session::SessionSnapshot,
+    models: Arc<tea_model::ModelRegistry>,
+    binding: Arc<crate::ProfileBinding>,
+    active_tools: Arc<tea_tools::ToolRegistry>,
+    config: KernelRunConfig,
 }
 
 /// Terminal result of one dispatched command.
@@ -129,9 +137,16 @@ impl AgentRuntime {
                 self.set_profile(envelope.session_id(), profile_id.clone())
                     .await
             }
-            AgentCommand::Prompt { message } => {
-                self.handle_prompt(envelope.session_id(), message.clone())
-                    .await
+            AgentCommand::Prompt {
+                message,
+                final_output_format,
+            } => {
+                Box::pin(self.handle_prompt(
+                    envelope.session_id(),
+                    message.clone(),
+                    final_output_format.clone(),
+                ))
+                .await
             }
             AgentCommand::Steer { text } => {
                 self.handle_steer(envelope.session_id(), text.clone()).await
@@ -145,8 +160,12 @@ impl AgentRuntime {
                 approval_id,
                 decision,
             } => {
-                self.handle_resolve_approval(envelope.session_id(), *approval_id, *decision)
-                    .await
+                Box::pin(self.handle_resolve_approval(
+                    envelope.session_id(),
+                    *approval_id,
+                    *decision,
+                ))
+                .await
             }
             AgentCommand::CompactSession { instruction } => {
                 self.handle_compact(envelope.session_id(), instruction.as_ref())
@@ -478,6 +497,7 @@ impl AgentRuntime {
             )
         })?;
         let snapshot = self.load_snapshot(session_id).await?;
+        tea_kernel::validate_new_run_state(&snapshot).map_err(RuntimeError::from)?;
         if snapshot.state().messages().is_empty() {
             return Err(RuntimeError::new(
                 RuntimeErrorCode::InvalidRequest,
@@ -654,14 +674,83 @@ impl AgentRuntime {
         self.replace_active_tool_override(session_id, profile_id, names)
     }
 
+    /// Validates the exact prospective provider request for a new prompt.
+    ///
+    /// This performs prompt compilation, active-tool projection, model
+    /// capability checks, and provider-specific request validation without
+    /// committing the user message or starting provider transport. Hosts that
+    /// acknowledge work before awaiting [`Self::send`] should call this first.
+    /// The runtime repeats the validation when the command actually starts so
+    /// a concurrent configuration change cannot bypass the checks.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same pre-transport validation errors as a prompt dispatched
+    /// through [`Self::send`].
+    pub async fn preflight_prompt(
+        &self,
+        session_id: SessionId,
+        message: &CanonicalMessage,
+        final_output_format: Option<&FinalOutputFormat>,
+    ) -> Result<(), RuntimeError> {
+        self.prepare_prompt(session_id, message, final_output_format, None)
+            .await
+            .map(drop)
+    }
+
     async fn handle_prompt(
         &self,
         session_id: Option<SessionId>,
         message: CanonicalMessage,
+        final_output_format: Option<FinalOutputFormat>,
     ) -> Result<RuntimeCommandOutcome, RuntimeError> {
         let session_id = Self::require_session(session_id)?;
         let active_run = self.begin_active_run(session_id)?;
+        let run_id = self.ids.next_run_id().map_err(|error| {
+            RuntimeError::new(RuntimeErrorCode::InvalidState, error.message().to_owned())
+        })?;
+        let PreparedPrompt {
+            snapshot,
+            models,
+            binding,
+            active_tools,
+            config,
+        } = self
+            .prepare_prompt(
+                session_id,
+                &message,
+                final_output_format.as_ref(),
+                Some(run_id),
+            )
+            .await?;
+        self.append_user_message(session_id, snapshot.state().tail_sequence(), message)
+            .await?;
+        let outcome = self
+            .run_kernel(
+                session_id,
+                models,
+                binding.as_ref(),
+                active_tools.as_ref(),
+                &config,
+                active_run.cancellation(),
+            )
+            .await?;
+        Ok(RuntimeCommandOutcome::RunCompleted {
+            state: outcome.state(),
+            session: outcome.session().clone(),
+            pending_approval_id: outcome.pending_approval_id(),
+        })
+    }
+
+    async fn prepare_prompt(
+        &self,
+        session_id: SessionId,
+        message: &CanonicalMessage,
+        final_output_format: Option<&FinalOutputFormat>,
+        run_id: Option<tea_protocol::RunId>,
+    ) -> Result<PreparedPrompt, RuntimeError> {
         let snapshot = self.load_snapshot(session_id).await?;
+        validate_new_run_state(&snapshot)?;
         let models = self.model_registry();
         let model_ref = snapshot
             .state()
@@ -675,48 +764,63 @@ impl AgentRuntime {
             })?;
         let model = resolve_model(models.as_ref(), model_ref)?;
         let profile_id = snapshot.state().configuration().profile_id().clone();
-        let binding = self.binding(&profile_id).ok_or_else(|| {
+        let binding = Arc::clone(self.binding(&profile_id).ok_or_else(|| {
             RuntimeError::new(
                 RuntimeErrorCode::UnknownProfile,
                 format!("session profile {profile_id} is not registered"),
             )
-        })?;
-        let (active_tools, active_tool_specs) = self.active_tool_snapshot(session_id, binding)?;
+        })?);
+        let (active_tools, active_tool_specs) =
+            self.active_tool_snapshot(session_id, binding.as_ref())?;
         active_tools.model_definitions(model).map_err(|error| {
             RuntimeError::new(RuntimeErrorCode::InvalidRequest, error.to_string())
-        })?;
-        let run_id = self.ids.next_run_id().map_err(|error| {
-            RuntimeError::new(RuntimeErrorCode::InvalidState, error.message().to_owned())
         })?;
         let prompt = compile_prompt(
             &self.compiler,
             binding.context_providers(),
-            profile_id.clone(),
+            profile_id,
             session_id,
-            Some(run_id),
+            run_id,
             &active_tool_specs,
             ProtocolMetadata::default(),
             binding.prompt_budget(),
         )
         .await?;
-        self.record_prompt_inspection(session_id, Some(run_id), &prompt)?;
-        let config = self.build_run_config(binding, Some(prompt))?;
-        self.append_user_message(session_id, snapshot.state().tail_sequence(), message)
-            .await?;
-        let outcome = self
-            .run_kernel(
-                session_id,
-                models,
-                binding,
-                active_tools.as_ref(),
-                &config,
-                active_run.cancellation(),
+        if run_id.is_some() {
+            self.record_prompt_inspection(session_id, run_id, &prompt)?;
+        }
+        let config = self
+            .build_run_config(binding.as_ref(), Some(prompt))?
+            .with_final_output_format(final_output_format.cloned())
+            .map_err(|error| {
+                RuntimeError::new(RuntimeErrorCode::InvalidRequest, error.message().to_owned())
+            })?;
+        let prospective_request = TurnRequestSnapshot::build_with_pending_messages(
+            snapshot.state(),
+            std::slice::from_ref(message),
+            &config,
+            active_tools.as_ref(),
+            model,
+        )
+        .map_err(|error| {
+            RuntimeError::new(RuntimeErrorCode::InvalidRequest, error.message().to_owned())
+        })?;
+        let provider = models.provider(model_ref.provider_id()).ok_or_else(|| {
+            RuntimeError::new(
+                RuntimeErrorCode::UnknownProvider,
+                format!(
+                    "model provider {} is not registered",
+                    model_ref.provider_id()
+                ),
             )
-            .await?;
-        Ok(RuntimeCommandOutcome::RunCompleted {
-            state: outcome.state(),
-            session: outcome.session().clone(),
-            pending_approval_id: outcome.pending_approval_id(),
+        })?;
+        validate_provider_request(provider, prospective_request.request())?;
+        Ok(PreparedPrompt {
+            snapshot,
+            models,
+            binding,
+            active_tools,
+            config,
         })
     }
 
@@ -747,6 +851,7 @@ impl AgentRuntime {
         Ok(RuntimeCommandOutcome::Aborted { session_id })
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn handle_resolve_approval(
         &self,
         session_id: Option<SessionId>,
@@ -757,17 +862,6 @@ impl AgentRuntime {
         let active_run = self.begin_active_run(session_id)?;
         let snapshot = self.load_snapshot(session_id).await?;
         let models = self.model_registry();
-        let model_ref = snapshot
-            .state()
-            .configuration()
-            .model_ref()
-            .ok_or_else(|| {
-                RuntimeError::new(
-                    RuntimeErrorCode::UnknownModel,
-                    "session has no active model",
-                )
-            })?;
-        resolve_model(models.as_ref(), model_ref)?;
         let profile_id = snapshot.state().configuration().profile_id().clone();
         let binding = self.binding(&profile_id).ok_or_else(|| {
             RuntimeError::new(
@@ -783,13 +877,15 @@ impl AgentRuntime {
             }
             ApprovalArtifactEntry::Requested { .. } => false,
         });
-        let request = (!already_resolved)
+        let (request, final_output_format) = (!already_resolved)
             .then(|| {
                 approval_artifacts.iter().find_map(|entry| match entry {
-                    ApprovalArtifactEntry::Requested { request, .. }
-                        if request.approval_id() == &approval_id =>
-                    {
-                        Some(request.clone())
+                    ApprovalArtifactEntry::Requested {
+                        request,
+                        final_output_format,
+                        ..
+                    } if request.approval_id() == &approval_id => {
+                        Some((request.clone(), final_output_format.clone()))
                     }
                     ApprovalArtifactEntry::Requested { .. }
                     | ApprovalArtifactEntry::Resolved { .. } => None,
@@ -802,6 +898,61 @@ impl AgentRuntime {
                     "persisted approval request is missing or already resolved",
                 )
             })?;
+        let run_id = request.run_id().copied();
+        let prompt = compile_prompt(
+            &self.compiler,
+            binding.context_providers(),
+            profile_id.clone(),
+            session_id,
+            run_id,
+            &active_tool_specs,
+            ProtocolMetadata::default(),
+            binding.prompt_budget(),
+        )
+        .await?;
+        self.record_prompt_inspection(session_id, run_id, &prompt)?;
+        let preflight_required = decision != ApprovalDecision::Deny;
+        let config = self
+            .build_run_config(binding, Some(prompt))?
+            .with_final_output_format(if preflight_required {
+                final_output_format
+            } else {
+                None
+            })
+            .map_err(|error| {
+                RuntimeError::new(RuntimeErrorCode::InvalidRequest, error.message().to_owned())
+            })?;
+        if preflight_required {
+            let model_ref = snapshot
+                .state()
+                .configuration()
+                .model_ref()
+                .ok_or_else(|| {
+                    RuntimeError::new(
+                        RuntimeErrorCode::UnknownModel,
+                        "session has no active model",
+                    )
+                })?;
+            let model = resolve_model(models.as_ref(), model_ref)?;
+            let provider = models.provider(model_ref.provider_id()).ok_or_else(|| {
+                RuntimeError::new(
+                    RuntimeErrorCode::UnknownProvider,
+                    format!(
+                        "model provider {} is not registered",
+                        model_ref.provider_id()
+                    ),
+                )
+            })?;
+            let prospective_request =
+                TurnRequestSnapshot::build(snapshot.state(), &config, active_tools.as_ref(), model)
+                    .map_err(|error| {
+                        RuntimeError::new(
+                            RuntimeErrorCode::InvalidRequest,
+                            error.message().to_owned(),
+                        )
+                    })?;
+            validate_provider_request(provider, prospective_request.request())?;
+        }
         let decided_at = self.clock_now()?;
         let issued_grant = if decision == ApprovalDecision::AllowSession {
             let grant_id = self.ids.next_grant_id().map_err(|error| {
@@ -815,20 +966,6 @@ impl AgentRuntime {
             .map_err(|error| {
                 RuntimeError::new(RuntimeErrorCode::PolicyFailure, error.to_string())
             })?;
-        let run_id = resolution.request().run_id().copied();
-        let prompt = compile_prompt(
-            &self.compiler,
-            binding.context_providers(),
-            profile_id.clone(),
-            session_id,
-            run_id,
-            &active_tool_specs,
-            ProtocolMetadata::default(),
-            binding.prompt_budget(),
-        )
-        .await?;
-        self.record_prompt_inspection(session_id, run_id, &prompt)?;
-        let config = self.build_run_config(binding, Some(prompt))?;
         let outcome = self
             .resume_kernel(
                 session_id,
@@ -1024,6 +1161,20 @@ impl AgentRuntime {
             runs.remove(&session_id);
         }
     }
+}
+
+fn validate_provider_request(
+    provider: &dyn tea_model::ModelProvider,
+    request: &tea_model::ModelRequest,
+) -> Result<(), RuntimeError> {
+    provider.validate_request(request).map_err(|failure| {
+        let code = if failure.code() == tea_model::ModelFailureCode::InvalidRequest {
+            RuntimeErrorCode::InvalidRequest
+        } else {
+            RuntimeErrorCode::ProviderFailure
+        };
+        RuntimeError::new(code, failure.message().to_owned())
+    })
 }
 
 fn session_grant(

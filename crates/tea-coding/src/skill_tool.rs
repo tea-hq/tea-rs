@@ -251,6 +251,7 @@ fn coding_error_code(code: crate::CodingErrorCode) -> &'static str {
         crate::CodingErrorCode::Unavailable => "unavailable",
         crate::CodingErrorCode::Transport => "transport",
         crate::CodingErrorCode::InvalidRequest => "invalid_request",
+        crate::CodingErrorCode::MalformedResponse => "malformed_response",
         crate::CodingErrorCode::PolicyDenied => "policy_denied",
         crate::CodingErrorCode::Cancelled => "cancelled",
         crate::CodingErrorCode::Runtime => "runtime",

@@ -338,7 +338,9 @@ async fn configured_mcp_tool_is_approved_audited_and_never_replayed_after_reopen
         .prompt(
             session_id,
             "Call the configured MCP tool with the scripted arguments.",
+            None,
         )
+        .await
         .unwrap();
     let approval = match service.wait(session_id).await.unwrap() {
         RuntimeCommandOutcome::RunCompleted {

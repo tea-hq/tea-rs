@@ -10,19 +10,23 @@ use tea_kernel::{
     AgentKernel, KernelClock, KernelDeadlineFuture, KernelError, KernelErrorCode,
     KernelEventFuture, KernelEventSink, KernelRunConfig, ModelRetryPolicy, RunState,
 };
-use tea_model::{ModelEvent, ModelFailure, ModelFailureCode, ModelResponseInfo, Utf8Delta};
+use tea_model::{
+    ModelCapabilities, ModelEvent, ModelFailure, ModelFailureCode, ModelResponseInfo, Utf8Delta,
+};
 use tea_policy::{
     ActorId, CodingWorkspacePolicy, ExecutionSurface, PolicyEngine, PolicyEnvironment,
     PolicyExecutionTarget,
 };
 use tea_protocol::{
-    AgentEvent, EventEnvelope, ProtocolMetadata, ProtocolTimestamp, RetryClass, RunStatus,
-    SessionId, SessionSequence,
+    AgentEvent, EventEnvelope, FinalOutputFormat, ProtocolMetadata, ProtocolTimestamp, RetryClass,
+    RunStatus, SessionId, SessionSequence,
 };
 use tea_testkit::ScriptedModelResponse;
 use tea_tools::ToolRegistry;
 
-use common::{EventCollector, TestIds, provider, session_id, store, timestamp};
+use common::{
+    EventCollector, TestIds, provider, provider_with_capabilities, session_id, store, timestamp,
+};
 use tea_session::SessionStore;
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -165,6 +169,55 @@ async fn retryable_failure_then_success_completes() {
     assert_eq!(retry_events[0].4, Some(1));
     assert_eq!(retry_events[1].0, "started");
     assert_eq!(retry_events[1].1, retry_events[0].1);
+}
+
+#[tokio::test]
+async fn retry_preserves_the_frozen_final_output_format() {
+    let format = FinalOutputFormat::JsonSchema {
+        schema: serde_json::json!({
+            "type": "object",
+            "properties": {"answer": {"type": "string"}},
+            "required": ["answer"],
+            "additionalProperties": false
+        }),
+    };
+    let provider = provider_with_capabilities(
+        [
+            ScriptedModelResponse::failure(ModelFailureCode::Unavailable, "transient"),
+            ScriptedModelResponse::text([r#"{"answer":"recovered"}"#]),
+        ],
+        ModelCapabilities::text().with_final_json_schema(),
+    );
+    let store = store().await;
+    let tools = ToolRegistry::new();
+    let mut policy = PolicyEngine::new();
+    policy.add_rule(CodingWorkspacePolicy).unwrap();
+    let events = EventCollector::default();
+    let config = config_with_retries(3)
+        .with_final_output_format(Some(format.clone()))
+        .unwrap();
+
+    let outcome = AgentKernel::new(
+        &provider,
+        &tools,
+        &policy,
+        &store,
+        &RealSleepClock,
+        &TestIds::default(),
+        &events,
+    )
+    .run(session_id(), &config, tea_control::CancellationScope::new())
+    .await
+    .unwrap();
+
+    assert_eq!(outcome.state(), RunState::Completed);
+    let requests = provider.captured_requests().unwrap();
+    assert_eq!(requests.len(), 2);
+    assert!(
+        requests
+            .iter()
+            .all(|request| request.final_output_format() == Some(&format))
+    );
 }
 
 #[tokio::test]

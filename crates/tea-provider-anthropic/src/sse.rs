@@ -66,9 +66,18 @@ impl SseParser {
 
     /// Flushes a trailing event at the end of the byte stream.
     pub fn finish(&mut self) -> Vec<SseEvent> {
-        self.pending
-            .take()
-            .map_or_else(Vec::new, |data| vec![Self::classify(&data)])
+        let mut events = Vec::new();
+        if !self.buffer.is_empty() {
+            let mut line = std::mem::take(&mut self.buffer);
+            if line.last() == Some(&b'\r') {
+                line.pop();
+            }
+            self.process_line(&String::from_utf8_lossy(&line), &mut events);
+        }
+        if let Some(data) = self.pending.take() {
+            events.push(Self::classify(&data));
+        }
+        events
     }
 
     fn process_line(&mut self, line: &str, events: &mut Vec<SseEvent>) {
@@ -119,6 +128,28 @@ mod tests {
         assert_eq!(
             events,
             vec![SseEvent::Data("{\"type\":\"message_start\"}".to_owned())]
+        );
+    }
+
+    #[test]
+    fn finish_flushes_an_unterminated_data_line() {
+        let mut parser = SseParser::new();
+        assert!(parser.feed(b"data: {\"type\":\"message_stop\"}").is_empty());
+
+        assert_eq!(
+            parser.finish(),
+            vec![SseEvent::Data("{\"type\":\"message_stop\"}".to_owned())]
+        );
+    }
+
+    #[test]
+    fn finish_combines_pending_and_unterminated_data_lines() {
+        let mut parser = SseParser::new();
+        assert!(parser.feed(b"data: first\ndata: second").is_empty());
+
+        assert_eq!(
+            parser.finish(),
+            vec![SseEvent::Data("first\nsecond".to_owned())]
         );
     }
 

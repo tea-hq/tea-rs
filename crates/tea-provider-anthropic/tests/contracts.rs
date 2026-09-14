@@ -40,16 +40,83 @@ fn credential_contract_is_bounded_redacted_and_configured() {
         DEFAULT_WEB_SEARCH_TOOL_TYPE
     );
     assert_eq!(config.web_search().max_uses(), DEFAULT_WEB_SEARCH_MAX_USES);
+    assert!(!config.supports_final_json_schema());
     assert!(
         default_catalog(&config).unwrap()[0]
             .capabilities()
             .supports_hosted_tool(HostedToolKind::WebSearch)
+    );
+    assert!(
+        !default_catalog(&config).unwrap()[0]
+            .capabilities()
+            .supports_final_json_schema()
+    );
+    assert!(
+        !default_catalog(&config).unwrap()[0]
+            .capabilities()
+            .supports_final_json_schema_with_tools()
     );
 
     let error = MapCredentialResolver::new(BTreeMap::new())
         .resolve()
         .unwrap_err();
     assert_eq!(error.code(), AnthropicErrorCode::Authentication);
+}
+
+#[test]
+fn final_json_schema_capability_requires_explicit_model_endpoint_opt_in() {
+    for value in ["1", "true", "TRUE"] {
+        let config = MapCredentialResolver::new(env_map(&[
+            ("TEA_ANTHROPIC_API_KEY", "sk-ant-test"),
+            ("TEA_ANTHROPIC_MODEL", "claude-sonnet-4-20250514"),
+            ("TEA_ANTHROPIC_BASE_URL", "https://api.anthropic.com"),
+            ("TEA_ANTHROPIC_FINAL_JSON_SCHEMA", value),
+        ]))
+        .resolve()
+        .unwrap();
+
+        assert!(config.supports_final_json_schema());
+        assert!(
+            default_catalog(&config).unwrap()[0]
+                .capabilities()
+                .supports_final_json_schema()
+        );
+        assert!(
+            default_catalog(&config).unwrap()[0]
+                .capabilities()
+                .supports_final_json_schema_with_tools()
+        );
+    }
+
+    for value in [None, Some("0"), Some("false"), Some("yes")] {
+        let mut values = env_map(&[
+            ("TEA_ANTHROPIC_API_KEY", "sk-ant-test"),
+            ("TEA_ANTHROPIC_MODEL", "deepseek-chat"),
+            (
+                "TEA_ANTHROPIC_BASE_URL",
+                "https://api.deepseek.example/anthropic",
+            ),
+        ]);
+        if let Some(value) = value {
+            values.insert(
+                "TEA_ANTHROPIC_FINAL_JSON_SCHEMA".to_owned(),
+                value.to_owned(),
+            );
+        }
+        let config = MapCredentialResolver::new(values).resolve().unwrap();
+
+        assert!(!config.supports_final_json_schema());
+        assert!(
+            !default_catalog(&config).unwrap()[0]
+                .capabilities()
+                .supports_final_json_schema()
+        );
+        assert!(
+            !default_catalog(&config).unwrap()[0]
+                .capabilities()
+                .supports_final_json_schema_with_tools()
+        );
+    }
 }
 
 #[test]

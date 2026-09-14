@@ -11,18 +11,18 @@ use tea_kernel::{
 };
 use tea_model::{
     HostedToolCompleted, HostedToolKind, HostedToolOptions, HostedToolStarted, ModelCapabilities,
-    ModelCompletion, ModelDisplayName, ModelEvent, ModelResponseInfo, ModelSourceCitation,
-    ModelSpec, ModelStreamIndex, ProviderId, ProviderToolCallId, ToolCallStarted, Utf8Delta,
-    WebSearchOptions,
+    ModelCompletion, ModelDisplayName, ModelEvent, ModelFailureCode, ModelResponseInfo,
+    ModelSourceCitation, ModelSpec, ModelStreamIndex, ProviderId, ProviderToolCallId,
+    ToolCallStarted, Utf8Delta, WebSearchOptions,
 };
 use tea_policy::{
     ActorId, ExecutionSurface, GrantId, PolicyEngine, PolicyEnvironment, PolicyExecutionTarget,
 };
 use tea_protocol::{
     AgentEventType, ApprovalId, CanonicalMessage, ContentBlock, EventEnvelope, EventId,
-    ExternalSource, HostedToolOutcome, MessageId, ModelId, ProfileId, ProtocolMetadata,
-    ProtocolTimestamp, ProviderContinuation, RecordEnvelope, RecordId, RunId, SessionId,
-    SessionRecord, SessionSequence, SourceCitation, StopReason, TokenCount, ToolCallId,
+    ExternalSource, FinalOutputFormat, HostedToolOutcome, MessageId, ModelId, ProfileId,
+    ProtocolMetadata, ProtocolTimestamp, ProviderContinuation, RecordEnvelope, RecordId, RunId,
+    SessionId, SessionRecord, SessionSequence, SourceCitation, StopReason, TokenCount, ToolCallId,
     ToolIdempotency, TurnId,
 };
 use tea_session::{AppendTransaction, InMemorySessionStore, SessionStore};
@@ -267,6 +267,283 @@ fn config() -> KernelRunConfig {
     )
 }
 
+async fn run_with_final_output(
+    format: FinalOutputFormat,
+    text: &str,
+) -> (
+    Result<tea_kernel::KernelRunOutcome, KernelError>,
+    InMemorySessionStore,
+) {
+    let capabilities = match &format {
+        FinalOutputFormat::JsonObject => ModelCapabilities::text().with_final_json_object(),
+        FinalOutputFormat::JsonSchema { .. } => ModelCapabilities::text().with_final_json_schema(),
+    };
+    let tools = ToolRegistry::new();
+    run_final_output_script(
+        format,
+        ScriptedModelResponse::text([text]),
+        capabilities,
+        &tools,
+    )
+    .await
+}
+
+async fn run_final_output_script(
+    format: FinalOutputFormat,
+    script: ScriptedModelResponse,
+    capabilities: ModelCapabilities,
+    tools: &ToolRegistry,
+) -> (
+    Result<tea_kernel::KernelRunOutcome, KernelError>,
+    InMemorySessionStore,
+) {
+    let provider = provider_with_capabilities(script, capabilities);
+    let store = store().await;
+    let events = EventCollector::default();
+    let ids = DeterministicIds::default();
+    let policy = PolicyEngine::new();
+    let run_config = config().with_final_output_format(Some(format)).unwrap();
+    let outcome = AgentKernel::new(
+        &provider,
+        tools,
+        &policy,
+        &store,
+        &FixedClock,
+        &ids,
+        &events,
+    )
+    .run(
+        SessionId::from_str(SESSION).unwrap(),
+        &run_config,
+        CancellationScope::new(),
+    )
+    .await;
+    (outcome, store)
+}
+
+async fn assert_structured_output_rejected(
+    outcome: Result<tea_kernel::KernelRunOutcome, KernelError>,
+    store: &InMemorySessionStore,
+    expected_message: &str,
+) {
+    let error = outcome.unwrap_err();
+    assert_eq!(error.code(), KernelErrorCode::ModelFailure);
+    assert_eq!(
+        error.model_failure_code(),
+        Some(ModelFailureCode::MalformedResponse)
+    );
+    assert_eq!(error.message(), expected_message);
+    let snapshot = store
+        .load(SessionId::from_str(SESSION).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(snapshot.state().messages().len(), 1);
+    assert!(!snapshot.records().iter().any(|record| matches!(
+        record.record(),
+        SessionRecord::MessageCommitted {
+            message: CanonicalMessage::Assistant { .. }
+        }
+    )));
+    assert!(matches!(
+        snapshot.records().last().unwrap().record(),
+        SessionRecord::RunInterrupted { .. }
+    ));
+}
+
+#[tokio::test]
+async fn json_object_final_output_is_committed_after_validation() {
+    let (outcome, store) =
+        run_with_final_output(FinalOutputFormat::JsonObject, r#"{"answer":"ok"}"#).await;
+
+    assert_eq!(outcome.unwrap().state(), RunState::Completed);
+    assert_eq!(
+        store
+            .load(SessionId::from_str(SESSION).unwrap())
+            .await
+            .unwrap()
+            .state()
+            .messages()
+            .len(),
+        2
+    );
+}
+
+#[tokio::test]
+async fn json_schema_output_uses_the_run_output_budget_instead_of_tool_value_bounds() {
+    let text = format!(r#"{{"payload":"{}"}}"#, "x".repeat(300 * 1024));
+    let script = ScriptedModelResponse::text(
+        text.as_bytes()
+            .chunks(60 * 1024)
+            .map(|chunk| String::from_utf8(chunk.to_vec()).unwrap()),
+    );
+    let format = FinalOutputFormat::JsonSchema {
+        schema: json!({
+            "type": "object",
+            "properties": {"payload": {"type": "string"}},
+            "required": ["payload"],
+            "additionalProperties": false
+        }),
+    };
+    let tools = ToolRegistry::new();
+
+    let (outcome, store) = run_final_output_script(
+        format,
+        script,
+        ModelCapabilities::text().with_final_json_schema(),
+        &tools,
+    )
+    .await;
+
+    assert_eq!(outcome.unwrap().state(), RunState::Completed);
+    let snapshot = store
+        .load(SessionId::from_str(SESSION).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(snapshot.state().messages().len(), 2);
+}
+
+#[tokio::test]
+async fn json_schema_output_does_not_inherit_the_tool_value_depth_limit() {
+    let text = format!("{}null{}", "{\"next\":".repeat(40), "}".repeat(40));
+    let tools = ToolRegistry::new();
+
+    let (outcome, _) = run_final_output_script(
+        FinalOutputFormat::JsonSchema { schema: json!({}) },
+        ScriptedModelResponse::text([text]),
+        ModelCapabilities::text().with_final_json_schema(),
+        &tools,
+    )
+    .await;
+
+    assert_eq!(outcome.unwrap().state(), RunState::Completed);
+}
+
+#[tokio::test]
+async fn json_object_array_is_rejected_before_assistant_commit() {
+    let (outcome, store) = run_with_final_output(FinalOutputFormat::JsonObject, "[]").await;
+
+    assert_structured_output_rejected(outcome, &store, "structured output is not a JSON object")
+        .await;
+}
+
+#[tokio::test]
+async fn malformed_json_is_rejected_before_assistant_commit() {
+    let (outcome, store) = run_with_final_output(FinalOutputFormat::JsonObject, "{").await;
+
+    assert_structured_output_rejected(outcome, &store, "structured output is not valid JSON").await;
+}
+
+#[tokio::test]
+async fn json_schema_mismatch_is_rejected_before_assistant_commit() {
+    let format = FinalOutputFormat::JsonSchema {
+        schema: json!({
+            "type": "object",
+            "properties": {"answer": {"type": "string"}},
+            "required": ["answer"],
+            "additionalProperties": false
+        }),
+    };
+    let (outcome, store) = run_with_final_output(format, r#"{"answer":7}"#).await;
+
+    assert_structured_output_rejected(
+        outcome,
+        &store,
+        "structured output violates its JSON Schema",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn refusal_and_length_are_rejected_before_assistant_commit() {
+    for stop_reason in [StopReason::Refusal, StopReason::Length] {
+        let script = ScriptedModelResponse::events([
+            ModelEvent::Started(ModelResponseInfo::new()),
+            ModelEvent::TextDelta(Utf8Delta::new(r#"{"answer":"partial"}"#).unwrap()),
+            ModelEvent::Completed(ModelCompletion::new(stop_reason).unwrap()),
+        ]);
+        let tools = ToolRegistry::new();
+        let (outcome, store) = run_final_output_script(
+            FinalOutputFormat::JsonObject,
+            script,
+            ModelCapabilities::text().with_final_json_object(),
+            &tools,
+        )
+        .await;
+
+        assert_structured_output_rejected(
+            outcome,
+            &store,
+            "structured output did not complete normally",
+        )
+        .await;
+    }
+}
+
+#[tokio::test]
+async fn thinking_and_multiple_text_blocks_form_one_json_value() {
+    let script = ScriptedModelResponse::events([
+        ModelEvent::Started(ModelResponseInfo::new()),
+        ModelEvent::TextDelta(Utf8Delta::new("{\"answer\":\"").unwrap()),
+        ModelEvent::ThinkingDelta(Utf8Delta::new("checking schema").unwrap()),
+        ModelEvent::TextDelta(Utf8Delta::new("ok\"}").unwrap()),
+        ModelEvent::Completed(ModelCompletion::completed()),
+    ]);
+    let tools = ToolRegistry::new();
+    let (outcome, store) = run_final_output_script(
+        FinalOutputFormat::JsonObject,
+        script,
+        ModelCapabilities::text().with_final_json_object(),
+        &tools,
+    )
+    .await;
+
+    assert_eq!(outcome.unwrap().state(), RunState::Completed);
+    let snapshot = store
+        .load(SessionId::from_str(SESSION).unwrap())
+        .await
+        .unwrap();
+    let CanonicalMessage::Assistant { content, .. } = &snapshot.state().messages()[1] else {
+        panic!("expected assistant message")
+    };
+    assert!(matches!(
+        content.as_slice(),
+        [
+            ContentBlock::Text { text: first },
+            ContentBlock::Thinking { .. },
+            ContentBlock::Text { text: second }
+        ] if first == "{\"answer\":\"" && second == "ok\"}"
+    ));
+}
+
+#[tokio::test]
+async fn hosted_tool_activity_and_citations_do_not_invalidate_structured_json() {
+    let tools = hosted_tools();
+    let (outcome, store) = run_final_output_script(
+        FinalOutputFormat::JsonObject,
+        hosted_search_response_with_text(r#"{"answer":"Cited answer"}"#),
+        ModelCapabilities::text()
+            .with_final_json_object()
+            .with_hosted_tool(HostedToolKind::WebSearch),
+        &tools,
+    )
+    .await;
+
+    assert_eq!(outcome.unwrap().state(), RunState::Completed);
+    let snapshot = store
+        .load(SessionId::from_str(SESSION).unwrap())
+        .await
+        .unwrap();
+    let CanonicalMessage::Assistant { content, .. } = &snapshot.state().messages()[1] else {
+        panic!("expected assistant message");
+    };
+    assert!(matches!(content[0], ContentBlock::HostedTool { .. }));
+    assert!(matches!(
+        &content[1],
+        ContentBlock::Text { text } if text == r#"{"answer":"Cited answer"}"#
+    ));
+    assert!(matches!(content[2], ContentBlock::Citation { .. }));
+}
+
 #[tokio::test]
 async fn model_only_turn_streams_then_commits_message_and_checkpoint() {
     let provider = provider(ScriptedModelResponse::events([
@@ -430,6 +707,10 @@ async fn unprojected_hosted_activity_is_rejected_before_observation_or_commit() 
 }
 
 fn hosted_search_response() -> ScriptedModelResponse {
+    hosted_search_response_with_text("Cited answer")
+}
+
+fn hosted_search_response_with_text(text: &str) -> ScriptedModelResponse {
     let index = ModelStreamIndex::new(0).unwrap();
     let provider_call_id = ProviderToolCallId::from_str("ws_123").unwrap();
     let source = ExternalSource::new("https://example.com/result")
@@ -459,7 +740,7 @@ fn hosted_search_response() -> ScriptedModelResponse {
             )
             .unwrap(),
         ),
-        ModelEvent::TextDelta(Utf8Delta::new("Cited answer").unwrap()),
+        ModelEvent::TextDelta(Utf8Delta::new(text).unwrap()),
         ModelEvent::SourceCitation(
             ModelSourceCitation::new(
                 Some(provider_call_id),

@@ -11,6 +11,7 @@ use tea_protocol::{
     ToolCallId,
 };
 use tea_provider_anthropic::{
+    AnthropicErrorCode,
     credential::{CredentialResolver, MapCredentialResolver},
     request::{build_messages_body, messages_url, request_headers},
 };
@@ -42,6 +43,22 @@ fn configured_web_search() -> tea_provider_anthropic::AnthropicConfig {
             ("TEA_ANTHROPIC_BASE_URL", "https://api.example.test"),
             ("TEA_ANTHROPIC_WEB_SEARCH_TOOL_TYPE", "web_search_20260101"),
             ("TEA_ANTHROPIC_WEB_SEARCH_MAX_USES", "7"),
+        ]
+        .into_iter()
+        .map(|(key, value)| (key.to_owned(), value.to_owned()))
+        .collect::<BTreeMap<_, _>>(),
+    )
+    .resolve()
+    .unwrap()
+}
+
+fn structured_output_config() -> tea_provider_anthropic::AnthropicConfig {
+    MapCredentialResolver::new(
+        [
+            ("TEA_ANTHROPIC_API_KEY", "sk-ant-test"),
+            ("TEA_ANTHROPIC_MODEL", "claude-sonnet-4-20250514"),
+            ("TEA_ANTHROPIC_BASE_URL", "https://api.example.test"),
+            ("TEA_ANTHROPIC_FINAL_JSON_SCHEMA", "true"),
         ]
         .into_iter()
         .map(|(key, value)| (key.to_owned(), value.to_owned()))
@@ -83,6 +100,205 @@ fn web_search(options: WebSearchOptions) -> ModelToolDefinition {
         HostedToolOptions::WebSearch(options),
     )
     .unwrap()
+}
+
+fn structured_output_schema() -> serde_json::Value {
+    json!({
+        "type": "object",
+        "properties": {"answer": {"type": "string"}},
+        "required": ["answer"],
+        "additionalProperties": false
+    })
+}
+
+#[test]
+fn structured_output_maps_native_anthropic_json_schema_exactly() {
+    let schema = structured_output_schema();
+    let request = ModelRequest::new(
+        ModelId::from_str("claude-sonnet-4-20250514").unwrap(),
+        vec![user("answer as JSON")],
+    )
+    .unwrap()
+    .with_final_output_format(tea_protocol::FinalOutputFormat::JsonSchema {
+        schema: schema.clone(),
+    });
+
+    let body = build_messages_body(&request, &structured_output_config()).unwrap();
+
+    assert_eq!(
+        body["output_config"],
+        json!({
+            "format": {
+                "type": "json_schema",
+                "schema": schema
+            }
+        })
+    );
+    let encoded = serde_json::to_string(&body["output_config"]).unwrap();
+    assert!(!encoded.contains("strict"));
+    assert!(!encoded.contains("name"));
+}
+
+#[test]
+fn structured_output_maps_json_schema_with_function_tool_exactly() {
+    let schema = structured_output_schema();
+    let tool_schema = json!({
+        "type": "object",
+        "properties": {"query": {"type": "string"}},
+        "required": ["query"],
+        "additionalProperties": false
+    });
+    let request = ModelRequest::new(
+        ModelId::from_str("claude-sonnet-4-20250514").unwrap(),
+        vec![user("answer as JSON")],
+    )
+    .unwrap()
+    .with_tools(
+        vec![ModelToolDefinition::new("lookup", "Looks up a value.", tool_schema.clone()).unwrap()],
+        false,
+    )
+    .unwrap()
+    .with_final_output_format(tea_protocol::FinalOutputFormat::JsonSchema {
+        schema: schema.clone(),
+    });
+
+    let body = build_messages_body(&request, &structured_output_config()).unwrap();
+
+    assert_eq!(
+        body["output_config"],
+        json!({"format": {"type": "json_schema", "schema": schema}})
+    );
+    assert_eq!(
+        body["tools"],
+        json!([{
+            "name": "lookup",
+            "description": "Looks up a value.",
+            "input_schema": tool_schema
+        }])
+    );
+}
+
+#[test]
+fn structured_output_anthropic_rejects_json_object_before_transport() {
+    let request = ModelRequest::new(
+        ModelId::from_str("claude-sonnet-4-20250514").unwrap(),
+        vec![user("answer as JSON")],
+    )
+    .unwrap()
+    .with_final_output_format(tea_protocol::FinalOutputFormat::JsonObject);
+
+    let error = build_messages_body(&request, &structured_output_config()).unwrap_err();
+
+    assert_eq!(error.code(), AnthropicErrorCode::InvalidRequest);
+}
+
+#[test]
+fn structured_output_requires_explicit_model_endpoint_opt_in() {
+    let request = ModelRequest::new(
+        ModelId::from_str("claude-sonnet-4-20250514").unwrap(),
+        vec![user("answer as JSON")],
+    )
+    .unwrap()
+    .with_final_output_format(tea_protocol::FinalOutputFormat::JsonSchema {
+        schema: structured_output_schema(),
+    });
+
+    let error = build_messages_body(&request, &config()).unwrap_err();
+
+    assert_eq!(error.code(), AnthropicErrorCode::InvalidRequest);
+}
+
+#[test]
+fn structured_output_rejects_invalid_schema_before_transport() {
+    let request = ModelRequest::new(
+        ModelId::from_str("claude-sonnet-4-20250514").unwrap(),
+        vec![user("answer as JSON")],
+    )
+    .unwrap()
+    .with_final_output_format(tea_protocol::FinalOutputFormat::JsonSchema {
+        schema: json!({"type": 7}),
+    });
+
+    let error = build_messages_body(&request, &structured_output_config()).unwrap_err();
+
+    assert_eq!(error.code(), AnthropicErrorCode::InvalidRequest);
+}
+
+#[test]
+fn structured_output_rejects_assistant_prefill_before_transport() {
+    let prefill = CanonicalMessage::assistant(
+        MessageId::from_str("0195a0b1-5e53-74b2-8c25-0aa7aa000029").unwrap(),
+        vec![ContentBlock::text("{").unwrap()],
+        StopReason::Completed,
+        now(),
+    )
+    .unwrap();
+    let request = ModelRequest::new(
+        ModelId::from_str("claude-sonnet-4-20250514").unwrap(),
+        vec![user("answer as JSON"), prefill],
+    )
+    .unwrap()
+    .with_final_output_format(tea_protocol::FinalOutputFormat::JsonSchema {
+        schema: structured_output_schema(),
+    });
+
+    let error = build_messages_body(&request, &structured_output_config()).unwrap_err();
+
+    assert_eq!(error.code(), AnthropicErrorCode::InvalidRequest);
+}
+
+#[test]
+fn structured_output_rejects_web_search_citations_before_transport() {
+    let request = ModelRequest::new(
+        ModelId::from_str("claude-sonnet-4-20250514").unwrap(),
+        vec![user("search and answer as JSON")],
+    )
+    .unwrap()
+    .with_tools(vec![web_search(WebSearchOptions::new())], false)
+    .unwrap()
+    .with_final_output_format(tea_protocol::FinalOutputFormat::JsonSchema {
+        schema: structured_output_schema(),
+    });
+
+    let error = build_messages_body(&request, &structured_output_config()).unwrap_err();
+
+    assert_eq!(error.code(), AnthropicErrorCode::InvalidRequest);
+    assert_eq!(
+        error.message(),
+        "Anthropic final JSON Schema output does not support web search citations"
+    );
+}
+
+#[test]
+fn structured_output_rejects_citation_content_before_transport() {
+    let citation =
+        SourceCitation::new(ExternalSource::new("https://example.com/structured-output").unwrap());
+    let assistant = CanonicalMessage::assistant(
+        MessageId::from_str("0195a0b1-5e53-74b2-8c25-0aa7aa000098").unwrap(),
+        vec![
+            ContentBlock::text("Prior cited answer.").unwrap(),
+            ContentBlock::citation(citation),
+        ],
+        StopReason::Completed,
+        now(),
+    )
+    .unwrap();
+    let request = ModelRequest::new(
+        ModelId::from_str("claude-sonnet-4-20250514").unwrap(),
+        vec![assistant, user("answer as JSON")],
+    )
+    .unwrap()
+    .with_final_output_format(tea_protocol::FinalOutputFormat::JsonSchema {
+        schema: structured_output_schema(),
+    });
+
+    let error = build_messages_body(&request, &structured_output_config()).unwrap_err();
+
+    assert_eq!(error.code(), AnthropicErrorCode::InvalidRequest);
+    assert_eq!(
+        error.message(),
+        "Anthropic final JSON Schema output does not support citation content"
+    );
 }
 
 #[test]
@@ -151,6 +367,7 @@ fn maps_messages_tools_and_results_to_anthropic_shape() {
         provider_call_id
     );
     assert_eq!(body["tools"][0]["input_schema"]["type"], "object");
+    assert!(body.get("output_config").is_none());
 }
 
 #[test]
@@ -280,6 +497,11 @@ fn endpoint_and_headers_use_messages_contract() {
         headers
             .iter()
             .any(|(key, value)| key == "anthropic-version" && value == "2023-06-01")
+    );
+    assert!(
+        headers
+            .iter()
+            .all(|(key, _)| !key.eq_ignore_ascii_case("anthropic-beta"))
     );
 }
 

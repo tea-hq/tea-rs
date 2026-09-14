@@ -100,6 +100,21 @@ impl KernelError {
         error
     }
 
+    pub(crate) fn provider_validation(failure: &ModelFailure) -> Self {
+        let mut error = Self::model_failure(failure, false);
+        if failure.code() == ModelFailureCode::InvalidRequest {
+            error.code = KernelErrorCode::InvalidRequest;
+        }
+        error
+    }
+
+    pub(crate) fn malformed_response(message: &'static str) -> Self {
+        let mut error = Self::new(KernelErrorCode::ModelFailure, message);
+        error.model_failure_code = Some(ModelFailureCode::MalformedResponse);
+        error.safe_diagnostic = true;
+        error
+    }
+
     /// Returns the stable machine-readable code.
     #[must_use]
     pub const fn code(&self) -> KernelErrorCode {
