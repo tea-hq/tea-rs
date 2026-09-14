@@ -48,6 +48,16 @@ impl CompiledToolSchema {
     /// Returns bounded deterministic diagnostics or a value-bounds failure.
     pub fn validate(&self, value: &Value) -> Result<(), SchemaValidationFailure> {
         validate_json_bounds(value).map_err(|()| SchemaValidationFailure::ValueOutOfBounds)?;
+        self.validate_prebounded(value)
+    }
+
+    /// Validates a JSON value after the caller has enforced its own resource
+    /// bounds.
+    ///
+    /// # Errors
+    ///
+    /// Returns bounded deterministic diagnostics for schema violations.
+    pub fn validate_prebounded(&self, value: &Value) -> Result<(), SchemaValidationFailure> {
         let mut errors = self
             .validator
             .iter_errors(value)
@@ -63,6 +73,7 @@ impl CompiledToolSchema {
                     message,
                 }
             })
+            .take(MAX_SCHEMA_ERRORS)
             .collect::<Vec<_>>();
         errors.sort_by(|left, right| {
             (
@@ -76,7 +87,6 @@ impl CompiledToolSchema {
                     right.message.as_str(),
                 ))
         });
-        errors.truncate(MAX_SCHEMA_ERRORS);
         if errors.is_empty() {
             Ok(())
         } else {
@@ -175,8 +185,8 @@ impl SchemaValidationFailure {
 }
 
 fn validate_json_bounds(value: &Value) -> Result<(), ()> {
-    if serde_json::to_vec(value).map_err(|_| ())?.len() > MAX_TOOL_VALUE_BYTES
-        || json_depth(value) > MAX_TOOL_VALUE_DEPTH
+    if exceeds_json_depth(value, 1)
+        || serde_json::to_vec(value).map_err(|_| ())?.len() > MAX_TOOL_VALUE_BYTES
     {
         Err(())
     } else {
@@ -198,11 +208,18 @@ fn contains_external_reference(value: &Value) -> bool {
     }
 }
 
-fn json_depth(value: &Value) -> usize {
+fn exceeds_json_depth(value: &Value, depth: usize) -> bool {
+    if depth > MAX_TOOL_VALUE_DEPTH {
+        return true;
+    }
     match value {
-        Value::Array(values) => 1 + values.iter().map(json_depth).max().unwrap_or(0),
-        Value::Object(values) => 1 + values.values().map(json_depth).max().unwrap_or(0),
-        _ => 1,
+        Value::Array(values) => values
+            .iter()
+            .any(|value| exceeds_json_depth(value, depth + 1)),
+        Value::Object(values) => values
+            .values()
+            .any(|value| exceeds_json_depth(value, depth + 1)),
+        _ => false,
     }
 }
 

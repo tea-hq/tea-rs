@@ -10,6 +10,7 @@ use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 
 const LIVE_GATE: &str = "TEA_APP_SERVER_LIVE_SMOKE";
+const STRUCTURED_LIVE_GATE: &str = "TEA_APP_SERVER_STRUCTURED_LIVE_SMOKE";
 const APP_SERVER_VERSION: &str = "1.0";
 const READ_TIMEOUT: Duration = Duration::from_mins(3);
 const MAX_APPROVALS: usize = 8;
@@ -158,13 +159,22 @@ struct TurnObservation {
 }
 
 #[allow(clippy::too_many_lines)]
-async fn prompt(process: &mut AppServerProcess, session_id: &str, text: &str) -> TurnObservation {
+async fn prompt(
+    process: &mut AppServerProcess,
+    session_id: &str,
+    text: &str,
+    final_output_format: Option<Value>,
+) -> TurnObservation {
+    let mut params = json!({"sessionId": session_id, "text": text});
+    if let Some(format) = final_output_format {
+        params["finalOutputFormat"] = format;
+    }
     process
         .send(json!({
             "jsonrpc": "2.0",
             "id": "prompt",
             "method": "session/prompt",
-            "params": {"sessionId": session_id, "text": text},
+            "params": params,
         }))
         .await;
 
@@ -286,8 +296,12 @@ fn session_message_count(listed: &Value, session_id: &str) -> usize {
 }
 
 fn configured_provider() -> Option<(PathBuf, String, String)> {
-    if std::env::var(LIVE_GATE).ok().as_deref() != Some("1") {
-        eprintln!("skipping app-server live smoke: set {LIVE_GATE}=1 to opt in");
+    if std::env::var(LIVE_GATE).ok().as_deref() != Some("1")
+        && std::env::var(STRUCTURED_LIVE_GATE).ok().as_deref() != Some("1")
+    {
+        eprintln!(
+            "skipping app-server live smoke: set {LIVE_GATE}=1 or {STRUCTURED_LIVE_GATE}=1 to opt in"
+        );
         return None;
     }
     let home = std::env::var_os("HOME").map(PathBuf::from)?;
@@ -316,7 +330,7 @@ fn configured_provider() -> Option<(PathBuf, String, String)> {
 }
 
 #[tokio::test(flavor = "current_thread")]
-#[ignore = "requires TEA_APP_SERVER_LIVE_SMOKE=1, ~/.tea provider credentials, and network"]
+#[ignore = "requires an app-server live gate, ~/.tea provider credentials, and network"]
 #[allow(clippy::too_many_lines)]
 async fn app_server_uses_local_provider_and_survives_real_session_lifecycle() {
     let Some((config, provider, model)) = configured_provider() else {
@@ -401,6 +415,7 @@ async fn app_server_uses_local_provider_and_survives_real_session_lifecycle() {
         &mut first,
         &session_id,
         "Reply with exactly APP_SERVER_LIVE_OK. Do not call any tools.",
+        None,
     )
     .await;
     assert_eq!(simple.status, "completed");
@@ -409,6 +424,25 @@ async fn app_server_uses_local_provider_and_survives_real_session_lifecycle() {
         "unexpected live response: {}",
         simple.text
     );
+
+    if std::env::var(STRUCTURED_LIVE_GATE).ok().as_deref() == Some("1") {
+        let schema = json!({
+            "type": "object",
+            "properties": {"status": {"type": "string"}},
+            "required": ["status"],
+            "additionalProperties": false
+        });
+        let structured = prompt(
+            &mut first,
+            &session_id,
+            "Return a JSON object whose status is exactly APP_SERVER_STRUCTURED_OK. Do not call tools.",
+            Some(json!({"type": "json_schema", "schema": schema})),
+        )
+        .await;
+        let value: Value = serde_json::from_str(&structured.text)
+            .expect("structured app-server response is one JSON value");
+        assert_eq!(value, json!({"status": "APP_SERVER_STRUCTURED_OK"}));
+    }
 
     let before_tool = first
         .request(
@@ -427,6 +461,7 @@ async fn app_server_uses_local_provider_and_survives_real_session_lifecycle() {
             "Use only the read tool to inspect this absolute file: {}. Then reply with the exact marker APP_SERVER_LIVE_TOOL_OK and the file contents.",
             marker.display()
         ),
+        None,
     )
     .await;
     assert!(
@@ -473,6 +508,7 @@ async fn app_server_uses_local_provider_and_survives_real_session_lifecycle() {
         &mut first,
         &session_id,
         "Use only the bash tool to run this harmless command: printf APP_SERVER_LIVE_BASH_OK. Then reply with the exact marker APP_SERVER_LIVE_BASH_OK.",
+        None,
     )
     .await;
     assert!(

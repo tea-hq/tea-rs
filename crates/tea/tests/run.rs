@@ -2,19 +2,27 @@ use crate::common;
 
 use std::str::FromStr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
-use common::{TestIds, TestSessionIds, build_runtime, user_message};
+use common::{
+    TestIds, TestSessionIds, build_runtime, runtime_builder, runtime_builder_with_write_tool,
+    user_message,
+};
 use tea::{RuntimeCommandOutcome, RuntimeErrorCode};
 use tea_model::{
-    ModelCapabilities, ModelCompletion, ModelDisplayName, ModelEvent, ModelResponseInfo, ModelSpec,
-    ModelStreamIndex, ProviderId, ProviderToolCallId, ToolCallCompleted, ToolCallStarted,
+    BoxModelStream, ModelCancellation, ModelCapabilities, ModelCompletion, ModelDisplayName,
+    ModelEvent, ModelFailure, ModelFailureCode, ModelProvider, ModelRequest, ModelResponseInfo,
+    ModelSpec, ModelStreamIndex, ProviderId, ProviderToolCallId, ToolCallCompleted,
+    ToolCallStarted,
 };
 use tea_policy::GrantScope;
 use tea_protocol::{
     AgentCommand, ApprovalDecision, CanonicalMessage, CommandEnvelope, CommandId, ContentBlock,
-    ModelId, ProtocolMetadata, ProtocolTimestamp, SessionId, StopReason, TokenCount,
+    MessageId, ModelId, ProtocolMetadata, ProtocolTimestamp, RecordEnvelope, RecordId, RetryClass,
+    SessionId, SessionRecord, SessionSequence, StopReason, TokenCount,
 };
-use tea_testkit::{ScriptStep, ScriptedModelProvider, ScriptedModelResponse};
+use tea_session::{AppendTransaction, InMemorySessionStore, SessionStore};
+use tea_testkit::{FakeWriteTool, ScriptStep, ScriptedModelProvider, ScriptedModelResponse};
 
 const NOW: &str = "2026-07-23T09:30:12.125Z";
 
@@ -64,6 +72,73 @@ fn provider(
     ))
 }
 
+#[derive(Debug)]
+struct RejectingPreflightProvider {
+    inner: ScriptedModelProvider,
+    fail_on_call: usize,
+    preflight_calls: AtomicUsize,
+}
+
+impl RejectingPreflightProvider {
+    fn new(
+        scripts: impl IntoIterator<Item = ScriptedModelResponse>,
+        capabilities: ModelCapabilities,
+        fail_on_call: usize,
+    ) -> Self {
+        let provider_id = ProviderId::from_str("fake").unwrap();
+        let model = ModelSpec::new(
+            ModelId::from_str("fake/model").unwrap(),
+            provider_id.clone(),
+            ModelDisplayName::from_str("Fake Model").unwrap(),
+            TokenCount::new(32_000).unwrap(),
+            TokenCount::new(4_000).unwrap(),
+            capabilities,
+        )
+        .unwrap();
+        Self {
+            inner: ScriptedModelProvider::new(provider_id, vec![model], scripts),
+            fail_on_call,
+            preflight_calls: AtomicUsize::new(0),
+        }
+    }
+
+    fn captured_requests(&self) -> Vec<ModelRequest> {
+        self.inner.captured_requests().unwrap()
+    }
+
+    fn preflight_calls(&self) -> usize {
+        self.preflight_calls.load(Ordering::SeqCst)
+    }
+}
+
+impl ModelProvider for RejectingPreflightProvider {
+    fn provider_id(&self) -> &ProviderId {
+        self.inner.provider_id()
+    }
+
+    fn models(&self) -> &[ModelSpec] {
+        self.inner.models()
+    }
+
+    fn validate_request(&self, request: &ModelRequest) -> Result<(), ModelFailure> {
+        <ScriptedModelProvider as ModelProvider>::validate_request(&self.inner, request)?;
+        let call = self.preflight_calls.fetch_add(1, Ordering::SeqCst) + 1;
+        if call == self.fail_on_call {
+            return Err(ModelFailure::new(
+                ModelFailureCode::InvalidRequest,
+                "provider-specific preflight rejected request",
+                RetryClass::Never,
+            )
+            .unwrap());
+        }
+        Ok(())
+    }
+
+    fn stream(&self, request: ModelRequest, cancellation: ModelCancellation) -> BoxModelStream {
+        self.inner.stream(request, cancellation)
+    }
+}
+
 async fn create_session(runtime: &tea::AgentRuntime, profile_id: &str) -> SessionId {
     match runtime
         .send(envelope(
@@ -79,6 +154,250 @@ async fn create_session(runtime: &tea::AgentRuntime, profile_id: &str) -> Sessio
         RuntimeCommandOutcome::Created { session_id } => session_id,
         other => panic!("expected Created, got {other:?}"),
     }
+}
+
+#[tokio::test]
+async fn provider_preflight_rejection_leaves_no_orphan_user_message() {
+    let provider = Arc::new(RejectingPreflightProvider::new(
+        [ScriptedModelResponse::text([r#"{"answer":"unused"}"#])],
+        ModelCapabilities::text()
+            .with_tools(true)
+            .with_final_json_schema_with_tools(),
+        1,
+    ));
+    let write_tool = Arc::new(FakeWriteTool::new());
+    let runtime_provider: Arc<dyn ModelProvider> = provider.clone();
+    let runtime = runtime_builder_with_write_tool(
+        runtime_provider,
+        Arc::new(TestIds::default()),
+        Arc::new(TestSessionIds::default()),
+        write_tool,
+    )
+    .unwrap()
+    .build()
+    .unwrap();
+    let session_id = create_session(&runtime, "coding-agent").await;
+
+    let error = runtime
+        .send(envelope(
+            AgentCommand::Prompt {
+                message: user_message("return schema-constrained JSON"),
+                final_output_format: Some(tea_protocol::FinalOutputFormat::JsonSchema {
+                    schema: serde_json::json!({"type": "object"}),
+                }),
+            },
+            Some(session_id),
+        ))
+        .await
+        .unwrap_err();
+
+    assert_eq!(error.code(), RuntimeErrorCode::InvalidRequest);
+    assert_eq!(
+        error.message(),
+        "provider-specific preflight rejected request"
+    );
+    assert_eq!(provider.preflight_calls(), 1);
+    assert!(provider.captured_requests().is_empty());
+    assert!(
+        runtime
+            .snapshot(session_id)
+            .await
+            .unwrap()
+            .state()
+            .messages()
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn approval_resume_preflight_rejection_commits_nothing_and_executes_no_side_effect() {
+    let provider = Arc::new(RejectingPreflightProvider::new(
+        [
+            tool_script(
+                "write_file",
+                serde_json::json!({"path":"/summary.txt","content":"hello"}),
+                "write-preflight-1",
+            ),
+            ScriptedModelResponse::text([r#"{"status":"unused"}"#]),
+        ],
+        ModelCapabilities::text()
+            .with_tools(true)
+            .with_final_json_schema_with_tools(),
+        4,
+    ));
+    let write_tool = Arc::new(FakeWriteTool::new());
+    let runtime_provider: Arc<dyn ModelProvider> = provider.clone();
+    let runtime = runtime_builder_with_write_tool(
+        runtime_provider,
+        Arc::new(TestIds::default()),
+        Arc::new(TestSessionIds::default()),
+        Arc::clone(&write_tool),
+    )
+    .unwrap()
+    .build()
+    .unwrap();
+    let session_id = create_session(&runtime, "coding-agent").await;
+    let waiting = runtime
+        .send(envelope(
+            AgentCommand::Prompt {
+                message: user_message("write one file and return JSON"),
+                final_output_format: Some(tea_protocol::FinalOutputFormat::JsonSchema {
+                    schema: serde_json::json!({"type": "object"}),
+                }),
+            },
+            Some(session_id),
+        ))
+        .await
+        .unwrap();
+    let approval_id = match waiting {
+        RuntimeCommandOutcome::RunCompleted {
+            state: tea_kernel::RunState::WaitingApproval,
+            pending_approval_id: Some(approval_id),
+            ..
+        } => approval_id,
+        other => panic!("expected WaitingApproval, got {other:?}"),
+    };
+    let before = runtime.snapshot(session_id).await.unwrap();
+
+    let error = runtime
+        .send(envelope(
+            AgentCommand::ResolveApproval {
+                approval_id,
+                decision: ApprovalDecision::AllowOnce,
+            },
+            Some(session_id),
+        ))
+        .await
+        .unwrap_err();
+
+    assert_eq!(error.code(), RuntimeErrorCode::InvalidRequest);
+    assert_eq!(
+        error.message(),
+        "provider-specific preflight rejected request"
+    );
+    assert_eq!(provider.preflight_calls(), 4);
+    assert_eq!(provider.captured_requests().len(), 1);
+    assert!(write_tool.writes().unwrap().is_empty());
+    let after = runtime.snapshot(session_id).await.unwrap();
+    assert_eq!(after.records(), before.records());
+    assert_eq!(after.approval_artifacts(), before.approval_artifacts());
+    assert_eq!(after.state().pending_approvals().len(), 1);
+
+    let denied = runtime
+        .send(envelope(
+            AgentCommand::ResolveApproval {
+                approval_id,
+                decision: ApprovalDecision::Deny,
+            },
+            Some(session_id),
+        ))
+        .await
+        .unwrap();
+
+    assert!(matches!(
+        denied,
+        RuntimeCommandOutcome::RunCompleted {
+            state: tea_kernel::RunState::Completed,
+            pending_approval_id: None,
+            ..
+        }
+    ));
+    assert_eq!(provider.preflight_calls(), 6);
+    assert!(write_tool.writes().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn prompt_during_pending_approval_is_not_persisted_or_mixed_into_the_suspended_run() {
+    let provider = Arc::new(RejectingPreflightProvider::new(
+        [
+            tool_script(
+                "write_file",
+                serde_json::json!({"path":"/summary.txt","content":"hello"}),
+                "write-pending-1",
+            ),
+            ScriptedModelResponse::text([r#"{"status":"done"}"#]),
+        ],
+        ModelCapabilities::text()
+            .with_tools(true)
+            .with_final_json_object()
+            .with_final_json_schema_with_tools(),
+        usize::MAX,
+    ));
+    let runtime_provider: Arc<dyn ModelProvider> = provider.clone();
+    let runtime = runtime_builder_with_write_tool(
+        runtime_provider,
+        Arc::new(TestIds::default()),
+        Arc::new(TestSessionIds::default()),
+        Arc::new(FakeWriteTool::new()),
+    )
+    .unwrap()
+    .build()
+    .unwrap();
+    let session_id = create_session(&runtime, "coding-agent").await;
+    let waiting = runtime
+        .send(envelope(
+            AgentCommand::Prompt {
+                message: user_message("write one file, then return JSON"),
+                final_output_format: Some(tea_protocol::FinalOutputFormat::JsonObject),
+            },
+            Some(session_id),
+        ))
+        .await
+        .unwrap();
+    let approval_id = match waiting {
+        RuntimeCommandOutcome::RunCompleted {
+            state: tea_kernel::RunState::WaitingApproval,
+            pending_approval_id: Some(approval_id),
+            ..
+        } => approval_id,
+        other => panic!("expected WaitingApproval, got {other:?}"),
+    };
+    let before = runtime.snapshot(session_id).await.unwrap();
+
+    let error = runtime
+        .send(envelope(
+            AgentCommand::Prompt {
+                message: user_message("this prompt belongs to a different run"),
+                final_output_format: Some(tea_protocol::FinalOutputFormat::JsonSchema {
+                    schema: serde_json::json!({"type": "object"}),
+                }),
+            },
+            Some(session_id),
+        ))
+        .await
+        .unwrap_err();
+
+    assert_eq!(
+        error.message(),
+        "session has a pending approval; resume it explicitly"
+    );
+    let after = runtime.snapshot(session_id).await.unwrap();
+    assert_eq!(after.records(), before.records());
+    assert_eq!(after.approval_artifacts(), before.approval_artifacts());
+
+    let completed = runtime
+        .send(envelope(
+            AgentCommand::ResolveApproval {
+                approval_id,
+                decision: ApprovalDecision::AllowOnce,
+            },
+            Some(session_id),
+        ))
+        .await
+        .unwrap();
+    assert!(matches!(
+        completed,
+        RuntimeCommandOutcome::RunCompleted {
+            state: tea_kernel::RunState::Completed,
+            pending_approval_id: None,
+            ..
+        }
+    ));
+    let requests = provider.captured_requests();
+    assert_eq!(requests.len(), 2);
+    assert!(requests.iter().all(|request| {
+        request.final_output_format() == Some(&tea_protocol::FinalOutputFormat::JsonObject)
+    }));
 }
 
 #[tokio::test]
@@ -121,6 +440,7 @@ async fn prompt_pauses_for_approval_then_resumes() {
         .send(envelope(
             AgentCommand::Prompt {
                 message: user_message("summarize the notes"),
+                final_output_format: None,
             },
             Some(session_id),
         ))
@@ -175,6 +495,7 @@ async fn prompt_pauses_for_approval_then_resumes() {
 }
 
 #[tokio::test]
+#[allow(clippy::too_many_lines)]
 async fn allow_session_issues_a_bounded_grant_and_context_drift_asks_again() {
     let provider = provider([
         tool_script(
@@ -218,6 +539,7 @@ async fn allow_session_issues_a_bounded_grant_and_context_drift_asks_again() {
         .send(envelope(
             AgentCommand::Prompt {
                 message: user_message("write two files"),
+                final_output_format: None,
             },
             Some(session_id),
         ))
@@ -316,6 +638,7 @@ async fn dropped_prompt_future_releases_active_run() {
             .send(envelope(
                 AgentCommand::Prompt {
                     message: user_message("wait"),
+                    final_output_format: None,
                 },
                 Some(session_id),
             ))
@@ -331,6 +654,7 @@ async fn dropped_prompt_future_releases_active_run() {
         .send(envelope(
             AgentCommand::Prompt {
                 message: user_message("continue"),
+                final_output_format: None,
             },
             Some(session_id),
         ))
@@ -340,6 +664,80 @@ async fn dropped_prompt_future_releases_active_run() {
         recovered,
         RuntimeCommandOutcome::RunCompleted { .. }
     ));
+}
+
+#[tokio::test]
+async fn prompt_rejects_an_oversized_prospective_transcript_without_an_orphan_message() {
+    let provider = provider([]);
+    let store = Arc::new(InMemorySessionStore::new());
+    let runtime = runtime_builder(
+        Arc::clone(&provider),
+        Arc::new(TestIds::default()),
+        Arc::new(TestSessionIds::default()),
+    )
+    .unwrap()
+    .session_store(store.clone())
+    .build()
+    .unwrap();
+    let session_id = create_session(&runtime, "coding-agent").await;
+    let initial = store.load(session_id).await.unwrap();
+    let tail = initial.state().tail_sequence();
+    let branch_id = initial.state().active_branch_id();
+    let records = (0..tea_model::MAX_REQUEST_MESSAGES)
+        .map(|index| {
+            RecordEnvelope::new(
+                RecordId::from_str(&format!("0198a0b1-{index:04x}-7000-8000-000000000001"))
+                    .unwrap(),
+                session_id,
+                SessionSequence::new(tail.get() + 1 + index as u64),
+                ProtocolTimestamp::from_str(NOW).unwrap(),
+                None,
+                None,
+                branch_id,
+                ProtocolMetadata::default(),
+                SessionRecord::MessageCommitted {
+                    message: CanonicalMessage::user(
+                        MessageId::from_str(&format!(
+                            "0198a0b1-{index:04x}-7000-8000-000000000002"
+                        ))
+                        .unwrap(),
+                        vec![ContentBlock::text("seed").unwrap()],
+                        ProtocolTimestamp::from_str(NOW).unwrap(),
+                    )
+                    .unwrap(),
+                },
+            )
+            .unwrap()
+        })
+        .collect::<Vec<_>>();
+    store
+        .append(AppendTransaction::new(session_id, Some(tail), records))
+        .await
+        .unwrap();
+    let before = store.load(session_id).await.unwrap();
+
+    let error = runtime
+        .send(envelope(
+            AgentCommand::Prompt {
+                message: user_message("must not be persisted"),
+                final_output_format: None,
+            },
+            Some(session_id),
+        ))
+        .await
+        .unwrap_err();
+
+    assert_eq!(error.code(), RuntimeErrorCode::InvalidRequest);
+    let after = store.load(session_id).await.unwrap();
+    assert_eq!(
+        after.state().messages().len(),
+        tea_model::MAX_REQUEST_MESSAGES
+    );
+    assert_eq!(
+        after.state().tail_sequence(),
+        before.state().tail_sequence()
+    );
+    assert!(provider.captured_requests().unwrap().is_empty());
 }
 
 #[tokio::test]
@@ -373,6 +771,7 @@ async fn active_tool_overrides_are_isolated_switchable_and_cleared_by_profiles()
         .send(envelope(
             AgentCommand::Prompt {
                 message: user_message("first"),
+                final_output_format: None,
             },
             Some(first_session),
         ))
@@ -382,6 +781,7 @@ async fn active_tool_overrides_are_isolated_switchable_and_cleared_by_profiles()
         .send(envelope(
             AgentCommand::Prompt {
                 message: user_message("second"),
+                final_output_format: None,
             },
             Some(second_session),
         ))
@@ -396,6 +796,7 @@ async fn active_tool_overrides_are_isolated_switchable_and_cleared_by_profiles()
         .send(envelope(
             AgentCommand::Prompt {
                 message: user_message("third"),
+                final_output_format: None,
             },
             Some(first_session),
         ))
@@ -414,6 +815,7 @@ async fn active_tool_overrides_are_isolated_switchable_and_cleared_by_profiles()
         .send(envelope(
             AgentCommand::Prompt {
                 message: user_message("fourth"),
+                final_output_format: None,
             },
             Some(first_session),
         ))
@@ -470,6 +872,7 @@ async fn inactive_model_tool_call_is_rejected_without_execution() {
         .send(envelope(
             AgentCommand::Prompt {
                 message: user_message("try an inactive tool"),
+                final_output_format: None,
             },
             Some(session_id),
         ))
@@ -518,6 +921,7 @@ async fn active_tools_cannot_change_during_a_run() {
             .send(envelope(
                 AgentCommand::Prompt {
                     message: user_message("wait"),
+                    final_output_format: None,
                 },
                 Some(session_id),
             ))
@@ -580,6 +984,7 @@ async fn prompt_rejects_active_run_and_abort_requires_active_run() {
         .send(envelope(
             AgentCommand::Prompt {
                 message: user_message("hello"),
+                final_output_format: None,
             },
             Some(session_id),
         ))
@@ -589,6 +994,7 @@ async fn prompt_rejects_active_run_and_abort_requires_active_run() {
         .send(envelope(
             AgentCommand::Prompt {
                 message: user_message("again"),
+                final_output_format: None,
             },
             Some(session_id),
         ))

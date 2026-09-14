@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 use std::str::FromStr;
 
-use clap::{ArgAction, Parser, ValueEnum};
+use clap::{ArgAction, ArgGroup, Parser, ValueEnum};
 use tea_protocol::{ProfileId, ReasoningEffort, SessionId};
 use tea_provider_openai::ApiKey;
 
@@ -36,6 +36,7 @@ pub enum SessionSelection {
 /// Shared command-line contract for the Coding CLI.
 #[derive(Debug, Clone, Parser)]
 #[command(name = "tea", version = crate::version())]
+#[command(group(ArgGroup::new("structured_output_mode").args(["print", "json"])))]
 #[allow(clippy::struct_excessive_bools)] // Clap presence flags map to one validated selection.
 pub struct CliArgs {
     /// Run the protocol-neutral Tea app-server over stdin/stdout.
@@ -104,6 +105,23 @@ pub struct CliArgs {
     /// Increase diagnostic verbosity (stdout remains machine-safe in headless modes).
     #[arg(short, long, action = ArgAction::Count)]
     pub verbose: u8,
+    /// Require the final assistant output to be a JSON object.
+    #[arg(
+        long,
+        value_name = "FORMAT",
+        value_parser = ["json-object"],
+        conflicts_with = "output_schema",
+        requires = "structured_output_mode"
+    )]
+    pub output_format: Option<String>,
+    /// Require the final assistant output to match a JSON Schema file.
+    #[arg(
+        long,
+        value_name = "FILE",
+        conflicts_with = "output_format",
+        requires = "structured_output_mode"
+    )]
+    pub output_schema: Option<PathBuf>,
     /// Initial prompt text; values beginning with @ load a workspace-relative file.
     #[arg(value_name = "PROMPT")]
     pub prompt: Vec<String>,

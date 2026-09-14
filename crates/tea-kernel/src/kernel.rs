@@ -72,6 +72,8 @@ struct RunProgress {
     tool_iterations: u32,
     assistant_output_bytes: usize,
     deadline: tea_protocol::ProtocolTimestamp,
+    terminal_turn_id: TurnId,
+    prepared_turn_id: Option<TurnId>,
 }
 
 impl RunProgress {
@@ -185,6 +187,7 @@ impl<'a> AgentKernel<'a> {
             .load(session_id)
             .await
             .map_err(KernelError::from)?;
+        validate_new_run_state(&snapshot)?;
         let timestamp = self.clock.now()?;
         let records = envelopes_at(
             self.ids,
@@ -229,7 +232,10 @@ impl<'a> AgentKernel<'a> {
             .await
             .map_err(KernelError::from)?;
         validate_new_run_state(&snapshot)?;
+        self.preflight_model_request(&snapshot, config)?;
         let run_id = self.ids.next_run_id()?;
+        let deadline = add_duration(self.clock.now()?, config.limits().max_elapsed())?;
+        let first_turn_id = self.ids.next_turn_id()?;
         let mut emitter = EventEmitter::new(
             self.ids,
             self.clock,
@@ -241,8 +247,6 @@ impl<'a> AgentKernel<'a> {
         emitter
             .emit(Some(run_id), None, AgentEvent::RunStarted {})
             .await?;
-
-        let deadline = add_duration(self.clock.now()?, config.limits().max_elapsed())?;
         self.run_loop(
             snapshot,
             config,
@@ -253,6 +257,8 @@ impl<'a> AgentKernel<'a> {
                 tool_iterations: 0,
                 assistant_output_bytes: 0,
                 deadline,
+                terminal_turn_id: first_turn_id,
+                prepared_turn_id: Some(first_turn_id),
             },
         )
         .await
@@ -282,10 +288,17 @@ impl<'a> AgentKernel<'a> {
             .await
             .map_err(KernelError::from)?;
         let request = persisted_request(&snapshot, *resolution.request().approval_id())?.clone();
-        if &request != resolution.request()
-            || request.actor_id() != config.actor_id()
-            || request.workspace_id() != config.workspace_id()
-            || request.environment() != config.environment()
+        if &request != resolution.request() {
+            return Err(KernelError::new(
+                KernelErrorCode::PolicyFailure,
+                "approval resolution does not match persisted request",
+            ));
+        }
+        let denied = matches!(resolution.decision(), tea_protocol::ApprovalDecision::Deny);
+        if !denied
+            && (request.actor_id() != config.actor_id()
+                || request.workspace_id() != config.workspace_id()
+                || request.environment() != config.environment())
         {
             return Err(KernelError::new(
                 KernelErrorCode::PolicyFailure,
@@ -327,6 +340,64 @@ impl<'a> AgentKernel<'a> {
             tool_name: tool.tool_name().to_owned(),
             arguments: tool.arguments().clone(),
         };
+        let mut emitter = EventEmitter::new(
+            self.ids,
+            self.clock,
+            self.events,
+            session_id,
+            snapshot.state().tail_sequence(),
+            config.limits(),
+        );
+        if denied {
+            let snapshot = self
+                .commit_denied_resolution(snapshot, resolution, &call)
+                .await?;
+            let config = match config.clone().with_final_output_format(
+                persisted_final_output_format(&snapshot, *request.approval_id()).cloned(),
+            ) {
+                Ok(config) => config,
+                Err(error) => {
+                    self.ensure_run_terminal(session_id, run_id, turn_id, &error, &mut emitter)
+                        .await?;
+                    return Err(error);
+                }
+            };
+            if let Err(error) = self.preflight_model_request(&snapshot, &config) {
+                self.ensure_run_terminal(session_id, run_id, turn_id, &error, &mut emitter)
+                    .await?;
+                return Err(error);
+            }
+            let now = match self.clock.now() {
+                Ok(now) => now,
+                Err(error) => {
+                    self.ensure_run_terminal(session_id, run_id, turn_id, &error, &mut emitter)
+                        .await?;
+                    return Err(error);
+                }
+            };
+            let deadline = match add_duration(now, config.limits().max_elapsed()) {
+                Ok(deadline) => deadline,
+                Err(error) => {
+                    self.ensure_run_terminal(session_id, run_id, turn_id, &error, &mut emitter)
+                        .await?;
+                    return Err(error);
+                }
+            };
+            return Box::pin(self.continue_resumed_run(
+                snapshot,
+                &call,
+                &config,
+                cancellation,
+                run_id,
+                turn_id,
+                &mut emitter,
+                deadline,
+            ))
+            .await;
+        }
+        let config = config.clone().with_final_output_format(
+            persisted_final_output_format(&snapshot, *request.approval_id()).cloned(),
+        )?;
         let invocation = match prepare(
             self.tools,
             &call,
@@ -351,58 +422,102 @@ impl<'a> AgentKernel<'a> {
                 "persisted approval no longer matches registered tool context",
             ));
         }
+        self.preflight_model_request(&snapshot, &config)?;
         let deadline = add_duration(self.clock.now()?, config.limits().max_elapsed())?;
-        let mut emitter = EventEmitter::new(
-            self.ids,
-            self.clock,
-            self.events,
-            session_id,
-            snapshot.state().tail_sequence(),
-            config.limits(),
-        );
-        let denied = matches!(resolution.decision(), tea_protocol::ApprovalDecision::Deny);
-        let snapshot = if denied {
-            self.commit_denied_resolution(snapshot, resolution, &call)
-                .await?
-        } else {
-            let snapshot = self
-                .commit_resolution(
-                    snapshot,
-                    resolution,
-                    &invocation,
-                    config.environment().target(),
-                )
-                .await?;
-            let terminal = match execute(
-                self.tools,
-                invocation,
-                cancellation.child(),
-                &mut ToolExecutionContext {
-                    emitter: &mut emitter,
+        let snapshot = self
+            .commit_resolution(
+                snapshot,
+                resolution,
+                &invocation,
+                config.environment().target(),
+            )
+            .await?;
+        let terminal = match execute(
+            self.tools,
+            invocation,
+            cancellation.child(),
+            &mut ToolExecutionContext {
+                emitter: &mut emitter,
+                run_id,
+                turn_id,
+                clock: self.clock,
+                deadline,
+            },
+        )
+        .await
+        {
+            Ok(terminal) => terminal,
+            Err(error) => {
+                self.record_tool_interruption(
+                    &snapshot,
+                    &call,
                     run_id,
                     turn_id,
-                    clock: self.clock,
-                    deadline,
-                },
-            )
-            .await
-            {
-                Ok(terminal) => terminal,
-                Err(error) => {
-                    self.record_tool_interruption(
-                        &snapshot,
-                        &call,
-                        run_id,
-                        turn_id,
-                        &error,
-                        &mut emitter,
-                    )
-                    .await?;
-                    return Err(error);
-                }
-            };
-            self.commit_terminal(snapshot, &call, terminal).await?
+                    &error,
+                    &mut emitter,
+                )
+                .await?;
+                return Err(error);
+            }
         };
+        let snapshot = self.commit_terminal(snapshot, &call, terminal).await?;
+        Box::pin(self.continue_resumed_run(
+            snapshot,
+            &call,
+            &config,
+            cancellation,
+            run_id,
+            turn_id,
+            &mut emitter,
+            deadline,
+        ))
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn continue_resumed_run(
+        &self,
+        snapshot: SessionSnapshot,
+        call: &CompletedToolCall,
+        config: &KernelRunConfig,
+        cancellation: CancellationScope,
+        run_id: RunId,
+        turn_id: TurnId,
+        emitter: &mut EventEmitter<'_>,
+        deadline: tea_protocol::ProtocolTimestamp,
+    ) -> Result<KernelRunOutcome, KernelError> {
+        let session_id = snapshot.state().session_id();
+        let result = self
+            .continue_resumed_run_inner(
+                snapshot,
+                call,
+                config,
+                cancellation,
+                run_id,
+                turn_id,
+                emitter,
+                deadline,
+            )
+            .await;
+        if let Err(error) = &result {
+            self.ensure_run_terminal(session_id, run_id, turn_id, error, emitter)
+                .await?;
+        }
+        result
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn continue_resumed_run_inner(
+        &self,
+        snapshot: SessionSnapshot,
+        call: &CompletedToolCall,
+        config: &KernelRunConfig,
+        cancellation: CancellationScope,
+        run_id: RunId,
+        turn_id: TurnId,
+        emitter: &mut EventEmitter<'_>,
+        deadline: tea_protocol::ProtocolTimestamp,
+    ) -> Result<KernelRunOutcome, KernelError> {
         let mut snapshot = snapshot;
         for pending_call in remaining_tool_calls(&snapshot, call.tool_call_id) {
             match self
@@ -413,7 +528,7 @@ impl<'a> AgentKernel<'a> {
                     run_id,
                     turn_id,
                     cancellation.child(),
-                    &mut emitter,
+                    emitter,
                     deadline,
                 )
                 .await?
@@ -423,7 +538,7 @@ impl<'a> AgentKernel<'a> {
             }
         }
         let snapshot = self
-            .checkpoint_model_request(snapshot, run_id, turn_id, &mut emitter)
+            .checkpoint_model_request(snapshot, run_id, turn_id, emitter)
             .await?;
         let tool_iterations = completed_tool_iterations(&snapshot, run_id);
         let output_bytes = committed_assistant_output_bytes(&snapshot, run_id)?;
@@ -432,14 +547,50 @@ impl<'a> AgentKernel<'a> {
             config,
             cancellation,
             run_id,
-            &mut emitter,
+            emitter,
             RunProgress {
                 tool_iterations,
                 assistant_output_bytes: output_bytes,
                 deadline,
+                terminal_turn_id: turn_id,
+                prepared_turn_id: None,
             },
         )
         .await
+    }
+
+    fn preflight_model_request(
+        &self,
+        snapshot: &SessionSnapshot,
+        config: &KernelRunConfig,
+    ) -> Result<(), KernelError> {
+        let model_ref = snapshot
+            .state()
+            .configuration()
+            .model_ref()
+            .ok_or_else(|| {
+                KernelError::new(KernelErrorCode::InvalidModel, "session has no active model")
+            })?;
+        let provider = self
+            .models
+            .provider(model_ref.provider_id())
+            .ok_or_else(|| {
+                KernelError::new(
+                    KernelErrorCode::InvalidModel,
+                    "active model provider is not registered",
+                )
+            })?;
+        let model = self.models.model(model_ref).ok_or_else(|| {
+            KernelError::new(
+                KernelErrorCode::InvalidModel,
+                "active model is not advertised by its provider",
+            )
+        })?;
+        let request = TurnRequestSnapshot::build(snapshot.state(), config, self.tools, model)?;
+        provider
+            .validate_request(request.request())
+            .map_err(|failure| KernelError::provider_validation(&failure))?;
+        Ok(())
     }
 
     async fn checkpoint_model_request(
@@ -468,12 +619,43 @@ impl<'a> AgentKernel<'a> {
     #[allow(clippy::too_many_lines)]
     async fn run_loop(
         &self,
+        snapshot: SessionSnapshot,
+        config: &KernelRunConfig,
+        cancellation: CancellationScope,
+        run_id: RunId,
+        emitter: &mut EventEmitter<'_>,
+        progress: RunProgress,
+    ) -> Result<KernelRunOutcome, KernelError> {
+        let session_id = snapshot.state().session_id();
+        let mut current_turn_id = progress.terminal_turn_id;
+        let result = self
+            .run_loop_inner(
+                snapshot,
+                config,
+                cancellation,
+                run_id,
+                emitter,
+                progress,
+                &mut current_turn_id,
+            )
+            .await;
+        if let Err(error) = &result {
+            self.ensure_run_terminal(session_id, run_id, current_turn_id, error, emitter)
+                .await?;
+        }
+        result
+    }
+
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+    async fn run_loop_inner(
+        &self,
         mut snapshot: SessionSnapshot,
         config: &KernelRunConfig,
         cancellation: CancellationScope,
         run_id: RunId,
         emitter: &mut EventEmitter<'_>,
         mut progress: RunProgress,
+        current_turn_id: &mut TurnId,
     ) -> Result<KernelRunOutcome, KernelError> {
         let mut auto_compacted = false;
         loop {
@@ -483,8 +665,11 @@ impl<'a> AgentKernel<'a> {
                     .await?;
                 return Err(error);
             }
-            snapshot = self.apply_queued_input(snapshot).await?;
-            let turn_id = self.ids.next_turn_id()?;
+            let turn_id = match progress.prepared_turn_id.take() {
+                Some(turn_id) => turn_id,
+                None => self.ids.next_turn_id()?,
+            };
+            *current_turn_id = turn_id;
             let model_ref = snapshot
                 .state()
                 .configuration()
@@ -507,13 +692,19 @@ impl<'a> AgentKernel<'a> {
                     "active model is not advertised by its provider",
                 )
             })?;
+            snapshot = self
+                .apply_queued_input(snapshot, config, provider, model)
+                .await?;
             let request = TurnRequestSnapshot::build(snapshot.state(), config, self.tools, model)?;
+            provider
+                .validate_request(request.request())
+                .map_err(|failure| KernelError::provider_validation(&failure))?;
             let accountant = crate::ContextWindowAccountant::new(model);
             let estimated = crate::ContextWindowAccountant::estimate_input_tokens(
-                config.compiled_prompt(),
-                config.system_prompt(),
+                None,
+                request.request().system_prompt(),
                 request.request().tools(),
-                snapshot.state().messages(),
+                request.request().messages(),
             );
             if let Err(error) = accountant.check_overflow(estimated) {
                 if !auto_compacted
@@ -584,6 +775,13 @@ impl<'a> AgentKernel<'a> {
                         .await?;
                     continue;
                 }
+                if let Some(format) = config.compiled_final_output_format()
+                    && let Err(error) = validate_final_output(format, &output)
+                {
+                    self.record_run_terminal(&snapshot, run_id, Some(turn_id), &error, emitter)
+                        .await?;
+                    return Err(error);
+                }
                 return self
                     .finish(snapshot, output, run_id, turn_id, emitter)
                     .await;
@@ -631,6 +829,9 @@ impl<'a> AgentKernel<'a> {
     async fn apply_queued_input(
         &self,
         snapshot: SessionSnapshot,
+        config: &KernelRunConfig,
+        provider: &dyn tea_model::ModelProvider,
+        model: &tea_model::ModelSpec,
     ) -> Result<SessionSnapshot, KernelError> {
         let Some(queue) = self.input_queue else {
             return Ok(snapshot);
@@ -639,7 +840,7 @@ impl<'a> AgentKernel<'a> {
         if queued.follow_ups.is_empty() && queued.steering.is_empty() {
             return Ok(snapshot);
         }
-        let mut records = Vec::with_capacity(queued.follow_ups.len() + 1);
+        let mut messages = Vec::with_capacity(queued.follow_ups.len() + 1);
         if !queued.steering.is_empty() {
             let text = queued
                 .steering
@@ -652,16 +853,27 @@ impl<'a> AgentKernel<'a> {
                 vec![ContentBlock::text(text)?],
                 self.clock.now()?,
             )?;
-            records.push(SessionRecord::MessageCommitted { message });
+            messages.push(message);
         }
-        records.extend(
-            queued
-                .follow_ups
-                .iter()
-                .cloned()
-                .map(|message| SessionRecord::MessageCommitted { message }),
-        );
-        let snapshot = self.append_records(&snapshot, records).await?;
+        messages.extend(queued.follow_ups.iter().cloned());
+        let request = TurnRequestSnapshot::build_with_pending_messages(
+            snapshot.state(),
+            &messages,
+            config,
+            self.tools,
+            model,
+        )?;
+        provider
+            .validate_request(request.request())
+            .map_err(|failure| KernelError::provider_validation(&failure))?;
+        let snapshot = self
+            .append_records(
+                &snapshot,
+                messages
+                    .into_iter()
+                    .map(|message| SessionRecord::MessageCommitted { message }),
+            )
+            .await?;
         queue.acknowledge(&queued)?;
         Ok(snapshot)
     }
@@ -1290,6 +1502,7 @@ impl<'a> AgentKernel<'a> {
                 .with_approval_artifacts([ApprovalArtifactEntry::Requested {
                     record_id: approval_record_id,
                     request: request.clone(),
+                    final_output_format: config.final_output_format(),
                 }]),
             )
             .await
@@ -1625,6 +1838,34 @@ impl<'a> AgentKernel<'a> {
             .await
     }
 
+    async fn ensure_run_terminal(
+        &self,
+        session_id: SessionId,
+        run_id: RunId,
+        turn_id: TurnId,
+        error: &KernelError,
+        emitter: &mut EventEmitter<'_>,
+    ) -> Result<(), KernelError> {
+        let snapshot = self
+            .sessions
+            .load(session_id)
+            .await
+            .map_err(KernelError::from)?;
+        if snapshot.state().run_recovery().contains_key(&run_id)
+            || snapshot
+                .state()
+                .latest_checkpoint()
+                .is_some_and(|checkpoint| {
+                    checkpoint.run_id() == run_id
+                        && checkpoint.next_action() == NextTurnAction::FinishRun
+                })
+        {
+            return Ok(());
+        }
+        self.record_run_terminal(&snapshot, run_id, Some(turn_id), error, emitter)
+            .await
+    }
+
     async fn record_run_terminal(
         &self,
         snapshot: &SessionSnapshot,
@@ -1720,7 +1961,62 @@ impl<'a> AgentKernel<'a> {
     }
 }
 
-fn validate_new_run_state(snapshot: &SessionSnapshot) -> Result<(), KernelError> {
+fn validate_final_output(
+    format: &crate::config::CompiledFinalOutputFormat,
+    output: &ModelTurnOutput,
+) -> Result<(), KernelError> {
+    if output.completion.stop_reason() != &StopReason::Completed {
+        return Err(KernelError::malformed_response(
+            "structured output did not complete normally",
+        ));
+    }
+    let tea_protocol::CanonicalMessage::Assistant { content, .. } = &output.message else {
+        return Err(KernelError::malformed_response(
+            "structured output is not an assistant message",
+        ));
+    };
+    let mut text = String::new();
+    for block in content {
+        match block {
+            ContentBlock::Text { text: part } => text.push_str(part),
+            ContentBlock::Thinking { .. }
+            | ContentBlock::HostedTool { .. }
+            | ContentBlock::Citation { .. } => {}
+            ContentBlock::ContextualText { .. }
+            | ContentBlock::Image { .. }
+            | ContentBlock::ToolCall { .. } => {
+                return Err(KernelError::malformed_response(
+                    "structured output contains unsupported content",
+                ));
+            }
+        }
+    }
+    if text.is_empty() {
+        return Err(KernelError::malformed_response(
+            "structured output contains no JSON text",
+        ));
+    }
+    let value: serde_json::Value = serde_json::from_str(&text)
+        .map_err(|_| KernelError::malformed_response("structured output is not valid JSON"))?;
+    match format {
+        crate::config::CompiledFinalOutputFormat::JsonObject if value.is_object() => Ok(()),
+        crate::config::CompiledFinalOutputFormat::JsonObject => Err(
+            KernelError::malformed_response("structured output is not a JSON object"),
+        ),
+        crate::config::CompiledFinalOutputFormat::JsonSchema(schema) => {
+            schema.validate_prebounded(&value).map_err(|_| {
+                KernelError::malformed_response("structured output violates its JSON Schema")
+            })
+        }
+    }
+}
+
+/// Validates that durable session state can accept a new independent run.
+///
+/// # Errors
+///
+/// Returns an invalid-state error while an approval or tool outcome is pending.
+pub fn validate_new_run_state(snapshot: &SessionSnapshot) -> Result<(), KernelError> {
     if !snapshot.state().pending_approvals().is_empty() {
         return Err(KernelError::new(
             KernelErrorCode::InvalidState,
@@ -1899,6 +2195,25 @@ fn persisted_request(
                 KernelErrorCode::PolicyFailure,
                 "persisted approval request is missing",
             )
+        })
+}
+
+fn persisted_final_output_format(
+    snapshot: &SessionSnapshot,
+    approval_id: ApprovalId,
+) -> Option<&tea_protocol::FinalOutputFormat> {
+    snapshot
+        .approval_artifacts()
+        .iter()
+        .find_map(|entry| match entry {
+            ApprovalArtifactEntry::Requested {
+                request,
+                final_output_format,
+                ..
+            } if request.approval_id() == &approval_id => final_output_format.as_ref(),
+            ApprovalArtifactEntry::Requested { .. } | ApprovalArtifactEntry::Resolved { .. } => {
+                None
+            }
         })
 }
 

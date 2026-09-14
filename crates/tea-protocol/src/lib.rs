@@ -41,6 +41,7 @@ mod envelope;
 mod error;
 mod event;
 mod external;
+mod final_output;
 mod id;
 mod message;
 mod metadata;
@@ -85,6 +86,10 @@ pub use external::{
     MAX_WEB_FETCH_REDIRECTS, MAX_WEB_FETCH_TITLE_BYTES, MAX_WEB_FETCH_URL_BYTES,
     ProviderContinuation, SourceCitation, WebFetchPresentation, WebFetchRedirect,
     WebFetchTruncation,
+};
+pub use final_output::{
+    FINAL_JSON_OBJECT_INSTRUCTION, FinalOutputFormat, FinalOutputFormatError,
+    MAX_FINAL_OUTPUT_SCHEMA_BYTES, MAX_FINAL_OUTPUT_SCHEMA_DEPTH,
 };
 pub use id::{
     ApprovalId, BranchId, CausationId, CommandId, CorrelationId, EventId, MessageId,

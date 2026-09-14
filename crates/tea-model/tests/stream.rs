@@ -140,6 +140,13 @@ fn completed_event_normalizes_stop_usage_and_exact_cost() {
     assert_eq!(completion.metadata(), &metadata());
     assert!(matches!(event, ModelEvent::Completed(_)));
 
+    let refusal = ModelCompletion::new(StopReason::Refusal).unwrap();
+    assert_eq!(refusal.stop_reason(), &StopReason::Refusal);
+    let future_reason = StopReason::Unknown("future_provider_reason".to_owned());
+    let unknown = ModelCompletion::new(future_reason.clone()).unwrap();
+    assert_eq!(unknown.stop_reason(), &future_reason);
+    assert!(!unknown.stop_reason().is_success());
+
     assert_eq!(
         ModelCompletion::new(StopReason::Cancelled).unwrap_err(),
         ModelStreamValueError::InvalidCompletionReason

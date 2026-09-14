@@ -255,6 +255,43 @@ impl CliBootstrap {
         String::from_utf8(bytes).map_err(|_| CliFailure::usage("prompt file is not valid UTF-8"))
     }
 
+    /// Resolves and validates the invocation-scoped final-output contract.
+    ///
+    /// # Errors
+    ///
+    /// Rejects unreadable, malformed, oversized, externally referenced, or
+    /// otherwise invalid JSON Schema files.
+    pub fn final_output_format(
+        &self,
+        args: &CliArgs,
+    ) -> Result<Option<tea_protocol::FinalOutputFormat>, CliFailure> {
+        if args.output_format.is_some() {
+            return Ok(Some(tea_protocol::FinalOutputFormat::JsonObject));
+        }
+        let Some(path) = args.output_schema.as_deref() else {
+            return Ok(None);
+        };
+        let path = path
+            .to_str()
+            .ok_or_else(|| CliFailure::usage("output schema path is not valid UTF-8"))?;
+        let source = self
+            .read_prompt_file(args, path)
+            .map_err(|_| CliFailure::usage("output schema file is invalid or unreadable"))?;
+        let schema = serde_json::from_str(&source)
+            .map_err(|_| CliFailure::usage("output schema file is not valid JSON"))?;
+        let format = tea_protocol::FinalOutputFormat::JsonSchema { schema };
+        format.validate().map_err(|error| match error {
+            tea_protocol::FinalOutputFormatError::SchemaOutOfBounds => {
+                CliFailure::usage("output schema exceeds supported bounds")
+            }
+            tea_protocol::FinalOutputFormatError::SchemaMustBeObject
+            | tea_protocol::FinalOutputFormatError::InvalidSchema => {
+                CliFailure::usage("output schema is not valid Draft 2020-12 JSON Schema")
+            }
+        })?;
+        Ok(Some(format))
+    }
+
     /// Builds one mode-neutral coding service and resolves session selection.
     ///
     /// # Errors

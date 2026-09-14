@@ -9,7 +9,7 @@ use tea_cli::app_server;
 use tea_cli::args::CliArgs;
 use tea_cli::{BootstrapEnvironment, CliBootstrap};
 use tea_model::{ModelCapabilities, ModelDisplayName, ModelSpec, ProviderId};
-use tea_protocol::{ModelId, TokenCount};
+use tea_protocol::{FinalOutputFormat, ModelId, TokenCount};
 use tea_testkit::{ScriptedModelProvider, ScriptedModelResponse};
 use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader, DuplexStream};
 
@@ -20,7 +20,10 @@ fn model() -> ModelSpec {
         ModelDisplayName::from_str("Fake Model").unwrap(),
         TokenCount::new(32_000).unwrap(),
         TokenCount::new(4_000).unwrap(),
-        ModelCapabilities::text().with_tools(true),
+        ModelCapabilities::text()
+            .with_tools(true)
+            .with_final_json_object()
+            .with_final_json_schema_with_tools(),
     )
     .unwrap()
 }
@@ -71,17 +74,29 @@ async fn receive(output: &mut BufReader<DuplexStream>) -> Value {
 async fn app_server_routes_prompt_events_through_coding_service() {
     let root = std::env::temp_dir().join(format!("tea-app-session-{}", uuid::Uuid::now_v7()));
     fs::create_dir_all(&root).unwrap();
+    let schema = json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": {
+            "message": {"type": "string"}
+        },
+        "required": ["message"],
+        "additionalProperties": false
+    });
     let provider = Arc::new(ScriptedModelProvider::new(
         ProviderId::from_str("fake").unwrap(),
         vec![model()],
-        [ScriptedModelResponse::text(["hello from tea"])],
+        [
+            ScriptedModelResponse::text([r#"{"message":"hello from tea"}"#]),
+            ScriptedModelResponse::text(["not JSON"]),
+        ],
     ));
     let bootstrap = CliBootstrap::new(BootstrapEnvironment::new(
         &root,
         Some(root.clone()),
         BTreeMap::new(),
     ))
-    .with_provider(provider);
+    .with_provider(provider.clone());
     let cli_args = args(&root);
     let (mut input, server_input) = tokio::io::duplex(64 * 1024);
     let (server_output, client_output) = tokio::io::duplex(64 * 1024);
@@ -121,7 +136,19 @@ async fn app_server_routes_prompt_events_through_coding_service() {
     );
     send(
         &mut input,
-        json!({"jsonrpc":"2.0","id":"prompt","method":"session/prompt","params":{"sessionId":session_id,"text":"say hello"}}),
+        json!({
+            "jsonrpc": "2.0",
+            "id": "prompt",
+            "method": "session/prompt",
+            "params": {
+                "sessionId": session_id,
+                "text": "say hello",
+                "finalOutputFormat": {
+                    "type": "json_schema",
+                    "schema": schema.clone()
+                }
+            }
+        }),
     )
     .await;
 
@@ -134,18 +161,67 @@ async fn app_server_routes_prompt_events_through_coding_service() {
         }
         if message["method"] == "event/session"
             && message["params"]["event"]["type"] == "message_delta"
-            && message["params"]["event"]["payload"]["delta"]["text"] == "hello from tea"
+            && message["params"]["event"]["payload"]["delta"]["text"]
+                == r#"{"message":"hello from tea"}"#
         {
             saw_text = true;
         }
         if message["method"] == "event/turn_completed" && message["params"]["status"] == "completed"
         {
+            assert!(message["params"].get("errorCode").is_none());
             saw_finished = true;
             break;
         }
     }
     assert!(saw_text);
     assert!(saw_finished);
+
+    send(
+        &mut input,
+        json!({
+            "jsonrpc": "2.0",
+            "id": "malformed",
+            "method": "session/prompt",
+            "params": {
+                "sessionId": session_id,
+                "text": "return invalid JSON",
+                "finalOutputFormat": {
+                    "type": "json_schema",
+                    "schema": schema.clone()
+                }
+            }
+        }),
+    )
+    .await;
+    let mut malformed_accepted = false;
+    let mut malformed_finished = false;
+    for _ in 0..16 {
+        let message = receive(&mut output).await;
+        if message["id"] == "malformed" {
+            assert_eq!(message["result"]["accepted"], true);
+            malformed_accepted = true;
+        }
+        if message["method"] == "event/turn_completed" && message["params"]["status"] == "failed" {
+            assert_eq!(message["params"]["errorCode"], "malformed_response");
+            assert!(message["params"]["error"].is_string());
+            malformed_finished = true;
+            break;
+        }
+    }
+    assert!(malformed_accepted);
+    assert!(malformed_finished);
+
+    let requests = provider.captured_requests().unwrap();
+    assert_eq!(requests.len(), 2);
+    for request in &requests {
+        assert!(!request.tools().is_empty());
+        assert_eq!(
+            request.final_output_format(),
+            Some(&FinalOutputFormat::JsonSchema {
+                schema: schema.clone()
+            })
+        );
+    }
     send(
         &mut input,
         json!({
@@ -197,6 +273,116 @@ async fn app_server_routes_prompt_events_through_coding_service() {
         }
     }
     assert!(saw_shutdown);
+    drop(input);
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_secs(5), server)
+            .await
+            .unwrap()
+            .unwrap()
+            .is_ok()
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[allow(clippy::too_many_lines)]
+async fn app_server_rejects_schema_tool_mismatch_before_command_acceptance() {
+    let root = std::env::temp_dir().join(format!("tea-app-preflight-{}", uuid::Uuid::now_v7()));
+    fs::create_dir_all(&root).unwrap();
+    let provider = Arc::new(ScriptedModelProvider::new(
+        ProviderId::from_str("fake").unwrap(),
+        vec![
+            ModelSpec::new(
+                ModelId::from_str("fake/model").unwrap(),
+                ProviderId::from_str("fake").unwrap(),
+                ModelDisplayName::from_str("Fake Model").unwrap(),
+                TokenCount::new(32_000).unwrap(),
+                TokenCount::new(4_000).unwrap(),
+                ModelCapabilities::text()
+                    .with_tools(true)
+                    .with_final_json_schema(),
+            )
+            .unwrap(),
+        ],
+        [ScriptedModelResponse::text([r#"{"answer":"unused"}"#])],
+    ));
+    let bootstrap = CliBootstrap::new(BootstrapEnvironment::new(
+        &root,
+        Some(root.clone()),
+        BTreeMap::new(),
+    ))
+    .with_provider(provider.clone());
+    let cli_args = args(&root);
+    let (mut input, server_input) = tokio::io::duplex(64 * 1024);
+    let (server_output, client_output) = tokio::io::duplex(64 * 1024);
+    let server_args = cli_args.clone();
+    let server_bootstrap = bootstrap.clone();
+    let server = tokio::spawn(async move {
+        Box::pin(app_server::run(
+            &server_args,
+            &server_bootstrap,
+            server_input,
+            server_output,
+        ))
+        .await
+    });
+    let mut output = BufReader::new(client_output);
+
+    send(
+        &mut input,
+        json!({"jsonrpc":"2.0","id":"init","method":"server/initialize","params":{"clientName":"test","clientVersion":"1","appServerVersion":"1.0"}}),
+    )
+    .await;
+    assert_eq!(receive(&mut output).await["id"], "init");
+    send(
+        &mut input,
+        json!({"jsonrpc":"2.0","id":"create","method":"session/create","params":{"cwd":root,"mcpServers":[]}}),
+    )
+    .await;
+    let created = receive(&mut output).await;
+    let session_id = created["result"]["sessionId"].as_str().unwrap();
+
+    send(
+        &mut input,
+        json!({
+            "jsonrpc": "2.0",
+            "id": "unsupported",
+            "method": "session/prompt",
+            "params": {
+                "sessionId": session_id,
+                "text": "return JSON",
+                "finalOutputFormat": {
+                    "type": "json_schema",
+                    "schema": {"type": "object"}
+                }
+            }
+        }),
+    )
+    .await;
+    let rejected = receive(&mut output).await;
+    assert_eq!(rejected["id"], "unsupported");
+    assert!(rejected.get("result").is_none());
+    assert_eq!(rejected["error"]["code"], -32602);
+    assert!(
+        rejected["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("JSON-Schema final output with tools")
+    );
+    assert!(provider.captured_requests().unwrap().is_empty());
+
+    send(
+        &mut input,
+        json!({"jsonrpc":"2.0","id":"stop","method":"server/shutdown","params":{}}),
+    )
+    .await;
+    loop {
+        let response = receive(&mut output).await;
+        if response["id"] == "stop" {
+            assert_eq!(response["result"]["stopping"], true);
+            break;
+        }
+    }
     drop(input);
     assert!(
         tokio::time::timeout(std::time::Duration::from_secs(5), server)

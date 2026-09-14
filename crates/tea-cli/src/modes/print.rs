@@ -30,8 +30,17 @@ pub async fn run(
         ));
     }
     let prompt = initial_prompt(args, input, stdin_is_terminal, bootstrap)?;
+    let final_output_format = bootstrap.final_output_format(args)?;
     let (service, selection) = bootstrap.build_async(args).await?;
-    let result = run_service(&service, selection, &prompt, output, diagnostics).await;
+    let result = run_service(
+        &service,
+        selection,
+        &prompt,
+        final_output_format,
+        output,
+        diagnostics,
+    )
+    .await;
     service.shutdown().await;
     result
 }
@@ -40,13 +49,15 @@ async fn run_service(
     service: &CodingAgentService,
     selection: SessionSelection,
     prompt: &str,
+    final_output_format: Option<tea_protocol::FinalOutputFormat>,
     output: &mut dyn Write,
     diagnostics: &mut dyn Write,
 ) -> Result<(), CliFailure> {
     let session_id = select_session(service, selection).await?;
     let events = service.subscribe(session_id).map_err(CliFailure::from)?;
     service
-        .prompt(session_id, prompt)
+        .prompt(session_id, prompt, final_output_format)
+        .await
         .map_err(CliFailure::from)?;
     let event_task = tokio::spawn(drain_events(events));
     let outcome = tokio::select! {

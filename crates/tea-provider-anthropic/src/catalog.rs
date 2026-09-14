@@ -14,11 +14,14 @@ use crate::error::{AnthropicError, AnthropicErrorCode};
 ///
 /// Returns an error when the model contract cannot be constructed.
 pub fn default_catalog(config: &AnthropicConfig) -> Result<Vec<ModelSpec>, AnthropicError> {
-    let capabilities = ModelCapabilities::text()
+    let mut capabilities = ModelCapabilities::text()
         .with_image_input()
         .with_tools(true)
         .with_hosted_tool(HostedToolKind::WebSearch)
         .with_usage_reporting();
+    if config.supports_final_json_schema() {
+        capabilities = capabilities.with_final_json_schema_with_tools();
+    }
     let model = ModelSpec::new(
         config.model_id().clone(),
         config.provider_id().clone(),

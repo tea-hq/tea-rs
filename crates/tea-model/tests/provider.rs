@@ -3,10 +3,12 @@ use std::str::FromStr;
 use futures_util::{StreamExt, stream};
 use tea_model::{
     BoxModelStream, ModelCancellation, ModelCapabilities, ModelCompletion, ModelDisplayName,
-    ModelEvent, ModelProvider, ModelRequest, ModelResponseInfo, ModelSpec, ProviderId, Utf8Delta,
+    ModelEvent, ModelFailureCode, ModelProvider, ModelRequest, ModelResponseInfo, ModelSpec,
+    ProviderId, Utf8Delta,
 };
 use tea_protocol::{
-    CanonicalMessage, ContentBlock, MessageId, ModelId, ProtocolTimestamp, StopReason, TokenCount,
+    CanonicalMessage, ContentBlock, FinalOutputFormat, MessageId, ModelId, ProtocolTimestamp,
+    RetryClass, StopReason, TokenCount,
 };
 
 #[derive(Debug)]
@@ -99,4 +101,33 @@ fn provider_and_stream_contracts_are_send_sync_as_required() {
     fn assert_stream<T: tea_model::ModelStream>() {}
     assert_provider::<InMemoryProvider>();
     assert_stream::<futures_util::stream::Iter<std::array::IntoIter<ModelEvent, 0>>>();
+}
+
+#[test]
+fn default_provider_preflight_checks_catalog_and_model_capabilities() {
+    let provider = provider();
+
+    provider.validate_request(&request()).unwrap();
+
+    let missing_model = ModelRequest::new(
+        ModelId::from_str("memory/missing").unwrap(),
+        request().messages().to_vec(),
+    )
+    .unwrap();
+    let missing = provider.validate_request(&missing_model).unwrap_err();
+    assert_eq!(missing.code(), ModelFailureCode::InvalidRequest);
+    assert_eq!(missing.retry(), RetryClass::Never);
+    assert_eq!(
+        missing.message(),
+        "model request selects a model not advertised by this provider"
+    );
+
+    let unsupported = request().with_final_output_format(FinalOutputFormat::JsonObject);
+    let unsupported = provider.validate_request(&unsupported).unwrap_err();
+    assert_eq!(unsupported.code(), ModelFailureCode::InvalidRequest);
+    assert_eq!(unsupported.retry(), RetryClass::Never);
+    assert_eq!(
+        unsupported.message(),
+        "model does not support JSON-object final output"
+    );
 }

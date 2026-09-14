@@ -4,7 +4,7 @@ use common::{APPROVAL_ID, SESSION_ID, TOOL_CALL_ID, approval_flow, envelope};
 use serde_json::{Value, json};
 use std::str::FromStr;
 use tea_policy::{ActorId, ApprovalRequest, ApprovalResolution, PolicyGrant};
-use tea_protocol::{RecordEnvelope, SessionId, SessionSequence};
+use tea_protocol::{FinalOutputFormat, RecordEnvelope, SessionId, SessionSequence};
 use tea_session::{
     AppendTransaction, ApprovalArtifactEntry, GrantJournalEntry, InMemorySessionStore,
     SessionStore, SessionStoreErrorCode,
@@ -41,6 +41,17 @@ fn request() -> ApprovalRequest {
         }
     }))
     .unwrap()
+}
+
+fn final_output_format() -> FinalOutputFormat {
+    FinalOutputFormat::JsonSchema {
+        schema: json!({
+            "type": "object",
+            "properties": {"answer": {"type": "string"}},
+            "required": ["answer"],
+            "additionalProperties": false
+        }),
+    }
 }
 
 fn grant() -> PolicyGrant {
@@ -108,6 +119,7 @@ async fn request_resolution_grant_and_revocation_are_atomic() {
                 .with_approval_artifacts([ApprovalArtifactEntry::Requested {
                     record_id: request_record.record_id(),
                     request: request(),
+                    final_output_format: Some(final_output_format()),
                 }]),
         )
         .await
@@ -186,6 +198,7 @@ async fn mismatched_artifact_and_stale_journal_roll_back() {
                 .with_approval_artifacts([ApprovalArtifactEntry::Requested {
                     record_id: request_record.record_id(),
                     request: wrong_request,
+                    final_output_format: None,
                 }]),
         )
         .await
@@ -203,6 +216,7 @@ async fn mismatched_artifact_and_stale_journal_roll_back() {
                 .with_approval_artifacts([ApprovalArtifactEntry::Requested {
                     record_id: request_record.record_id(),
                     request: request(),
+                    final_output_format: None,
                 }]),
         )
         .await
@@ -228,6 +242,7 @@ fn artifact_values_round_trip() {
         ApprovalArtifactEntry::Requested {
             record_id: approval_request_record().record_id(),
             request: request(),
+            final_output_format: Some(final_output_format()),
         },
         ApprovalArtifactEntry::Resolved {
             record_id: resolution_record().record_id(),
@@ -235,8 +250,13 @@ fn artifact_values_round_trip() {
         },
     ];
     let value: Value = serde_json::to_value(&entries).unwrap();
-    assert_eq!(
-        serde_json::from_value::<Vec<ApprovalArtifactEntry>>(value).unwrap(),
-        entries
-    );
+    let decoded = serde_json::from_value::<Vec<ApprovalArtifactEntry>>(value).unwrap();
+    assert!(matches!(
+        &decoded[0],
+        ApprovalArtifactEntry::Requested {
+            final_output_format: Some(format),
+            ..
+        } if format == &final_output_format()
+    ));
+    assert_eq!(decoded, entries);
 }

@@ -11,13 +11,21 @@ use tea_policy::{
     ActorId, CodingWorkspacePolicy, ExecutionSurface, PolicyEngine, PolicyEnvironment,
     PolicyExecutionTarget,
 };
-use tea_protocol::{ModelId, ProtocolMetadata, TokenCount};
+use tea_protocol::{FinalOutputFormat, ModelId, ProtocolMetadata, TokenCount};
 use tea_testkit::ScriptedModelProvider;
 use tea_tools::ToolRegistry;
 
 use common::{EventCollector, FixedClock, TestIds, session_id, timestamp};
 
 fn tiny_window_provider(context: u64, output: u64) -> ScriptedModelProvider {
+    tiny_window_provider_with_capabilities(context, output, ModelCapabilities::text())
+}
+
+fn tiny_window_provider_with_capabilities(
+    context: u64,
+    output: u64,
+    capabilities: ModelCapabilities,
+) -> ScriptedModelProvider {
     let provider_id = ProviderId::from_str("tiny").unwrap();
     let model = ModelSpec::new(
         ModelId::from_str("tiny/model").unwrap(),
@@ -25,7 +33,7 @@ fn tiny_window_provider(context: u64, output: u64) -> ScriptedModelProvider {
         ModelDisplayName::from_str("Tiny Model").unwrap(),
         TokenCount::new(context).unwrap(),
         TokenCount::new(output).unwrap(),
-        ModelCapabilities::text(),
+        capabilities,
     )
     .unwrap();
     // The provider should never be called when the window is exceeded.
@@ -74,6 +82,37 @@ async fn overflow_fails_before_any_provider_call() {
         provider.captured_requests().unwrap().is_empty(),
         "no model request should be made on overflow"
     );
+}
+
+#[tokio::test]
+async fn json_object_instruction_is_included_in_context_accounting() {
+    let provider = tiny_window_provider_with_capabilities(
+        32,
+        8,
+        ModelCapabilities::text().with_final_json_object(),
+    );
+    let store = store_with_tiny_model().await;
+    let tools = ToolRegistry::new();
+    let events = EventCollector::default();
+    let config = config_for("user:alice")
+        .with_final_output_format(Some(FinalOutputFormat::JsonObject))
+        .unwrap();
+
+    let error = AgentKernel::new(
+        &provider,
+        &tools,
+        &PolicyEngine::new(),
+        &store,
+        &FixedClock,
+        &TestIds::default(),
+        &events,
+    )
+    .run(session_id(), &config, CancellationScope::new())
+    .await
+    .unwrap_err();
+
+    assert_eq!(error.code(), KernelErrorCode::ContextOverflow);
+    assert!(provider.captured_requests().unwrap().is_empty());
 }
 
 #[tokio::test]

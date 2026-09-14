@@ -4,7 +4,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde_json::{Value, json};
 use tea_policy::{ActorId, ApprovalRequest, ApprovalResolution, PolicyGrant};
-use tea_protocol::{ApprovalDecision, RecordEnvelope, SessionId, SessionSequence};
+use tea_protocol::{
+    ApprovalDecision, FinalOutputFormat, RecordEnvelope, SessionId, SessionSequence,
+};
 use tea_session::{AppendTransaction, ApprovalArtifactEntry, GrantJournalEntry, SessionStore};
 use tea_session_sqlite::{SqliteSessionError, SqliteSessionStore};
 
@@ -129,6 +131,14 @@ async fn active_grant_write_through_survives_reopen_and_revoke() {
     let database = TestDatabase::new("active-grant-write-through");
     let session_id: SessionId = SESSION_ID.parse().unwrap();
     let issued_grant = grant();
+    let final_output_format = FinalOutputFormat::JsonSchema {
+        schema: json!({
+            "type": "object",
+            "properties": {"answer": {"type": "string"}},
+            "required": ["answer"],
+            "additionalProperties": false
+        }),
+    };
     {
         let store = SqliteSessionStore::open(database.path()).unwrap();
         let records = approval_records();
@@ -140,6 +150,7 @@ async fn active_grant_write_through_survives_reopen_and_revoke() {
                     .with_approval_artifacts([ApprovalArtifactEntry::Requested {
                         record_id: requested.record_id(),
                         request: request(),
+                        final_output_format: Some(final_output_format.clone()),
                     }]),
             )
             .await
@@ -171,6 +182,14 @@ async fn active_grant_write_through_survives_reopen_and_revoke() {
 
     {
         let reopened = SqliteSessionStore::open(database.path()).unwrap();
+        let snapshot = reopened.load(session_id).await.unwrap();
+        assert!(matches!(
+            &snapshot.approval_artifacts()[0],
+            ApprovalArtifactEntry::Requested {
+                final_output_format: Some(format),
+                ..
+            } if format == &final_output_format
+        ));
         assert_eq!(
             reopened
                 .active_grants_for_actor(ActorId::from_str("user:alice").unwrap())

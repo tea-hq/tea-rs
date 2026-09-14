@@ -83,6 +83,16 @@ fn schema_and_instance_bounds_are_enforced() {
         compiled.validate(&json!({"data":"x".repeat(256 * 1024)})),
         Err(SchemaValidationFailure::ValueOutOfBounds)
     ));
+
+    compiled
+        .validate_prebounded(&json!({"data":"x".repeat(300 * 1024)}))
+        .unwrap();
+
+    let mut deep_value = json!(null);
+    for _ in 0..40 {
+        deep_value = json!({"next":deep_value});
+    }
+    compiled.validate_prebounded(&deep_value).unwrap();
 }
 
 #[test]

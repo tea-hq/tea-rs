@@ -17,7 +17,7 @@ use tea_model::{
     ModelCapabilities, ModelCompletion, ModelDisplayName, ModelEvent, ModelResponseInfo, ModelSpec,
     ModelStreamIndex, ProviderId, ProviderToolCallId, ToolCallCompleted, ToolCallStarted,
 };
-use tea_protocol::{ModelId, StopReason, TokenCount};
+use tea_protocol::{FinalOutputFormat, ModelId, StopReason, TokenCount};
 use tea_testkit::{ScriptedModelProvider, ScriptedModelResponse};
 
 static ID: AtomicU64 = AtomicU64::new(0);
@@ -40,7 +40,9 @@ fn fake_provider(text: &str) -> Arc<ScriptedModelProvider> {
         ModelDisplayName::from_str("Fake Model").unwrap(),
         TokenCount::new(32_000).unwrap(),
         TokenCount::new(4_000).unwrap(),
-        ModelCapabilities::text().with_tools(true),
+        ModelCapabilities::text()
+            .with_tools(true)
+            .with_final_json_schema_with_tools(),
     )
     .unwrap();
     Arc::new(ScriptedModelProvider::new(
@@ -123,6 +125,78 @@ async fn fake_print_mode_is_final_answer_only_and_supports_stdin_and_at_file() {
     assert_eq!(stdout, b"final answer\n");
     assert!(stderr.is_empty());
     fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn print_mode_enforces_json_schema_with_active_tools() {
+    let schema = serde_json::json!({
+        "type": "object",
+        "properties": {"answer": {"type": "string"}},
+        "required": ["answer"],
+        "additionalProperties": false
+    });
+    for (label, response, expected) in [
+        (
+            "schema-success",
+            r#"{"answer":"tea"}"#,
+            Some(r#"{"answer":"tea"}"#),
+        ),
+        ("schema-malformed", "not JSON", None),
+    ] {
+        let root = temp_root(label);
+        fs::write(
+            root.join("answer.schema.json"),
+            serde_json::to_vec(&schema).unwrap(),
+        )
+        .unwrap();
+        let args = CliArgs::try_parse_from([
+            "tea",
+            "--print",
+            "--no-session",
+            "--provider",
+            "fake",
+            "--model",
+            "fake/model",
+            "--trust",
+            "ignore",
+            "--cwd",
+            root.to_str().unwrap(),
+            "--output-schema",
+            "answer.schema.json",
+            "return the answer",
+        ])
+        .unwrap();
+        let provider = fake_provider(response);
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let result = Box::pin(tea_cli::modes::print::run(
+            &args,
+            &injected_bootstrap_with(&root, Arc::clone(&provider)),
+            &mut std::io::empty(),
+            true,
+            &mut stdout,
+            &mut stderr,
+        ))
+        .await;
+        if let Some(expected) = expected {
+            result.unwrap();
+            assert_eq!(stdout, format!("{expected}\n").as_bytes());
+        } else {
+            assert_eq!(result.unwrap_err().category(), ExitCategory::Provider);
+            assert!(stdout.is_empty());
+        }
+        assert!(stderr.is_empty());
+        let requests = provider.captured_requests().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert!(!requests[0].tools().is_empty());
+        assert_eq!(
+            requests[0].final_output_format(),
+            Some(&FinalOutputFormat::JsonSchema {
+                schema: schema.clone()
+            })
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
 }
 
 #[tokio::test(flavor = "current_thread")]

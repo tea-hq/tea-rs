@@ -82,11 +82,11 @@ fn session_sequence_serializes_as_a_decimal_string() {
 }
 
 #[test]
-fn additive_unknown_fields_are_ignored_on_known_types() {
+fn command_fields_are_strict_while_observation_fields_remain_additive() {
     let mut command = fixture("command-prompt.json");
     command["futureEnvelopeField"] = json!(true);
     command["payload"]["futurePayloadField"] = json!({"value": 1});
-    assert!(serde_json::from_value::<CommandEnvelope>(command).is_ok());
+    assert!(serde_json::from_value::<CommandEnvelope>(command).is_err());
 
     let mut event = fixture("event-run-finished.json");
     event["futureEnvelopeField"] = json!(true);
@@ -101,8 +101,10 @@ fn additive_unknown_fields_are_ignored_on_known_types() {
 
 #[test]
 fn same_major_minor_fixtures_decode_known_envelopes() {
-    let command: CommandEnvelope =
-        serde_json::from_value(fixture_for("v1.1", "command-prompt.json")).unwrap();
+    assert!(
+        serde_json::from_value::<CommandEnvelope>(fixture_for("v1.1", "command-prompt.json"))
+            .is_err()
+    );
     let event: EventEnvelope =
         serde_json::from_value(fixture_for("v1.1", "event-run-finished.json")).unwrap();
     let record: RecordEnvelope =
@@ -111,7 +113,6 @@ fn same_major_minor_fixtures_decode_known_envelopes() {
         serde_json::from_value(fixture_for("v1.1", "error-unsupported-command.json")).unwrap();
 
     for version in [
-        command.protocol_version(),
         event.protocol_version(),
         record.protocol_version(),
         error.protocol_version(),

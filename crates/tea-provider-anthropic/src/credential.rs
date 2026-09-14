@@ -105,6 +105,7 @@ pub struct AnthropicConfig {
     model_id: ModelId,
     timeout_millis: u64,
     web_search: AnthropicWebSearchConfig,
+    final_json_schema: bool,
 }
 
 impl AnthropicConfig {
@@ -148,6 +149,12 @@ impl AnthropicConfig {
     #[must_use]
     pub const fn web_search(&self) -> &AnthropicWebSearchConfig {
         &self.web_search
+    }
+
+    /// Returns whether the configured model and endpoint support native final JSON Schema output.
+    #[must_use]
+    pub const fn supports_final_json_schema(&self) -> bool {
+        self.final_json_schema
     }
 }
 
@@ -260,6 +267,8 @@ fn resolve_config(get: impl Fn(&str) -> Option<String>) -> Result<AnthropicConfi
             })?,
             None => DEFAULT_WEB_SEARCH_MAX_USES,
         };
+    let final_json_schema = get("TEA_ANTHROPIC_FINAL_JSON_SCHEMA")
+        .is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("true"));
     Ok(AnthropicConfig {
         provider_id: ProviderId::from_str(PROVIDER_ID).expect("provider id is canonical"),
         base_url,
@@ -268,5 +277,6 @@ fn resolve_config(get: impl Fn(&str) -> Option<String>) -> Result<AnthropicConfi
         model_id,
         timeout_millis,
         web_search: AnthropicWebSearchConfig::new(web_search_tool_type, web_search_max_uses)?,
+        final_json_schema,
     })
 }

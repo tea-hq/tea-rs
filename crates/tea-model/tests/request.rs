@@ -7,8 +7,8 @@ use tea_model::{
     ReasoningOptions, ReasoningProfile, WebSearchLocation, WebSearchOptions,
 };
 use tea_protocol::{
-    CanonicalMessage, ContentBlock, MessageId, ModelId, ProtocolMetadata, ProtocolTimestamp,
-    TokenCount,
+    CanonicalMessage, ContentBlock, FinalOutputFormat, MessageId, ModelId, ProtocolMetadata,
+    ProtocolTimestamp, TokenCount,
 };
 
 const MESSAGE_ID: &str = "0195a0b1-5e3d-73de-b461-0aa7aa000004";
@@ -79,6 +79,14 @@ fn request_preserves_provider_neutral_turn_snapshot() {
     )])
     .unwrap();
     let reasoning = ReasoningOptions::new(ReasoningEffort::Medium).with_budget(tokens(2_000));
+    let final_output_format = FinalOutputFormat::JsonSchema {
+        schema: json!({
+            "type":"object",
+            "properties":{"answer":{"type":"string"}},
+            "required":["answer"],
+            "additionalProperties":false
+        }),
+    };
 
     let request = ModelRequest::new(
         ModelId::from_str("test/model").unwrap(),
@@ -90,6 +98,7 @@ fn request_preserves_provider_neutral_turn_snapshot() {
     .with_tools(vec![tool("write_text_file")], true)
     .unwrap()
     .with_reasoning(reasoning)
+    .with_final_output_format(final_output_format.clone())
     .with_max_output_tokens(tokens(4_000))
     .with_metadata(metadata.clone());
 
@@ -102,12 +111,140 @@ fn request_preserves_provider_neutral_turn_snapshot() {
     assert_eq!(request.tools()[0].name(), "write_text_file");
     assert!(request.allow_parallel_tool_calls());
     assert_eq!(request.reasoning(), Some(reasoning));
+    assert_eq!(request.final_output_format(), Some(&final_output_format));
     assert_eq!(request.max_output_tokens(), Some(tokens(4_000)));
     assert_eq!(request.metadata(), &metadata);
 
     request
         .validate_for(&model(
-            ModelCapabilities::text().with_reasoning().with_tools(true),
+            ModelCapabilities::text()
+                .with_reasoning()
+                .with_tools(true)
+                .with_final_json_schema_with_tools(),
+        ))
+        .unwrap();
+}
+
+#[test]
+fn final_output_formats_fail_closed_against_independent_capabilities() {
+    let base = ModelRequest::new(
+        ModelId::from_str("test/model").unwrap(),
+        vec![user_message(vec![
+            ContentBlock::text("Return JSON").unwrap(),
+        ])],
+    )
+    .unwrap();
+    let object_request = base
+        .clone()
+        .with_final_output_format(FinalOutputFormat::JsonObject);
+    let schema_request = base.with_final_output_format(FinalOutputFormat::JsonSchema {
+        schema: json!({"type":"object"}),
+    });
+
+    let neither = ModelCapabilities::text();
+    let object_only = ModelCapabilities::text().with_final_json_object();
+    let schema_only = ModelCapabilities::text().with_final_json_schema();
+    let both = ModelCapabilities::text()
+        .with_final_json_object()
+        .with_final_json_schema();
+    let cases = [
+        (
+            &object_request,
+            neither,
+            Err(ModelRequestError::FinalJsonObjectUnsupported),
+        ),
+        (
+            &schema_request,
+            neither,
+            Err(ModelRequestError::FinalJsonSchemaUnsupported),
+        ),
+        (&object_request, object_only, Ok(())),
+        (
+            &schema_request,
+            object_only,
+            Err(ModelRequestError::FinalJsonSchemaUnsupported),
+        ),
+        (
+            &object_request,
+            schema_only,
+            Err(ModelRequestError::FinalJsonObjectUnsupported),
+        ),
+        (&schema_request, schema_only, Ok(())),
+        (&object_request, both, Ok(())),
+        (&schema_request, both, Ok(())),
+    ];
+
+    for (request, capabilities, expected) in cases {
+        assert_eq!(request.validate_for(&model(capabilities)), expected);
+    }
+}
+
+#[test]
+fn final_output_format_is_validated_for_direct_model_requests() {
+    let request = ModelRequest::new(
+        ModelId::from_str("test/model").unwrap(),
+        vec![user_message(vec![
+            ContentBlock::text("Return JSON").unwrap(),
+        ])],
+    )
+    .unwrap()
+    .with_final_output_format(FinalOutputFormat::JsonSchema {
+        schema: json!({"type": 7}),
+    });
+
+    assert_eq!(
+        request
+            .validate_for(&model(ModelCapabilities::text().with_final_json_schema()))
+            .unwrap_err(),
+        ModelRequestError::InvalidFinalOutputFormat
+    );
+}
+
+#[test]
+fn final_json_schema_with_tools_requires_the_combination_capability() {
+    let base = ModelRequest::new(
+        ModelId::from_str("test/model").unwrap(),
+        vec![user_message(vec![
+            ContentBlock::text("Return JSON").unwrap(),
+        ])],
+    )
+    .unwrap()
+    .with_tools(vec![tool("write_text_file")], false)
+    .unwrap();
+    let schema_request = base
+        .clone()
+        .with_final_output_format(FinalOutputFormat::JsonSchema {
+            schema: json!({"type":"object"}),
+        });
+    let schema_only = ModelCapabilities::text()
+        .with_tools(false)
+        .with_final_json_schema();
+
+    let error = schema_request
+        .validate_for(&model(schema_only))
+        .unwrap_err();
+    assert_eq!(
+        error,
+        ModelRequestError::FinalJsonSchemaWithToolsUnsupported
+    );
+    assert_eq!(
+        error.to_string(),
+        "model does not support JSON-Schema final output with tools"
+    );
+
+    let schema_with_tools = ModelCapabilities::text()
+        .with_tools(false)
+        .with_final_json_schema_with_tools();
+    assert!(schema_with_tools.supports_final_json_schema());
+    schema_request
+        .validate_for(&model(schema_with_tools))
+        .unwrap();
+
+    base.with_final_output_format(FinalOutputFormat::JsonObject)
+        .validate_for(&model(
+            ModelCapabilities::text()
+                .with_tools(false)
+                .with_final_json_object(),
         ))
         .unwrap();
 }

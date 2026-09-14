@@ -2,7 +2,8 @@ use std::collections::BTreeSet;
 
 use serde_json::Value;
 use tea_protocol::{
-    CanonicalMessage, ContentBlock, ModelId, ProtocolMetadata, ReasoningEffort, TokenCount,
+    CanonicalMessage, ContentBlock, FinalOutputFormat, ModelId, ProtocolMetadata, ReasoningEffort,
+    TokenCount,
 };
 use thiserror::Error;
 
@@ -265,6 +266,7 @@ pub struct ModelRequest {
     tools: Vec<ModelToolDefinition>,
     allow_parallel_tool_calls: bool,
     reasoning: Option<ReasoningOptions>,
+    final_output_format: Option<FinalOutputFormat>,
     max_output_tokens: Option<TokenCount>,
     metadata: ProtocolMetadata,
 }
@@ -288,6 +290,7 @@ impl ModelRequest {
             tools: Vec::new(),
             allow_parallel_tool_calls: false,
             reasoning: None,
+            final_output_format: None,
             max_output_tokens: None,
             metadata: ProtocolMetadata::default(),
         })
@@ -343,6 +346,13 @@ impl ModelRequest {
         self
     }
 
+    /// Adds the required format for the run's final visible assistant output.
+    #[must_use]
+    pub fn with_final_output_format(mut self, final_output_format: FinalOutputFormat) -> Self {
+        self.final_output_format = Some(final_output_format);
+        self
+    }
+
     /// Adds a requested output-token limit.
     #[must_use]
     pub const fn with_max_output_tokens(mut self, max_output_tokens: TokenCount) -> Self {
@@ -368,6 +378,13 @@ impl ModelRequest {
             return Err(ModelRequestError::ModelMismatch);
         }
         validate_messages(&self.messages)?;
+        if self
+            .final_output_format
+            .as_ref()
+            .is_some_and(|format| format.validate().is_err())
+        {
+            return Err(ModelRequestError::InvalidFinalOutputFormat);
+        }
         let capabilities = model.capabilities();
         if request_contains_image(&self.messages) && !capabilities.accepts_images() {
             return Err(ModelRequestError::ImageInputUnsupported);
@@ -396,6 +413,23 @@ impl ModelRequest {
             && !capabilities.supports_parallel_tool_calls()
         {
             return Err(ModelRequestError::ParallelToolsUnsupported);
+        }
+        match self.final_output_format.as_ref() {
+            Some(FinalOutputFormat::JsonObject) if !capabilities.supports_final_json_object() => {
+                return Err(ModelRequestError::FinalJsonObjectUnsupported);
+            }
+            Some(FinalOutputFormat::JsonSchema { .. })
+                if !capabilities.supports_final_json_schema() =>
+            {
+                return Err(ModelRequestError::FinalJsonSchemaUnsupported);
+            }
+            Some(FinalOutputFormat::JsonSchema { .. })
+                if !self.tools.is_empty()
+                    && !capabilities.supports_final_json_schema_with_tools() =>
+            {
+                return Err(ModelRequestError::FinalJsonSchemaWithToolsUnsupported);
+            }
+            _ => {}
         }
         let output_limit = self
             .max_output_tokens
@@ -447,6 +481,12 @@ impl ModelRequest {
     #[must_use]
     pub const fn reasoning(&self) -> Option<ReasoningOptions> {
         self.reasoning
+    }
+
+    /// Returns the required final-output format, when present.
+    #[must_use]
+    pub const fn final_output_format(&self) -> Option<&FinalOutputFormat> {
+        self.final_output_format.as_ref()
     }
 
     /// Returns the request-specific output limit.
@@ -531,6 +571,18 @@ pub enum ModelRequestError {
     /// Request contains a hosted tool unsupported by the selected model.
     #[error("model does not support a requested hosted tool")]
     HostedToolUnsupported,
+    /// Request contains a malformed or out-of-bounds final-output contract.
+    #[error("model request final-output format is invalid")]
+    InvalidFinalOutputFormat,
+    /// Request asks for JSON-object output from a model without that capability.
+    #[error("model does not support JSON-object final output")]
+    FinalJsonObjectUnsupported,
+    /// Request asks for JSON-Schema output from a model without that capability.
+    #[error("model does not support JSON-Schema final output")]
+    FinalJsonSchemaUnsupported,
+    /// Request combines JSON-Schema output with tools without that capability.
+    #[error("model does not support JSON-Schema final output with tools")]
+    FinalJsonSchemaWithToolsUnsupported,
     /// Request output limit is zero or exceeds the model limit.
     #[error("requested output limit is unsupported")]
     OutputLimitUnsupported,

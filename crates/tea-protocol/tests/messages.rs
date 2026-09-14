@@ -368,6 +368,25 @@ fn provider_pause_turn_is_a_stable_nonterminal_reason() {
 }
 
 #[test]
+fn provider_refusal_is_a_stable_unsuccessful_reason() {
+    let reason: StopReason = serde_json::from_str(r#""refusal""#).unwrap();
+    assert_eq!(
+        (
+            &reason,
+            reason.as_str(),
+            reason.is_success(),
+            serde_json::to_string(&reason).unwrap()
+        ),
+        (
+            &StopReason::Refusal,
+            "refusal",
+            false,
+            r#""refusal""#.to_owned()
+        )
+    );
+}
+
+#[test]
 fn direct_invalid_enum_construction_cannot_cross_the_wire() {
     let timestamp = ProtocolTimestamp::from_str(TIMESTAMP).unwrap();
     let message_id = MessageId::from_str(MESSAGE_ID).unwrap();

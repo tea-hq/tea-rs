@@ -74,6 +74,13 @@ impl SseParser {
     /// Flushes any trailing partial event without a final blank line.
     pub fn finish(&mut self) -> Vec<SseEvent> {
         let mut events = Vec::new();
+        if !self.buffer.is_empty() {
+            let mut line = std::mem::take(&mut self.buffer);
+            if line.last() == Some(&b'\r') {
+                line.pop();
+            }
+            self.process_line(&String::from_utf8_lossy(&line), &mut events);
+        }
         if let Some(data) = self.pending.take() {
             events.push(Self::classify(&data));
         }
@@ -137,6 +144,28 @@ mod tests {
         assert!(parser.feed(b":1}\n").is_empty());
         let events = parser.feed(b"\n");
         assert_eq!(events, vec![SseEvent::Data("{\"a\":1}".to_owned())]);
+    }
+
+    #[test]
+    fn finish_flushes_an_unterminated_data_line() {
+        let mut parser = SseParser::new();
+        assert!(parser.feed(b"data: {\"a\":1}").is_empty());
+
+        assert_eq!(
+            parser.finish(),
+            vec![SseEvent::Data("{\"a\":1}".to_owned())]
+        );
+    }
+
+    #[test]
+    fn finish_combines_pending_and_unterminated_data_lines() {
+        let mut parser = SseParser::new();
+        assert!(parser.feed(b"data: first\ndata: second").is_empty());
+
+        assert_eq!(
+            parser.finish(),
+            vec![SseEvent::Data("first\nsecond".to_owned())]
+        );
     }
 
     #[test]

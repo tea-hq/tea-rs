@@ -3,6 +3,7 @@
   "fixtures": [
     { "category": "command", "file": "command-create-session.json" },
     { "category": "command", "file": "command-prompt.json" },
+    { "category": "command", "file": "command-prompt-json-schema.json" },
     { "category": "command", "file": "command-steer.json" },
     { "category": "command", "file": "command-follow-up.json" },
     { "category": "command", "file": "command-abort.json" },

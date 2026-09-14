@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 use std::future::pending;
 use tea::{AgentRuntime, AgentRuntimeBuilder, RuntimeError, SessionIdSource};
 use tea_kernel::{KernelClock, KernelDeadlineFuture, KernelError, KernelIdSource};
-use tea_model::{ModelCapabilities, ModelDisplayName, ModelSpec, ProviderId};
+use tea_model::{ModelCapabilities, ModelDisplayName, ModelProvider, ModelSpec, ProviderId};
 use tea_policy::{ActorId, CodingWorkspacePolicy, DesktopPolicy, GrantId};
 use tea_profile::ProfileRuleId;
 use tea_protocol::{
@@ -66,7 +66,10 @@ pub fn envelope_prompt(
     session_id: tea_protocol::SessionId,
 ) -> tea_protocol::CommandEnvelope {
     envelope(
-        tea_protocol::AgentCommand::Prompt { message },
+        tea_protocol::AgentCommand::Prompt {
+            message,
+            final_output_format: None,
+        },
         Some(session_id),
     )
 }
@@ -155,6 +158,13 @@ pub fn provider() -> Arc<ScriptedModelProvider> {
 pub fn provider_with(
     scripts: impl IntoIterator<Item = ScriptedModelResponse>,
 ) -> Arc<ScriptedModelProvider> {
+    provider_with_capabilities(scripts, ModelCapabilities::text().with_tools(true))
+}
+
+pub fn provider_with_capabilities(
+    scripts: impl IntoIterator<Item = ScriptedModelResponse>,
+    capabilities: ModelCapabilities,
+) -> Arc<ScriptedModelProvider> {
     let provider_id = ProviderId::from_str("fake").unwrap();
     let model = ModelSpec::new(
         tea_protocol::ModelId::from_str("fake/model").unwrap(),
@@ -162,7 +172,7 @@ pub fn provider_with(
         ModelDisplayName::from_str("Fake Model").unwrap(),
         TokenCount::new(32_000).unwrap(),
         TokenCount::new(4_000).unwrap(),
-        ModelCapabilities::text().with_tools(true),
+        capabilities,
     )
     .unwrap();
     Arc::new(ScriptedModelProvider::new(
@@ -216,6 +226,15 @@ pub fn runtime_builder(
     ids: Arc<TestIds>,
     session_ids: Arc<TestSessionIds>,
 ) -> Result<AgentRuntimeBuilder, RuntimeError> {
+    runtime_builder_with_write_tool(provider, ids, session_ids, Arc::new(FakeWriteTool::new()))
+}
+
+pub fn runtime_builder_with_write_tool(
+    provider: Arc<dyn ModelProvider>,
+    ids: Arc<TestIds>,
+    session_ids: Arc<TestSessionIds>,
+    write_tool: Arc<FakeWriteTool>,
+) -> Result<AgentRuntimeBuilder, RuntimeError> {
     let builder = AgentRuntimeBuilder::new()
         .provider(provider)
         .clock(Arc::new(FixedClock))
@@ -237,7 +256,7 @@ pub fn runtime_builder(
             Arc::new(
                 ArgumentResourceResolver::new("path", "file", ToolResourceAccess::Write).unwrap(),
             ),
-            Arc::new(FakeWriteTool::new()),
+            write_tool,
         )?
         .tool(
             spec("clipboard_read", ToolEffect::ClipboardRead),

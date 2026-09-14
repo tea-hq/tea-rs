@@ -127,6 +127,22 @@ pub(crate) struct ResponsesReasoning {
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
+pub(crate) struct ResponsesText {
+    pub(crate) format: ResponsesTextFormat,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub(crate) struct ResponsesTextFormat {
+    pub(crate) r#type: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) strict: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) schema: Option<Value>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
 pub(crate) struct ResponsesApiRequest {
     pub(crate) model: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -140,6 +156,8 @@ pub(crate) struct ResponsesApiRequest {
     pub(crate) parallel_tool_calls: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) reasoning: Option<ResponsesReasoning>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) text: Option<ResponsesText>,
     pub(crate) store: bool,
     pub(crate) stream: bool,
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -181,6 +199,7 @@ mod tests {
             tool_choice: None,
             parallel_tool_calls: None,
             reasoning: None,
+            text: None,
             store: false,
             stream: true,
             include: Vec::new(),

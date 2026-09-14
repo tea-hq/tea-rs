@@ -108,6 +108,7 @@ async fn two_profiles_differ_in_prompt_tools_limits_and_policy() {
         .send(envelope(
             AgentCommand::Prompt {
                 message: user_message("write a note"),
+                final_output_format: None,
             },
             Some(coding_id),
         ))
@@ -131,6 +132,7 @@ async fn two_profiles_differ_in_prompt_tools_limits_and_policy() {
         .send(envelope(
             AgentCommand::Prompt {
                 message: user_message("write a note"),
+                final_output_format: None,
             },
             Some(desktop_id),
         ))

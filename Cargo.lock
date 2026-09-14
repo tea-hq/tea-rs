@@ -2824,6 +2824,7 @@ dependencies = [
  "tea-model",
  "tea-policy",
  "tea-protocol",
+ "tea-provider-anthropic",
  "tea-session",
  "tea-testkit",
  "tea-tools",
@@ -2897,6 +2898,7 @@ version = "0.1.0"
 dependencies = [
  "base64",
  "chrono",
+ "jsonschema",
  "serde",
  "serde_json",
  "thiserror 2.0.12",
@@ -2910,6 +2912,7 @@ version = "0.1.0"
 dependencies = [
  "async-stream",
  "futures-util",
+ "jsonschema",
  "reqwest",
  "serde_json",
  "tea-control",
@@ -2939,6 +2942,7 @@ dependencies = [
  "async-stream",
  "futures-core",
  "futures-util",
+ "jsonschema",
  "reqwest",
  "serde",
  "serde_json",

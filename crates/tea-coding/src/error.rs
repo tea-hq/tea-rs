@@ -30,6 +30,8 @@ pub enum CodingErrorCode {
     Transport,
     /// A provider-neutral model request was rejected as invalid.
     InvalidRequest,
+    /// A model response violated the normalized or requested output contract.
+    MalformedResponse,
     /// Policy denied or could not authorize an operation.
     PolicyDenied,
     /// An owned run was cancelled.
@@ -42,7 +44,7 @@ pub enum CodingErrorCode {
 
 impl CodingErrorCode {
     /// All stable coding-product failure codes.
-    pub const ALL: [Self; 16] = [
+    pub const ALL: [Self; 17] = [
         Self::InvalidInput,
         Self::NotFound,
         Self::ProjectNotTrusted,
@@ -55,6 +57,7 @@ impl CodingErrorCode {
         Self::Unavailable,
         Self::Transport,
         Self::InvalidRequest,
+        Self::MalformedResponse,
         Self::PolicyDenied,
         Self::Cancelled,
         Self::Runtime,
@@ -71,7 +74,8 @@ impl CodingErrorCode {
             ModelFailureCode::Transport => Self::Transport,
             ModelFailureCode::InvalidRequest => Self::InvalidRequest,
             ModelFailureCode::Cancelled => Self::Cancelled,
-            ModelFailureCode::MalformedResponse | ModelFailureCode::Internal => Self::Internal,
+            ModelFailureCode::MalformedResponse => Self::MalformedResponse,
+            ModelFailureCode::Internal => Self::Internal,
         }
     }
 }
@@ -153,6 +157,7 @@ impl From<tea::RuntimeError> for CodingError {
             | CodingErrorCode::Unavailable
             | CodingErrorCode::Transport
             | CodingErrorCode::InvalidRequest
+            | CodingErrorCode::MalformedResponse
             | CodingErrorCode::Credential
             | CodingErrorCode::InvalidInput
             | CodingErrorCode::NotFound
@@ -195,6 +200,7 @@ mod tests {
                 "unavailable",
                 "transport",
                 "invalid_request",
+                "malformed_response",
                 "policy_denied",
                 "cancelled",
                 "runtime",

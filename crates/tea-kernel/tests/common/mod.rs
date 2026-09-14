@@ -3,18 +3,21 @@
 use std::future::pending;
 use std::str::FromStr;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU16, Ordering};
+use std::sync::atomic::{AtomicU16, AtomicUsize, Ordering};
 
 use tea_kernel::{
     KernelClock, KernelDeadlineFuture, KernelError, KernelEventFuture, KernelEventSink,
     KernelIdSource,
 };
-use tea_model::{ModelCapabilities, ModelDisplayName, ModelSpec, ProviderId};
+use tea_model::{
+    BoxModelStream, ModelCancellation, ModelCapabilities, ModelDisplayName, ModelFailure,
+    ModelFailureCode, ModelProvider, ModelRequest, ModelSpec, ProviderId,
+};
 use tea_policy::GrantId;
 use tea_protocol::{
     ApprovalId, CanonicalMessage, ContentBlock, EventEnvelope, EventId, MessageId, ModelId,
-    ProfileId, ProtocolMetadata, ProtocolTimestamp, RecordEnvelope, RecordId, RunId, SessionId,
-    SessionRecord, SessionSequence, TokenCount, ToolCallId, TurnId,
+    ProfileId, ProtocolMetadata, ProtocolTimestamp, RecordEnvelope, RecordId, RetryClass, RunId,
+    SessionId, SessionRecord, SessionSequence, TokenCount, ToolCallId, TurnId,
 };
 use tea_session::{AppendTransaction, InMemorySessionStore, SessionStore};
 use tea_testkit::{ScriptedModelProvider, ScriptedModelResponse};
@@ -178,6 +181,13 @@ pub async fn store() -> InMemorySessionStore {
 }
 
 pub fn provider(scripts: impl IntoIterator<Item = ScriptedModelResponse>) -> ScriptedModelProvider {
+    provider_with_capabilities(scripts, ModelCapabilities::text().with_tools(false))
+}
+
+pub fn provider_with_capabilities(
+    scripts: impl IntoIterator<Item = ScriptedModelResponse>,
+    capabilities: ModelCapabilities,
+) -> ScriptedModelProvider {
     let provider_id = ProviderId::from_str("fake").unwrap();
     let model = ModelSpec::new(
         ModelId::from_str("fake/model").unwrap(),
@@ -185,8 +195,68 @@ pub fn provider(scripts: impl IntoIterator<Item = ScriptedModelResponse>) -> Scr
         ModelDisplayName::from_str("Fake Model").unwrap(),
         TokenCount::new(32_000).unwrap(),
         TokenCount::new(4_000).unwrap(),
-        ModelCapabilities::text().with_tools(false),
+        capabilities,
     )
     .unwrap();
     ScriptedModelProvider::new(provider_id, vec![model], scripts)
+}
+
+#[derive(Debug)]
+pub struct RejectingPreflightProvider {
+    inner: ScriptedModelProvider,
+    fail_on_call: usize,
+    validate_calls: AtomicUsize,
+}
+
+impl RejectingPreflightProvider {
+    pub fn new(
+        scripts: impl IntoIterator<Item = ScriptedModelResponse>,
+        fail_on_call: usize,
+    ) -> Self {
+        Self {
+            inner: provider(scripts),
+            fail_on_call,
+            validate_calls: AtomicUsize::new(0),
+        }
+    }
+
+    pub fn captured_requests(&self) -> Vec<ModelRequest> {
+        self.inner.captured_requests().unwrap()
+    }
+
+    pub fn remaining_scripts(&self) -> usize {
+        self.inner.remaining_scripts().unwrap()
+    }
+
+    pub fn validate_calls(&self) -> usize {
+        self.validate_calls.load(Ordering::SeqCst)
+    }
+}
+
+impl ModelProvider for RejectingPreflightProvider {
+    fn provider_id(&self) -> &ProviderId {
+        self.inner.provider_id()
+    }
+
+    fn models(&self) -> &[ModelSpec] {
+        self.inner.models()
+    }
+
+    fn validate_request(&self, request: &ModelRequest) -> Result<(), ModelFailure> {
+        <ScriptedModelProvider as ModelProvider>::validate_request(&self.inner, request)?;
+        let call = self.validate_calls.fetch_add(1, Ordering::SeqCst) + 1;
+        if call == self.fail_on_call {
+            return Err(ModelFailure::new(
+                ModelFailureCode::InvalidRequest,
+                "provider-specific preflight rejected request",
+                RetryClass::Never,
+            )
+            .unwrap());
+        }
+        Ok(())
+    }
+
+    fn stream(&self, request: ModelRequest, cancellation: ModelCancellation) -> BoxModelStream {
+        self.inner.stream(request, cancellation)
+    }
 }

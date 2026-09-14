@@ -2,9 +2,12 @@ use std::fmt::Debug;
 use std::pin::Pin;
 
 use futures_core::Stream;
-use tea_protocol::ModelId;
+use tea_protocol::{ModelId, RetryClass};
 
-use crate::{ModelCancellation, ModelEvent, ModelRequest, ModelSpec, ProviderId};
+use crate::{
+    ModelCancellation, ModelEvent, ModelFailure, ModelFailureCode, ModelRequest, ModelSpec,
+    ProviderId,
+};
 
 /// Provider-neutral asynchronous stream of normalized model events.
 ///
@@ -38,6 +41,27 @@ pub trait ModelProvider: Debug + Send + Sync {
             .find(|model| model.model_id() == model_id)
     }
 
+    /// Validates one immutable request before any durable state or transport
+    /// side effect is allowed.
+    ///
+    /// The default implementation resolves the request's model from this
+    /// provider's current catalog and applies all provider-neutral request
+    /// validation. Adapters may extend this method with dialect-specific and
+    /// cross-field constraints, but should retain the default checks.
+    ///
+    /// # Errors
+    ///
+    /// Returns a non-retryable invalid-request failure when the model is not
+    /// advertised or the request exceeds its declared capabilities.
+    fn validate_request(&self, request: &ModelRequest) -> Result<(), ModelFailure> {
+        let model = self.model(request.model_id()).ok_or_else(|| {
+            invalid_request("model request selects a model not advertised by this provider")
+        })?;
+        request
+            .validate_for(model)
+            .map_err(|error| invalid_request(error.to_string()))
+    }
+
     /// Creates a lazy normalized stream for one immutable request.
     ///
     /// `cancellation` is cooperative. Completion must not be reported until
@@ -45,4 +69,9 @@ pub trait ModelProvider: Debug + Send + Sync {
     /// the stream abandons it; implementations must therefore keep resource
     /// ownership inside the stream rather than a detached task.
     fn stream(&self, request: ModelRequest, cancellation: ModelCancellation) -> BoxModelStream;
+}
+
+fn invalid_request(message: impl Into<String>) -> ModelFailure {
+    ModelFailure::new(ModelFailureCode::InvalidRequest, message, RetryClass::Never)
+        .unwrap_or_else(|_| ModelFailure::internal_adapter_failure())
 }

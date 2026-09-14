@@ -25,7 +25,7 @@ pub mod stream;
 
 pub use credential::{
     ApiKey, CredentialResolver, EnvCredentialResolver, MapCredentialResolver, OpenAiApiMode,
-    OpenAiConfig, PROVIDER_ID,
+    OpenAiCompatibilityProfile, OpenAiConfig, PROVIDER_ID,
 };
 pub use error::{OpenAiError, OpenAiErrorCode};
 pub use provider::{OpenAiProvider, OpenAiProviderBuilder};

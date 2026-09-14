@@ -495,7 +495,7 @@ impl ModelSourceCitation {
     }
 }
 
-/// Successful terminal model completion data.
+/// Provider-terminal model completion data.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ModelCompletion {
     stop_reason: StopReason,
@@ -516,12 +516,13 @@ impl ModelCompletion {
         }
     }
 
-    /// Creates successful terminal completion data.
+    /// Creates provider-terminal completion data.
     ///
     /// # Errors
     ///
-    /// Returns an error for cancelled, error, or unknown stop reasons. Those
-    /// outcomes must use [`ModelEvent::Failed`].
+    /// Returns an error for cancelled or error stop reasons. Those outcomes
+    /// must use [`ModelEvent::Failed`]. Refusal and unknown provider-terminal
+    /// reasons remain completions, but are not normal successful output.
     pub fn new(stop_reason: StopReason) -> Result<Self, ModelStreamValueError> {
         if !matches!(
             stop_reason,
@@ -529,6 +530,8 @@ impl ModelCompletion {
                 | StopReason::Length
                 | StopReason::ToolUse
                 | StopReason::PauseTurn
+                | StopReason::Refusal
+                | StopReason::Unknown(_)
         ) {
             return Err(ModelStreamValueError::InvalidCompletionReason);
         }
@@ -607,7 +610,7 @@ pub enum ModelEvent {
     HostedToolCompleted(HostedToolCompleted),
     /// Citation emitted for assistant text and an external source.
     SourceCitation(ModelSourceCitation),
-    /// Successful terminal event.
+    /// Provider-terminal event.
     Completed(ModelCompletion),
     /// Failed or cancelled terminal event.
     Failed(ModelFailure),

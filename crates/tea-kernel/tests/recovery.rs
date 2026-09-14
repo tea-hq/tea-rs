@@ -7,18 +7,22 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use futures_util::stream;
 use serde_json::json;
 use tea_control::CancellationScope;
-use tea_kernel::{AgentKernel, KernelErrorCode, KernelRunConfig};
+use tea_kernel::{
+    AgentKernel, KernelError, KernelErrorCode, KernelEventFuture, KernelEventSink, KernelIdSource,
+    KernelRunConfig,
+};
 use tea_model::{
     ModelCompletion, ModelEvent, ModelResponseInfo, ModelStreamIndex, ProviderToolCallId,
     ToolCallCompleted, ToolCallStarted,
 };
 use tea_policy::{
-    ActorId, ApprovalResolution, CodingWorkspacePolicy, ExecutionSurface, PolicyEngine,
+    ActorId, ApprovalResolution, CodingWorkspacePolicy, ExecutionSurface, GrantId, PolicyEngine,
     PolicyEnvironment, PolicyExecutionTarget,
 };
 use tea_protocol::{
-    ApprovalDecision, ContentBlock, ProtocolMetadata, SessionId, SessionRecord, StopReason,
-    ToolIdempotency,
+    AgentEvent, AgentEventType, ApprovalDecision, ApprovalId, ContentBlock, EventEnvelope, EventId,
+    MessageId, NextTurnAction, ProtocolMetadata, RecordId, RunId, RunStatus, SessionId,
+    SessionRecord, SessionSequence, StopReason, ToolCallId, ToolIdempotency, TurnId,
 };
 use tea_session::{
     AppendOutcome, AppendTransaction, InMemorySessionStore, SessionSnapshot, SessionStore,
@@ -33,6 +37,96 @@ use tea_tools::{
 };
 
 use common::{EventCollector, FixedClock, TestIds, provider, session_id, store, timestamp};
+
+#[derive(Debug)]
+struct BoundedTurnIds {
+    inner: TestIds,
+    successful_turns: usize,
+    turn_calls: AtomicUsize,
+}
+
+impl BoundedTurnIds {
+    fn new(successful_turns: usize) -> Self {
+        Self {
+            inner: TestIds::default(),
+            successful_turns,
+            turn_calls: AtomicUsize::new(0),
+        }
+    }
+}
+
+impl KernelIdSource for BoundedTurnIds {
+    fn next_run_id(&self) -> Result<RunId, KernelError> {
+        self.inner.next_run_id()
+    }
+
+    fn next_turn_id(&self) -> Result<TurnId, KernelError> {
+        if self.turn_calls.fetch_add(1, Ordering::SeqCst) >= self.successful_turns {
+            return Err(KernelError::new(
+                KernelErrorCode::IdExhausted,
+                "injected turn id exhaustion",
+            ));
+        }
+        self.inner.next_turn_id()
+    }
+
+    fn next_message_id(&self) -> Result<MessageId, KernelError> {
+        self.inner.next_message_id()
+    }
+
+    fn next_tool_call_id(&self) -> Result<ToolCallId, KernelError> {
+        self.inner.next_tool_call_id()
+    }
+
+    fn next_approval_id(&self) -> Result<ApprovalId, KernelError> {
+        self.inner.next_approval_id()
+    }
+
+    fn next_grant_id(&self) -> Result<GrantId, KernelError> {
+        self.inner.next_grant_id()
+    }
+
+    fn next_event_id(&self) -> Result<EventId, KernelError> {
+        self.inner.next_event_id()
+    }
+
+    fn next_record_id(&self) -> Result<RecordId, KernelError> {
+        self.inner.next_record_id()
+    }
+}
+
+#[derive(Debug, Default)]
+struct RejectCompletedRunSink(EventCollector);
+
+impl RejectCompletedRunSink {
+    fn events(&self) -> Vec<EventEnvelope> {
+        self.0.events()
+    }
+}
+
+impl KernelEventSink for RejectCompletedRunSink {
+    fn last_sequence(&self, session_id: SessionId) -> Option<SessionSequence> {
+        self.0.last_sequence(session_id)
+    }
+
+    fn emit(&self, event: EventEnvelope) -> KernelEventFuture<'_> {
+        if matches!(
+            event.event(),
+            AgentEvent::RunFinished {
+                status: RunStatus::Completed,
+                ..
+            }
+        ) {
+            return Box::pin(async {
+                Err(KernelError::new(
+                    KernelErrorCode::EventSinkFailure,
+                    "injected completed event rejection",
+                ))
+            });
+        }
+        self.0.emit(event)
+    }
+}
 
 #[derive(Debug)]
 struct FailingStore {
@@ -224,9 +318,15 @@ async fn failed_terminal_append_never_replays_non_idempotent_side_effect() {
     );
     assert_eq!(executor.calls(), 1);
     let snapshot = store.load(session_id()).await.unwrap();
+    assert!(
+        snapshot
+            .records()
+            .iter()
+            .any(|record| matches!(record.record(), SessionRecord::ToolExecutionStarted { .. }))
+    );
     assert!(matches!(
         snapshot.records().last().unwrap().record(),
-        SessionRecord::ToolExecutionStarted { .. }
+        SessionRecord::RunInterrupted { .. }
     ));
 
     let retry_ids = TestIds::with_start(700);
@@ -332,5 +432,133 @@ async fn failed_resolution_transaction_remains_pending_and_retries_once() {
     assert_eq!(
         fake.writes().unwrap(),
         [("/notes.txt".to_owned(), "hello".to_owned())]
+    );
+}
+
+#[tokio::test]
+async fn first_turn_id_is_reserved_before_run_started() {
+    let provider = provider([ScriptedModelResponse::text(["unused"])]);
+    let store = store().await;
+    let tools = ToolRegistry::new();
+    let policy = PolicyEngine::new();
+    let events = EventCollector::default();
+    let ids = BoundedTurnIds::new(0);
+
+    let error = AgentKernel::new(
+        &provider,
+        &tools,
+        &policy,
+        &store,
+        &FixedClock,
+        &ids,
+        &events,
+    )
+    .run(session_id(), &config(), CancellationScope::new())
+    .await
+    .unwrap_err();
+
+    assert_eq!(error.code(), KernelErrorCode::IdExhausted);
+    assert!(events.events().is_empty());
+    assert!(
+        store
+            .load(session_id())
+            .await
+            .unwrap()
+            .state()
+            .run_recovery()
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn later_turn_id_exhaustion_records_one_durable_and_observed_terminal() {
+    let provider = provider([tool_script("read_once", json!({}))]);
+    let store = store().await;
+    let executor = CountingExecutor::default();
+    let tools = counting_registry(executor.clone());
+    let mut policy = PolicyEngine::new();
+    policy.add_rule(CodingWorkspacePolicy).unwrap();
+    let events = EventCollector::default();
+    let ids = BoundedTurnIds::new(1);
+
+    let error = AgentKernel::new(
+        &provider,
+        &tools,
+        &policy,
+        &store,
+        &FixedClock,
+        &ids,
+        &events,
+    )
+    .run(session_id(), &config(), CancellationScope::new())
+    .await
+    .unwrap_err();
+
+    assert_eq!(error.code(), KernelErrorCode::IdExhausted);
+    assert_eq!(executor.calls(), 1);
+    let snapshot = store.load(session_id()).await.unwrap();
+    assert_eq!(snapshot.state().run_recovery().len(), 1);
+    assert_eq!(
+        snapshot
+            .records()
+            .iter()
+            .filter(|record| matches!(record.record(), SessionRecord::RunInterrupted { .. }))
+            .count(),
+        1
+    );
+    assert_eq!(
+        events
+            .events()
+            .iter()
+            .filter(|event| event.event_type() == AgentEventType::RunFinished)
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn completed_checkpoint_is_not_rewritten_as_interrupted_when_observation_fails() {
+    let provider = provider([ScriptedModelResponse::text(["done"])]);
+    let store = store().await;
+    let tools = ToolRegistry::new();
+    let policy = PolicyEngine::new();
+    let events = RejectCompletedRunSink::default();
+    let ids = TestIds::default();
+
+    let error = AgentKernel::new(
+        &provider,
+        &tools,
+        &policy,
+        &store,
+        &FixedClock,
+        &ids,
+        &events,
+    )
+    .run(session_id(), &config(), CancellationScope::new())
+    .await
+    .unwrap_err();
+
+    assert_eq!(error.code(), KernelErrorCode::EventSinkFailure);
+    let snapshot = store.load(session_id()).await.unwrap();
+    assert!(matches!(
+        snapshot.state().latest_checkpoint(),
+        Some(checkpoint) if checkpoint.next_action() == NextTurnAction::FinishRun
+    ));
+    assert!(snapshot.state().run_recovery().is_empty());
+    assert_eq!(
+        snapshot
+            .records()
+            .iter()
+            .filter(|record| matches!(record.record(), SessionRecord::RunInterrupted { .. }))
+            .count(),
+        0
+    );
+    assert_eq!(
+        events
+            .events()
+            .iter()
+            .filter(|event| event.event_type() == AgentEventType::RunFinished)
+            .count(),
+        0
     );
 }

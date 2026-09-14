@@ -8,8 +8,8 @@ use thiserror::Error;
 use crate::envelope::{deserialize_unique_value, validate_read_version};
 use crate::{
     ApprovalId, BranchId, CURRENT_PROTOCOL_VERSION, CanonicalMessage, CommandId, CorrelationId,
-    MessageId, MessageRole, ProtocolError, ProtocolMetadata, ProtocolTimestamp, ProtocolVersion,
-    SessionId,
+    FinalOutputFormat, MessageId, MessageRole, ProtocolError, ProtocolMetadata, ProtocolTimestamp,
+    ProtocolVersion, SessionId,
 };
 
 /// Maximum UTF-8 bytes in a command text fragment.
@@ -165,6 +165,8 @@ pub enum AgentCommand {
     Prompt {
         /// Canonical user message.
         message: CanonicalMessage,
+        /// Optional contract for the run's final visible assistant output.
+        final_output_format: Option<FinalOutputFormat>,
     },
     /// Steer the currently running turn.
     Steer {
@@ -235,10 +237,16 @@ impl AgentCommand {
 
     fn validate(&self) -> Result<(), CommandValidationError> {
         match self {
-            Self::Prompt { message } | Self::FollowUp { message }
+            Self::Prompt { message, .. } | Self::FollowUp { message }
                 if message.role() != MessageRole::User =>
             {
                 Err(CommandValidationError::MessageMustBeUser)
+            }
+            Self::Prompt {
+                final_output_format: Some(format),
+                ..
+            } if format.validate().is_err() => {
+                Err(CommandValidationError::InvalidFinalOutputFormat)
             }
             _ => Ok(()),
         }
@@ -250,7 +258,8 @@ impl AgentCommand {
     remote = "AgentCommand",
     tag = "type",
     content = "payload",
-    rename_all = "snake_case"
+    rename_all = "snake_case",
+    deny_unknown_fields
 )]
 enum AgentCommandDef {
     CreateSession {
@@ -261,6 +270,12 @@ enum AgentCommandDef {
     },
     Prompt {
         message: CanonicalMessage,
+        #[serde(
+            rename = "finalOutputFormat",
+            default,
+            skip_serializing_if = "Option::is_none"
+        )]
+        final_output_format: Option<FinalOutputFormat>,
     },
     Steer {
         text: CommandText,
@@ -561,6 +576,9 @@ pub enum CommandValidationError {
     /// Prompt and follow-up require canonical user messages.
     #[error("prompt and follow_up messages must have user role")]
     MessageMustBeUser,
+    /// Prompt final-output format is malformed or exceeds protocol bounds.
+    #[error("prompt final-output format is invalid")]
+    InvalidFinalOutputFormat,
     /// Command text is empty, oversized, or contains a null character.
     #[error("command text is invalid")]
     InvalidText,

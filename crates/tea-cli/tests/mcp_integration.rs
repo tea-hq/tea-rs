@@ -128,7 +128,10 @@ async fn prepared_manager_registers_frozen_mcp_tools_and_awaits_shutdown() {
     );
 
     let session_id = service.create_session().await.unwrap();
-    service.prompt(session_id, "call the MCP tool").unwrap();
+    service
+        .prompt(session_id, "call the MCP tool", None)
+        .await
+        .unwrap();
     let approval = match service.wait(session_id).await.unwrap() {
         RuntimeCommandOutcome::RunCompleted {
             pending_approval_id: Some(approval_id),

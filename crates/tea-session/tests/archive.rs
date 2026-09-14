@@ -118,6 +118,7 @@ fn archive() -> SessionArchive {
             ApprovalArtifactEntry::Requested {
                 record_id: request_record_id,
                 request,
+                final_output_format: None,
             },
             ApprovalArtifactEntry::Resolved {
                 record_id: resolution_record_id,
@@ -217,6 +218,27 @@ fn malformed_unknown_and_wrong_version_archives_fail_closed() {
         Err(SessionArchiveError::Record(
             tea_protocol::RecordDecodeError::UnsupportedType { .. }
         ))
+    ));
+
+    let mut missing_format: Value = serde_json::from_str(&encoded).unwrap();
+    missing_format["approvalArtifacts"][0]
+        .as_object_mut()
+        .unwrap()
+        .remove("final_output_format");
+    assert!(matches!(
+        SessionArchive::decode_json(&missing_format.to_string()),
+        Err(SessionArchiveError::Malformed(_))
+    ));
+
+    let mut misspelled_format: Value = serde_json::from_str(&encoded).unwrap();
+    let requested = misspelled_format["approvalArtifacts"][0]
+        .as_object_mut()
+        .unwrap();
+    let format = requested.remove("final_output_format").unwrap();
+    requested.insert("final_output_formatt".to_owned(), format);
+    assert!(matches!(
+        SessionArchive::decode_json(&misspelled_format.to_string()),
+        Err(SessionArchiveError::Malformed(_))
     ));
 }
 

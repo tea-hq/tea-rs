@@ -306,7 +306,8 @@
             "file:/workspace/notes.txt"
           ]
         }
-      }
+      },
+      "final_output_format": null
     },
     {
       "type": "resolved",

@@ -1619,12 +1619,14 @@ impl InteractiveApp<'_> {
             );
             content.extend(self.state.attachment_blocks());
             self.service
-                .prompt_content(self.session_id, content)
+                .prompt_content(self.session_id, content, None)
+                .await
                 .map_err(CliFailure::from)?;
             self.apply(Action::ClearAttachments).await?;
         } else {
             self.service
-                .prompt(self.session_id, text)
+                .prompt(self.session_id, text, None)
+                .await
                 .map_err(CliFailure::from)?;
         }
         self.owned_runs.insert(self.session_id);
@@ -1721,7 +1723,8 @@ impl InteractiveApp<'_> {
                 content.extend(self.state.attachment_blocks());
             }
             self.service
-                .prompt_content(self.session_id, content)
+                .prompt_content(self.session_id, content, None)
+                .await
                 .map_err(CliFailure::from)?;
             self.owned_runs.insert(self.session_id);
             self.apply(Action::ClearAttachments).await?;

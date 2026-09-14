@@ -22,6 +22,7 @@ tea-provider-http = { version = "=0.1.0", path = "../tea-provider-http" }
 tea-protocol = { version = "=0.1.0", path = "../tea-protocol" }
 async-stream = { workspace = true }
 futures-util = { workspace = true }
+jsonschema = { workspace = true, optional = true }
 reqwest = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
@@ -33,7 +34,9 @@ tokio = { workspace = true, features = ["io-util", "macros", "net", "rt-multi-th
 
 [features]
 default = []
-live = []
+# Enable ignored live smoke tests. They require explicit process environment
+# credentials and never run in the default test suite.
+live = ["dep:jsonschema"]
 
 [lints]
 workspace = true

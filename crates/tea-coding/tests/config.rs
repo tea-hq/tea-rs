@@ -15,6 +15,7 @@ use tea_coding::mcp_config::{
     McpToolSettings, McpTransportSettings,
 };
 use tea_protocol::{ModelRef, ReasoningEffort};
+use tea_provider_openai::OpenAiCompatibilityProfile;
 
 static ID: AtomicU64 = AtomicU64::new(0);
 
@@ -650,6 +651,7 @@ fn failed_global_model_persistence_leaves_old_file_intact() {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn provider_files_are_strict_soft_failing_and_field_merged() {
     let root = std::env::temp_dir().join(format!(
         "tea-coding-providers-{}-{}",
@@ -666,9 +668,13 @@ fn provider_files_are_strict_soft_failing_and_field_merged() {
                 "deepseek": {
                     "base_url": "https://api.deepseek.test/v1",
                     "api_key": "$DEEPSEEK_API_KEY",
+                    "compatibility_profile": "deep-seek",
                     "models": [{
                         "id": "deepseek-chat",
-                        "capabilities": {"hosted_tools": ["web_search"]}
+                        "capabilities": {
+                            "final_json_object": true,
+                            "hosted_tools": ["web_search"]
+                        }
                     }]
                 }
             }
@@ -681,6 +687,7 @@ fn provider_files_are_strict_soft_failing_and_field_merged() {
             "providers": {
                 "deepseek": {
                     "api_mode": "responses",
+                    "compatibility_profile": "open-ai",
                     "timeout_millis": 30000
                 }
             }
@@ -698,17 +705,34 @@ fn provider_files_are_strict_soft_failing_and_field_merged() {
         Some("https://api.deepseek.test/v1")
     );
     assert_eq!(provider.api_mode.as_deref(), Some("responses"));
+    assert_eq!(
+        provider.compatibility_profile,
+        Some(OpenAiCompatibilityProfile::OpenAi)
+    );
     assert_eq!(provider.models[0].id, "deepseek-chat");
+    assert!(provider.models[0].capabilities.final_json_object);
+    assert!(!provider.models[0].capabilities.final_json_schema);
+    assert!(!provider.models[0].capabilities.final_json_schema_with_tools);
     assert_eq!(
         provider.models[0].capabilities.hosted_tools,
         [HostedToolCapability::WebSearch]
     );
     assert!(!format!("{merged:?}").contains("DEEPSEEK_API_KEY"));
+    assert!(format!("{merged:?}").contains("OpenAi"));
 
     fs::write(&global_path, br#"{"providers":{},"unknown":true}"#).unwrap();
     let invalid = load_providers_file(&global_path);
     assert_eq!(invalid.error, Some(ProvidersConfigLoadError::Invalid));
     assert!(invalid.config.providers.is_empty());
+    fs::write(
+        &global_path,
+        br#"{"providers":{"deepseek":{"compatibility_profile":"unknown"}}}"#,
+    )
+    .unwrap();
+    assert_eq!(
+        load_providers_file(&global_path).error,
+        Some(ProvidersConfigLoadError::Invalid)
+    );
     fs::write(&global_path, vec![b' '; 256 * 1024 + 1]).unwrap();
     assert_eq!(
         load_providers_file(&global_path).error,
@@ -727,6 +751,15 @@ fn provider_files_are_strict_soft_failing_and_field_merged() {
     fs::write(
         &global_path,
         br#"{"providers":{"deepseek":{"models":[{"id":"deepseek-chat","capabilities":{"hosted_tools":["web_search","web_search"]}}]}}}"#,
+    )
+    .unwrap();
+    assert_eq!(
+        load_providers_file(&global_path).error,
+        Some(ProvidersConfigLoadError::Invalid)
+    );
+    fs::write(
+        &global_path,
+        br#"{"providers":{"compatible":{"compatibility_profile":"open-ai","models":[{"id":"test","capabilities":{"final_json_schema_with_tools":true}}]}}}"#,
     )
     .unwrap();
     assert_eq!(

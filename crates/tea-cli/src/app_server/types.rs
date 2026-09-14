@@ -346,6 +346,9 @@ pub struct PromptParams {
     pub session_id: SessionId,
     /// User prompt text.
     pub text: String,
+    /// Optional run-scoped structured final-output contract.
+    #[serde(default)]
+    pub final_output_format: Option<tea_protocol::FinalOutputFormat>,
 }
 
 /// Session cancellation parameters.

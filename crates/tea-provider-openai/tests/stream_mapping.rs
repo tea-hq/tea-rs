@@ -3,7 +3,7 @@
 use std::path::Path;
 use std::str::FromStr;
 
-use tea_model::{ModelEvent, ModelRequest, ModelStreamValidator};
+use tea_model::{MAX_MODEL_DELTA_BYTES, ModelEvent, ModelRequest, ModelStreamValidator};
 use tea_protocol::{
     CanonicalMessage, ContentBlock, ExternalSource, HostedToolActivity, HostedToolOutcome,
     MessageId, ModelId, ProtocolTimestamp, ProviderContinuation, SourceCitation, StopReason,
@@ -14,7 +14,7 @@ use tea_provider_openai::{
     responses::build_responses_body,
     responses_stream::ResponsesReducer,
     sse::SseParser,
-    stream::{ChunkReducer, map_http_failure, map_stream_error},
+    stream::{ChunkReducer, map_chat_completion_response, map_http_failure, map_stream_error},
 };
 
 #[test]
@@ -200,6 +200,229 @@ fn reducer_with_pending_search(text: &str) -> ResponsesReducer {
     reducer
 }
 
+fn complete_chat_response(message: &serde_json::Value, finish_reason: &str) -> serde_json::Value {
+    serde_json::json!({
+        "id": "chatcmpl-groq-1",
+        "object": "chat.completion",
+        "model": "llama-3.3-70b-versatile",
+        "choices": [{
+            "index": 0,
+            "message": message,
+            "finish_reason": finish_reason
+        }],
+        "usage": {
+            "prompt_tokens": 12,
+            "completion_tokens": 5,
+            "total_tokens": 17,
+            "prompt_tokens_details": {"cached_tokens": 2},
+            "completion_tokens_details": {"reasoning_tokens": 1}
+        }
+    })
+}
+
+#[test]
+fn non_streaming_chat_completion_maps_metadata_text_usage_and_terminal() {
+    let response = complete_chat_response(
+        &serde_json::json!({
+            "role": "assistant",
+            "reasoning": "Checked the schema.",
+            "content": "{\"answer\":\"ok\"}",
+            "refusal": null
+        }),
+        "stop",
+    );
+    let events = map_chat_completion_response(&response).unwrap();
+
+    let ModelEvent::Started(info) = &events[0] else {
+        panic!("first event must be Started");
+    };
+    assert_eq!(info.response_id().unwrap().as_str(), "chatcmpl-groq-1");
+    assert_eq!(
+        info.response_model().unwrap().as_str(),
+        "llama-3.3-70b-versatile"
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter_map(ModelEvent::as_thinking_delta)
+            .collect::<String>(),
+        "Checked the schema."
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter_map(ModelEvent::as_text_delta)
+            .collect::<String>(),
+        "{\"answer\":\"ok\"}"
+    );
+    let Some(ModelEvent::Completed(completion)) = events.last() else {
+        panic!("last event must be Completed");
+    };
+    assert_eq!(completion.stop_reason(), &StopReason::Completed);
+    let usage = completion.usage().unwrap();
+    assert_eq!(usage.input_tokens().get(), 10);
+    assert_eq!(usage.output_tokens().get(), 5);
+    assert_eq!(usage.cache_read_tokens().unwrap().get(), 2);
+    assert_eq!(usage.reasoning_tokens().unwrap().get(), 1);
+    assert!(events_validator_accepts(&events));
+}
+
+#[test]
+fn non_streaming_chat_completion_maps_refusal_and_provider_error() {
+    let refusal = complete_chat_response(
+        &serde_json::json!({
+            "role": "assistant",
+            "content": null,
+            "refusal": "I cannot comply."
+        }),
+        "stop",
+    );
+    let events = map_chat_completion_response(&refusal).unwrap();
+    assert_eq!(
+        events
+            .iter()
+            .filter_map(ModelEvent::as_text_delta)
+            .collect::<String>(),
+        "I cannot comply."
+    );
+    assert!(matches!(
+        events.last(),
+        Some(ModelEvent::Completed(completion))
+            if completion.stop_reason() == &StopReason::Refusal
+    ));
+    assert!(events_validator_accepts(&events));
+
+    let events = map_chat_completion_response(&serde_json::json!({
+        "error": {"type": "rate_limit_exceeded", "message": "try later"}
+    }))
+    .unwrap();
+    assert!(matches!(events.first(), Some(ModelEvent::Started(_))));
+    assert!(matches!(events.last(), Some(ModelEvent::Failed(_))));
+    assert!(events_validator_accepts(&events));
+}
+
+#[test]
+fn non_streaming_chat_completion_maps_complete_tool_calls() {
+    let response = complete_chat_response(
+        &serde_json::json!({
+            "role": "assistant",
+            "content": null,
+            "tool_calls": [{
+                "id": "call_1",
+                "type": "function",
+                "function": {
+                    "name": "read_file",
+                    "arguments": "{\"path\":\"/notes.txt\"}"
+                }
+            }]
+        }),
+        "tool_calls",
+    );
+    let events = map_chat_completion_response(&response).unwrap();
+
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, ModelEvent::ToolCallStarted(_)))
+    );
+    let completed = events
+        .iter()
+        .find_map(ModelEvent::as_tool_call_completed)
+        .unwrap();
+    assert_eq!(completed.tool_name(), "read_file");
+    assert_eq!(completed.arguments()["path"], "/notes.txt");
+    assert!(matches!(
+        events.last(),
+        Some(ModelEvent::Completed(completion))
+            if completion.stop_reason() == &StopReason::ToolUse
+    ));
+    assert!(events_validator_accepts(&events));
+}
+
+#[test]
+fn non_streaming_chat_completion_rejects_malformed_envelope_and_usage() {
+    let valid = complete_chat_response(
+        &serde_json::json!({"role": "assistant", "content": "{}"}),
+        "stop",
+    );
+    let mut cases = Vec::new();
+
+    let mut missing_id = valid.clone();
+    missing_id.as_object_mut().unwrap().remove("id");
+    cases.push(missing_id);
+    let mut missing_model = valid.clone();
+    missing_model.as_object_mut().unwrap().remove("model");
+    cases.push(missing_model);
+    let mut no_choices = valid.clone();
+    no_choices["choices"] = serde_json::json!([]);
+    cases.push(no_choices);
+    let mut multiple_choices = valid.clone();
+    multiple_choices["choices"] = serde_json::json!([
+        {"index": 0, "message": {"role": "assistant", "content": "{}"}, "finish_reason": "stop"},
+        {"index": 1, "message": {"role": "assistant", "content": "{}"}, "finish_reason": "stop"}
+    ]);
+    cases.push(multiple_choices);
+    let mut wrong_index = valid.clone();
+    wrong_index["choices"][0]["index"] = serde_json::json!(1);
+    cases.push(wrong_index);
+    let mut wrong_role = valid.clone();
+    wrong_role["choices"][0]["message"]["role"] = serde_json::json!("user");
+    cases.push(wrong_role);
+    let mut invalid_content = valid.clone();
+    invalid_content["choices"][0]["message"]["content"] = serde_json::json!([]);
+    cases.push(invalid_content);
+    let mut no_finish = valid.clone();
+    no_finish["choices"][0]["finish_reason"] = serde_json::Value::Null;
+    cases.push(no_finish);
+    let mut no_usage = valid.clone();
+    no_usage.as_object_mut().unwrap().remove("usage");
+    cases.push(no_usage);
+    let mut invalid_usage = valid.clone();
+    invalid_usage["usage"]["prompt_tokens"] = serde_json::json!("12");
+    cases.push(invalid_usage);
+    let mut inconsistent_total = valid.clone();
+    inconsistent_total["usage"]["total_tokens"] = serde_json::json!(99);
+    cases.push(inconsistent_total);
+    let mut excessive_cache = valid.clone();
+    excessive_cache["usage"]["prompt_tokens_details"]["cached_tokens"] = serde_json::json!(13);
+    cases.push(excessive_cache);
+    let mut excessive_reasoning = valid.clone();
+    excessive_reasoning["usage"]["completion_tokens_details"]["reasoning_tokens"] =
+        serde_json::json!(6);
+    cases.push(excessive_reasoning);
+
+    for value in cases {
+        let error = map_chat_completion_response(&value).unwrap_err();
+        assert_eq!(
+            error.code(),
+            tea_provider_openai::OpenAiErrorCode::MalformedResponse
+        );
+    }
+}
+
+#[test]
+fn non_streaming_chat_completion_splits_long_utf8_without_data_loss() {
+    let text = "界".repeat(MAX_MODEL_DELTA_BYTES / 3 + 32);
+    let response = complete_chat_response(
+        &serde_json::json!({"role": "assistant", "content": text}),
+        "stop",
+    );
+    let events = map_chat_completion_response(&response).unwrap();
+    let deltas = events
+        .iter()
+        .filter_map(ModelEvent::as_text_delta)
+        .collect::<Vec<_>>();
+
+    assert!(deltas.len() > 1);
+    assert!(
+        deltas
+            .iter()
+            .all(|delta| delta.len() <= MAX_MODEL_DELTA_BYTES)
+    );
+    assert_eq!(deltas.concat(), text);
+    assert!(events_validator_accepts(&events));
+}
+
 #[test]
 fn text_fixture_maps_to_started_deltas_and_completion() {
     let events = events_from_fixture("text.sse");
@@ -222,6 +445,295 @@ fn text_fixture_maps_to_started_deltas_and_completion() {
     );
     assert!(completion.usage().is_some());
     assert!(events_validator_accepts(&events));
+}
+
+#[test]
+fn refusal_chat_fixture_preserves_visible_text_and_terminal_reason() {
+    let events = events_from_fixture("refusal.sse");
+    let text = events
+        .iter()
+        .filter_map(ModelEvent::as_text_delta)
+        .collect::<String>();
+
+    assert_eq!(text, "I cannot comply.");
+    assert!(matches!(
+        events.last(),
+        Some(ModelEvent::Completed(completion))
+            if completion.stop_reason() == &StopReason::Refusal
+    ));
+    assert!(events_validator_accepts(&events));
+}
+
+#[test]
+fn chat_refusal_without_finish_reason_is_truncated() {
+    let mut reducer = ChunkReducer::new();
+    let events = reducer
+        .map_chunk(&serde_json::json!({
+            "choices": [{
+                "index": 0,
+                "delta": {"role": "assistant", "refusal": "I cannot comply."},
+                "finish_reason": null
+            }]
+        }))
+        .unwrap();
+
+    assert_eq!(
+        events
+            .iter()
+            .filter_map(ModelEvent::as_text_delta)
+            .collect::<String>(),
+        "I cannot comply."
+    );
+    assert!(reducer.finish().is_err());
+}
+
+#[test]
+fn chat_finish_reasons_preserve_non_success_terminal_semantics() {
+    for (raw, expected) in [
+        ("stop", StopReason::Completed),
+        ("length", StopReason::Length),
+        ("tool_calls", StopReason::ToolUse),
+        ("function_call", StopReason::ToolUse),
+        ("refusal", StopReason::Refusal),
+        (
+            "content_filter",
+            StopReason::Unknown("content_filter".to_owned()),
+        ),
+        (
+            "future_finish_reason",
+            StopReason::Unknown("future_finish_reason".to_owned()),
+        ),
+    ] {
+        let mut reducer = ChunkReducer::new();
+        let mut events = reducer
+            .map_chunk(&serde_json::json!({
+                "choices": [{
+                    "index": 0,
+                    "delta": {},
+                    "finish_reason": raw
+                }]
+            }))
+            .unwrap();
+        events.push(reducer.finish().unwrap().unwrap());
+
+        assert!(matches!(
+            events.last(),
+            Some(ModelEvent::Completed(completion)) if completion.stop_reason() == &expected
+        ));
+        assert!(events_validator_accepts(&events));
+    }
+}
+
+#[test]
+fn chat_stream_without_finish_reason_is_not_a_normal_completion() {
+    let mut reducer = ChunkReducer::new();
+    let events = reducer
+        .map_chunk(&serde_json::json!({
+            "choices": [{
+                "index": 0,
+                "delta": {"content": "partial"},
+                "finish_reason": null
+            }]
+        }))
+        .unwrap();
+
+    assert_eq!(
+        events
+            .iter()
+            .filter_map(ModelEvent::as_text_delta)
+            .collect::<String>(),
+        "partial"
+    );
+    assert!(reducer.finish().is_err());
+}
+
+#[test]
+fn chat_empty_refusal_marker_still_terminates_as_refusal() {
+    let mut reducer = ChunkReducer::new();
+    let mut events = reducer
+        .map_chunk(&serde_json::json!({
+            "choices": [{
+                "index": 0,
+                "delta": {"refusal": ""},
+                "finish_reason": "stop"
+            }]
+        }))
+        .unwrap();
+    events.push(reducer.finish().unwrap().unwrap());
+
+    assert!(events.iter().all(|event| event.as_text_delta().is_none()));
+    assert!(matches!(
+        events.last(),
+        Some(ModelEvent::Completed(completion))
+            if completion.stop_reason() == &StopReason::Refusal
+    ));
+    assert!(events_validator_accepts(&events));
+}
+
+#[test]
+fn chat_finish_reason_is_honored_when_delta_is_omitted() {
+    let mut reducer = ChunkReducer::new();
+    let mut events = reducer
+        .map_chunk(&serde_json::json!({
+            "choices": [{"index": 0, "finish_reason": "content_filter"}]
+        }))
+        .unwrap();
+    events.push(reducer.finish().unwrap().unwrap());
+
+    assert!(matches!(
+        events.last(),
+        Some(ModelEvent::Completed(completion))
+            if completion.stop_reason()
+                == &StopReason::Unknown("content_filter".to_owned())
+    ));
+    assert!(events_validator_accepts(&events));
+}
+
+#[test]
+fn chat_rejects_choice_chunks_after_finish_reason() {
+    for trailing_chunk in [
+        serde_json::json!({"choices": [{"index": 0}]}),
+        serde_json::json!({
+            "choices": [{
+                "index": 0,
+                "delta": {"content": "trailing"},
+                "finish_reason": null
+            }]
+        }),
+        serde_json::json!({
+            "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]
+        }),
+    ] {
+        let mut reducer = ChunkReducer::new();
+        reducer
+            .map_chunk(&serde_json::json!({
+                "choices": [{"index": 0, "delta": {}, "finish_reason": "length"}]
+            }))
+            .unwrap();
+
+        let error = reducer.map_chunk(&trailing_chunk).unwrap_err();
+
+        assert_eq!(
+            error.code(),
+            tea_provider_openai::OpenAiErrorCode::MalformedResponse
+        );
+        assert!(!reducer.terminal_emitted());
+    }
+}
+
+#[test]
+fn chat_usage_terminal_requires_empty_choices_before_completion() {
+    let usage = serde_json::json!({
+        "prompt_tokens": 2,
+        "completion_tokens": 1,
+        "total_tokens": 3
+    });
+    for (finish_first, invalid_chunk) in [
+        (
+            true,
+            serde_json::json!({
+                "choices": [{"index": 0, "delta": {}, "finish_reason": null}],
+                "usage": usage.clone()
+            }),
+        ),
+        (true, serde_json::json!({"usage": usage.clone()})),
+        (true, serde_json::json!({"choices": []})),
+        (
+            false,
+            serde_json::json!({
+                "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+                "usage": usage.clone()
+            }),
+        ),
+    ] {
+        let mut reducer = ChunkReducer::new();
+        if finish_first {
+            reducer
+                .map_chunk(&serde_json::json!({
+                    "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]
+                }))
+                .unwrap();
+        }
+
+        let error = reducer.map_chunk(&invalid_chunk).unwrap_err();
+
+        assert_eq!(
+            error.code(),
+            tea_provider_openai::OpenAiErrorCode::MalformedResponse
+        );
+        assert!(!reducer.terminal_emitted());
+    }
+
+    let mut reducer = ChunkReducer::new();
+    reducer
+        .map_chunk(&serde_json::json!({
+            "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]
+        }))
+        .unwrap();
+    let events = reducer
+        .map_chunk(&serde_json::json!({"choices": [], "usage": usage.clone()}))
+        .unwrap();
+
+    assert!(reducer.terminal_emitted());
+    assert!(matches!(
+        events.as_slice(),
+        [ModelEvent::Completed(completion)] if completion.usage().is_some()
+    ));
+    let error = reducer
+        .map_chunk(&serde_json::json!({"choices": [], "usage": usage}))
+        .unwrap_err();
+    assert_eq!(
+        error.code(),
+        tea_provider_openai::OpenAiErrorCode::MalformedResponse
+    );
+}
+
+#[test]
+fn chat_null_usage_remains_valid_on_choice_chunks() {
+    let mut reducer = ChunkReducer::new();
+    let events = reducer
+        .map_chunk(&serde_json::json!({
+            "choices": [{
+                "index": 0,
+                "delta": {"content": "answer"},
+                "finish_reason": "stop"
+            }],
+            "usage": null
+        }))
+        .unwrap();
+
+    assert!(
+        events
+            .iter()
+            .any(|event| event.as_text_delta() == Some("answer"))
+    );
+    assert!(!reducer.terminal_emitted());
+    assert!(matches!(
+        reducer.finish().unwrap(),
+        Some(ModelEvent::Completed(completion))
+            if completion.stop_reason() == &StopReason::Completed
+    ));
+}
+
+#[test]
+fn chat_rejects_missing_nonzero_and_multiple_choices() {
+    for choices in [
+        serde_json::json!([{"delta":{"content":"{}"},"finish_reason":"stop"}]),
+        serde_json::json!([{"index":1,"delta":{"content":"{}"},"finish_reason":"stop"}]),
+        serde_json::json!([
+            {"index":0,"delta":{"content":"{\"answer\":"},"finish_reason":null},
+            {"index":1,"delta":{"content":"1}"},"finish_reason":"stop"}
+        ]),
+    ] {
+        let error = ChunkReducer::new()
+            .map_chunk(&serde_json::json!({"choices": choices}))
+            .unwrap_err();
+
+        assert_eq!(
+            error.code(),
+            tea_provider_openai::OpenAiErrorCode::MalformedResponse
+        );
+    }
 }
 
 #[test]
@@ -351,6 +863,167 @@ fn responses_fixture_maps_text_reasoning_tools_and_usage() {
 }
 
 #[test]
+fn refusal_responses_fixture_preserves_visible_text_and_terminal_reason() {
+    let events = responses_events_from_fixture("responses_refusal.sse");
+    let text = events
+        .iter()
+        .filter_map(ModelEvent::as_text_delta)
+        .collect::<String>();
+
+    assert_eq!(text, "I cannot comply.");
+    assert!(matches!(
+        events.last(),
+        Some(ModelEvent::Completed(completion))
+            if completion.stop_reason() == &StopReason::Refusal
+    ));
+    assert!(events_validator_accepts(&events));
+}
+
+#[test]
+fn responses_refusal_done_without_delta_is_visible_and_terminal() {
+    let mut reducer = ResponsesReducer::new();
+    let mut events = reducer
+        .map_chunk(&serde_json::json!({
+            "type": "response.created",
+            "response": {"id": "resp_refusal_done", "model": "gpt-test"}
+        }))
+        .unwrap();
+    events.extend(
+        reducer
+            .map_chunk(&serde_json::json!({
+                "type": "response.refusal.done",
+                "output_index": 0,
+                "content_index": 0,
+                "refusal": "I cannot comply."
+            }))
+            .unwrap(),
+    );
+    events.extend(
+        reducer
+            .map_chunk(&serde_json::json!({
+                "type": "response.completed",
+                "response": {
+                    "id": "resp_refusal_done",
+                    "model": "gpt-test",
+                    "status": "completed",
+                    "output": [{
+                        "id": "msg_refusal_done",
+                        "type": "message",
+                        "role": "assistant",
+                        "status": "completed",
+                        "content": [{
+                            "type": "refusal",
+                            "refusal": "I cannot comply."
+                        }]
+                    }]
+                }
+            }))
+            .unwrap(),
+    );
+
+    assert_refusal_events(&events);
+}
+
+#[test]
+fn responses_terminal_refusal_snapshot_without_streamed_text_is_rejected() {
+    let mut reducer = ResponsesReducer::new();
+    let error = reducer
+        .map_chunk(&serde_json::json!({
+            "type": "response.completed",
+            "response": {
+                "id": "resp_refusal_snapshot",
+                "model": "gpt-test",
+                "status": "completed",
+                "output": [{
+                    "id": "msg_refusal_snapshot",
+                    "type": "message",
+                    "role": "assistant",
+                    "status": "completed",
+                    "content": [{
+                        "type": "refusal",
+                        "refusal": "I cannot comply."
+                    }]
+                }]
+            }
+        }))
+        .unwrap_err();
+
+    assert_eq!(
+        error.code(),
+        tea_provider_openai::OpenAiErrorCode::MalformedResponse
+    );
+    assert!(error.message().contains("streamed text"));
+}
+
+#[test]
+fn responses_refusal_takes_precedence_over_tool_use() {
+    let mut reducer = ResponsesReducer::new();
+    let mut events = reducer
+        .map_chunk(&serde_json::json!({
+            "type": "response.refusal.done",
+            "item_id": "msg_tool_then_refusal",
+            "output_index": 1,
+            "content_index": 0,
+            "refusal": "I cannot comply."
+        }))
+        .unwrap();
+    events.extend(
+        reducer
+            .map_chunk(&serde_json::json!({
+                "type": "response.completed",
+                "response": {
+                    "id": "resp_tool_then_refusal",
+                    "model": "gpt-test",
+                    "status": "completed",
+                    "output": [
+                        {
+                            "id": "fc_tool_then_refusal",
+                            "type": "function_call",
+                            "call_id": "call_tool_then_refusal",
+                            "name": "unused_lookup",
+                            "arguments": "{}",
+                            "status": "completed"
+                        },
+                        {
+                            "id": "msg_tool_then_refusal",
+                            "type": "message",
+                            "role": "assistant",
+                            "status": "completed",
+                            "content": [{
+                                "type": "refusal",
+                                "refusal": "I cannot comply."
+                            }]
+                        }
+                    ]
+                }
+            }))
+            .unwrap(),
+    );
+
+    assert_refusal_events(&events);
+    assert!(events.iter().any(|event| matches!(
+        event,
+        ModelEvent::ToolCallCompleted(call) if call.tool_name() == "unused_lookup"
+    )));
+}
+
+fn assert_refusal_events(events: &[ModelEvent]) {
+    assert_eq!(
+        events
+            .iter()
+            .filter_map(ModelEvent::as_text_delta)
+            .collect::<String>(),
+        "I cannot comply."
+    );
+    assert!(matches!(
+        events.last(),
+        Some(ModelEvent::Completed(completion))
+            if completion.stop_reason() == &StopReason::Refusal
+    ));
+    assert!(events_validator_accepts(events));
+}
+
+#[test]
 fn responses_failed_fixture_maps_to_failed_terminal() {
     let events = responses_events_from_fixture("responses_failed.sse");
     let failure = events
@@ -386,6 +1059,401 @@ fn responses_incomplete_is_a_terminal_failure() {
         })
         .unwrap();
     assert_eq!(failure.code(), tea_model::ModelFailureCode::ContextOverflow);
+    assert!(events_validator_accepts(&events));
+}
+
+#[test]
+fn responses_completed_rejects_non_completed_response_status() {
+    for response in [
+        serde_json::json!({"id": "resp_incomplete", "status": "incomplete", "output": []}),
+        serde_json::json!({"id": "resp_failed", "status": "failed", "output": []}),
+        serde_json::json!({"id": "resp_missing_status", "output": []}),
+    ] {
+        let mut reducer = ResponsesReducer::new();
+        let error = reducer
+            .map_chunk(&serde_json::json!({
+                "type": "response.completed",
+                "response": response
+            }))
+            .unwrap_err();
+
+        assert_eq!(
+            error.code(),
+            tea_provider_openai::OpenAiErrorCode::MalformedResponse
+        );
+    }
+}
+
+#[test]
+fn responses_rejects_data_after_completed_event() {
+    let mut reducer = ResponsesReducer::new();
+    for event in [
+        message_added(0, "msg_terminal"),
+        output_text_delta(0, 0, "{}"),
+    ] {
+        reducer.map_chunk(&event).unwrap();
+    }
+    let events = reducer
+        .map_chunk(&serde_json::json!({
+            "type": "response.completed",
+            "response": {
+                "id": "resp_terminal",
+                "status": "completed",
+                "error": null,
+                "incomplete_details": null,
+                "output": [{
+                    "id": "msg_terminal",
+                    "type": "message",
+                    "role": "assistant",
+                    "status": "completed",
+                    "content": [{"type": "output_text", "text": "{}"}]
+                }]
+            }
+        }))
+        .unwrap();
+    assert!(matches!(events.last(), Some(ModelEvent::Completed(_))));
+
+    let error = reducer
+        .map_chunk(&serde_json::json!({
+            "type": "response.incomplete",
+            "response": {
+                "id": "resp_terminal",
+                "status": "incomplete",
+                "incomplete_details": {"reason": "max_output_tokens"}
+            }
+        }))
+        .unwrap_err();
+
+    assert_eq!(
+        error.code(),
+        tea_provider_openai::OpenAiErrorCode::MalformedResponse
+    );
+}
+
+#[test]
+fn responses_completed_rejects_contradictory_error_and_incomplete_details() {
+    for contradictory_field in [
+        serde_json::json!({"error": {"code": "server_error", "message": "failed"}}),
+        serde_json::json!({"incomplete_details": {"reason": "max_output_tokens"}}),
+    ] {
+        let mut reducer = ResponsesReducer::new();
+        for event in [
+            message_added(0, "msg_contradiction"),
+            output_text_delta(0, 0, "{}"),
+        ] {
+            reducer.map_chunk(&event).unwrap();
+        }
+        let mut response = serde_json::json!({
+            "id": "resp_contradiction",
+            "status": "completed",
+            "error": null,
+            "incomplete_details": null,
+            "output": [{
+                "id": "msg_contradiction",
+                "type": "message",
+                "role": "assistant",
+                "status": "completed",
+                "content": [{"type": "output_text", "text": "{}"}]
+            }]
+        });
+        response
+            .as_object_mut()
+            .unwrap()
+            .extend(contradictory_field.as_object().unwrap().clone());
+
+        let error = reducer
+            .map_chunk(&serde_json::json!({
+                "type": "response.completed",
+                "response": response
+            }))
+            .unwrap_err();
+
+        assert_eq!(
+            error.code(),
+            tea_provider_openai::OpenAiErrorCode::MalformedResponse
+        );
+    }
+}
+
+#[test]
+fn responses_completed_rejects_non_completed_message_status() {
+    for status in ["incomplete", "in_progress"] {
+        let mut reducer = ResponsesReducer::new();
+        for event in [
+            message_added(0, "msg_status"),
+            output_text_delta(0, 0, "{}"),
+        ] {
+            reducer.map_chunk(&event).unwrap();
+        }
+
+        let error = reducer
+            .map_chunk(&serde_json::json!({
+                "type": "response.completed",
+                "response": {
+                    "id": "resp_status",
+                    "status": "completed",
+                    "error": null,
+                    "incomplete_details": null,
+                    "output": [{
+                        "id": "msg_status",
+                        "type": "message",
+                        "role": "assistant",
+                        "status": status,
+                        "content": [{"type": "output_text", "text": "{}"}]
+                    }]
+                }
+            }))
+            .unwrap_err();
+
+        assert_eq!(
+            error.code(),
+            tea_provider_openai::OpenAiErrorCode::MalformedResponse
+        );
+    }
+}
+
+#[test]
+fn responses_completed_rejects_inconsistent_usage_accounting() {
+    for usage in [
+        serde_json::json!({
+            "input_tokens": 1,
+            "output_tokens": 1,
+            "total_tokens": 2,
+            "input_tokens_details": {"cached_tokens": 2}
+        }),
+        serde_json::json!({
+            "input_tokens": 1,
+            "output_tokens": 1,
+            "total_tokens": 99
+        }),
+    ] {
+        let mut reducer = ResponsesReducer::new();
+        for event in [message_added(0, "msg_usage"), output_text_delta(0, 0, "{}")] {
+            reducer.map_chunk(&event).unwrap();
+        }
+
+        let error = reducer
+            .map_chunk(&serde_json::json!({
+                "type": "response.completed",
+                "response": {
+                    "id": "resp_usage",
+                    "status": "completed",
+                    "output": [{
+                        "id": "msg_usage",
+                        "type": "message",
+                        "role": "assistant",
+                        "status": "completed",
+                        "content": [{"type": "output_text", "text": "{}"}]
+                    }],
+                    "usage": usage
+                }
+            }))
+            .unwrap_err();
+
+        assert_eq!(
+            error.code(),
+            tea_provider_openai::OpenAiErrorCode::MalformedResponse
+        );
+    }
+}
+
+#[test]
+fn responses_completed_requires_a_nonempty_output_snapshot() {
+    for response in [
+        serde_json::json!({"id": "resp_missing", "status": "completed"}),
+        serde_json::json!({"id": "resp_null", "status": "completed", "output": null}),
+        serde_json::json!({"id": "resp_object", "status": "completed", "output": {}}),
+        serde_json::json!({"id": "resp_empty", "status": "completed", "output": []}),
+    ] {
+        let error = ResponsesReducer::new()
+            .map_chunk(&serde_json::json!({
+                "type": "response.completed",
+                "response": response
+            }))
+            .unwrap_err();
+
+        assert_eq!(
+            error.code(),
+            tea_provider_openai::OpenAiErrorCode::MalformedResponse
+        );
+        assert!(error.message().contains("output"));
+    }
+}
+
+#[test]
+fn responses_completed_accepts_an_empty_text_part_in_a_nonempty_output() {
+    let events = ResponsesReducer::new()
+        .map_chunk(&serde_json::json!({
+            "type": "response.completed",
+            "response": {
+                "id": "resp_empty_text",
+                "status": "completed",
+                "output": [{
+                    "id": "msg_empty_text",
+                    "type": "message",
+                    "role": "assistant",
+                    "status": "completed",
+                    "content": [{"type": "output_text", "text": ""}]
+                }]
+            }
+        }))
+        .unwrap();
+
+    assert!(matches!(events.last(), Some(ModelEvent::Completed(_))));
+    assert!(events.iter().all(|event| event.as_text_delta().is_none()));
+    assert!(events_validator_accepts(&events));
+}
+
+#[test]
+fn responses_completed_rejects_an_unanchored_text_delta() {
+    let mut reducer = ResponsesReducer::new();
+    reducer
+        .map_chunk(&output_text_delta(0, 0, "orphan"))
+        .unwrap();
+
+    let error = reducer
+        .map_chunk(&serde_json::json!({
+            "type": "response.completed",
+            "response": {
+                "id": "resp_orphan",
+                "status": "completed",
+                "output": [{
+                    "id": "msg_orphan",
+                    "type": "message",
+                    "role": "assistant",
+                    "status": "completed",
+                    "content": []
+                }]
+            }
+        }))
+        .unwrap_err();
+
+    assert_eq!(
+        error.code(),
+        tea_provider_openai::OpenAiErrorCode::MalformedResponse
+    );
+}
+
+#[test]
+fn responses_completed_rejects_output_and_content_index_mismatches() {
+    let cases = [
+        (
+            vec![
+                message_added(1, "msg_wrong_output"),
+                output_text_delta(1, 0, "answer"),
+            ],
+            serde_json::json!([message_item("msg_wrong_output", "answer", &[])]),
+        ),
+        (
+            vec![
+                message_added(0, "msg_wrong_content"),
+                output_text_delta(0, 1, "answer"),
+            ],
+            serde_json::json!([message_item("msg_wrong_content", "answer", &[])]),
+        ),
+    ];
+
+    for (stream, output) in cases {
+        let mut reducer = ResponsesReducer::new();
+        for event in stream {
+            reducer.map_chunk(&event).unwrap();
+        }
+        let error = reducer
+            .map_chunk(&serde_json::json!({
+                "type": "response.completed",
+                "response": {
+                    "id": "resp_index_mismatch",
+                    "status": "completed",
+                    "output": output
+                }
+            }))
+            .unwrap_err();
+
+        assert_eq!(
+            error.code(),
+            tea_provider_openai::OpenAiErrorCode::MalformedResponse
+        );
+    }
+}
+
+#[test]
+fn responses_completed_rejects_text_emitted_out_of_canonical_order() {
+    let mut reducer = ResponsesReducer::new();
+    for event in [
+        message_added(0, "msg_first"),
+        message_added(1, "msg_second"),
+        output_text_delta(1, 0, "second"),
+        output_text_delta(0, 0, "first"),
+    ] {
+        reducer.map_chunk(&event).unwrap();
+    }
+
+    let error = reducer
+        .map_chunk(&serde_json::json!({
+            "type": "response.completed",
+            "response": {
+                "id": "resp_wrong_order",
+                "status": "completed",
+                "output": [
+                    message_item("msg_first", "first", &[]),
+                    message_item("msg_second", "second", &[])
+                ]
+            }
+        }))
+        .unwrap_err();
+
+    assert_eq!(
+        error.code(),
+        tea_provider_openai::OpenAiErrorCode::MalformedResponse
+    );
+}
+
+#[test]
+fn responses_completed_accepts_canonical_output_and_content_text_order() {
+    let mut reducer = ResponsesReducer::new();
+    let mut events = Vec::new();
+    for event in [
+        message_added(0, "msg_first"),
+        output_text_delta(0, 0, "first"),
+        output_text_delta(0, 1, " second"),
+        message_added(1, "msg_last"),
+        output_text_delta(1, 0, " last"),
+    ] {
+        events.extend(reducer.map_chunk(&event).unwrap());
+    }
+    events.extend(
+        reducer
+            .map_chunk(&serde_json::json!({
+                "type": "response.completed",
+                "response": {
+                    "id": "resp_canonical_order",
+                    "status": "completed",
+                    "output": [
+                        {
+                            "id": "msg_first",
+                            "type": "message",
+                            "role": "assistant",
+                            "status": "completed",
+                            "content": [
+                                {"type": "output_text", "text": "first"},
+                                {"type": "output_text", "text": " second"}
+                            ]
+                        },
+                        message_item("msg_last", " last", &[])
+                    ]
+                }
+            }))
+            .unwrap(),
+    );
+
+    assert_eq!(
+        events
+            .iter()
+            .filter_map(ModelEvent::as_text_delta)
+            .collect::<String>(),
+        "first second last"
+    );
+    assert!(matches!(events.last(), Some(ModelEvent::Completed(_))));
     assert!(events_validator_accepts(&events));
 }
 
@@ -933,7 +2001,7 @@ fn responses_completed_rejects_unfinished_web_search() {
     reducer
         .map_chunk(&serde_json::json!({
             "type": "response.output_item.added",
-            "output_index": 0,
+            "output_index": 1,
             "item": {"id": "ws_unfinished", "type": "web_search_call"}
         }))
         .unwrap();
@@ -944,7 +2012,13 @@ fn responses_completed_rejects_unfinished_web_search() {
             "response": {
                 "id": "resp_unfinished",
                 "status": "completed",
-                "output": []
+                "output": [{
+                    "id": "msg_empty",
+                    "type": "message",
+                    "role": "assistant",
+                    "status": "completed",
+                    "content": []
+                }]
             }
         }))
         .unwrap_err();
@@ -962,7 +2036,7 @@ fn responses_completed_rejects_unfinished_function_call() {
     reducer
         .map_chunk(&serde_json::json!({
             "type": "response.output_item.added",
-            "output_index": 0,
+            "output_index": 1,
             "item": {
                 "type": "function_call",
                 "call_id": "call_unfinished",
@@ -978,7 +2052,13 @@ fn responses_completed_rejects_unfinished_function_call() {
             "response": {
                 "id": "resp_unfinished",
                 "status": "completed",
-                "output": []
+                "output": [{
+                    "id": "msg_empty",
+                    "type": "message",
+                    "role": "assistant",
+                    "status": "completed",
+                    "content": []
+                }]
             }
         }))
         .unwrap_err();
@@ -1049,41 +2129,33 @@ fn responses_rejects_output_index_type_changes() {
 }
 
 #[test]
-fn responses_resolves_reference_events_by_declared_item_identity() {
+fn responses_rejects_reused_output_index_with_a_different_item_identity() {
     let mut reducer = ResponsesReducer::new();
-    for value in [
-        serde_json::json!({
+    reducer
+        .map_chunk(&serde_json::json!({
             "type": "response.output_item.added",
             "output_index": 0,
             "item": {"id": "reasoning_0", "type": "reasoning"}
-        }),
-        serde_json::json!({
-            "type": "response.output_item.added",
-            "output_index": 0,
-            "item": {"id": "message_1", "type": "message", "content": []}
-        }),
-    ] {
-        reducer.map_chunk(&value).unwrap();
-    }
-
-    let events = reducer
-        .map_chunk(&serde_json::json!({
-            "type": "response.output_text.delta",
-            "output_index": 0,
-            "item_id": "message_1",
-            "content_index": 0,
-            "delta": "identity wins"
         }))
         .unwrap();
 
-    assert!(matches!(
-        events.as_slice(),
-        [ModelEvent::TextDelta(delta)] if delta.as_str() == "identity wins"
-    ));
+    let error = reducer
+        .map_chunk(&serde_json::json!({
+            "type": "response.output_item.added",
+            "output_index": 0,
+            "item": {"id": "message_1", "type": "message", "content": []}
+        }))
+        .unwrap_err();
+
+    assert_eq!(
+        error.code(),
+        tea_provider_openai::OpenAiErrorCode::MalformedResponse
+    );
+    assert!(error.message().contains("item identity"));
 }
 
 #[test]
-fn responses_allows_reasoning_and_message_streams_to_reuse_a_non_executable_index() {
+fn responses_rejects_reasoning_and_message_streams_reusing_an_output_index() {
     let mut reducer = ResponsesReducer::new();
     reducer
         .map_chunk(&serde_json::json!({
@@ -1093,46 +2165,20 @@ fn responses_allows_reasoning_and_message_streams_to_reuse_a_non_executable_inde
         }))
         .unwrap();
 
-    let events = reducer
+    let error = reducer
         .map_chunk(&serde_json::json!({
             "type": "response.output_text.delta",
             "output_index": 0,
             "content_index": 0,
             "delta": "visible answer"
         }))
-        .unwrap();
+        .unwrap_err();
 
-    assert!(matches!(
-        events.as_slice(),
-        [ModelEvent::TextDelta(delta)] if delta.as_str() == "visible answer"
-    ));
-
-    let text_done_events = reducer
-        .map_chunk(&serde_json::json!({
-            "type": "response.output_text.done",
-            "output_index": 1,
-            "content_index": 0,
-            "text": "visible answer"
-        }))
-        .unwrap();
-    assert!(text_done_events.is_empty());
-
-    let terminal_item_events = reducer
-        .map_chunk(&serde_json::json!({
-            "type": "response.output_item.done",
-            "output_index": 1,
-            "item": {
-                "id": "message_terminal",
-                "type": "message",
-                "content": [{
-                    "type": "output_text",
-                    "text": "visible answer",
-                    "annotations": []
-                }]
-            }
-        }))
-        .unwrap();
-    assert!(terminal_item_events.is_empty());
+    assert_eq!(
+        error.code(),
+        tea_provider_openai::OpenAiErrorCode::MalformedResponse
+    );
+    assert!(error.message().contains("changed type"));
 }
 
 #[test]
@@ -1344,7 +2390,7 @@ fn responses_rejects_conflicting_function_call_in_completed_response_snapshot() 
 
 #[test]
 #[allow(clippy::too_many_lines)]
-fn responses_completed_does_not_replay_items_when_terminal_ids_change() {
+fn responses_completed_rejects_terminal_item_identity_changes() {
     let mut reducer = ResponsesReducer::new();
     let streamed = [
         serde_json::json!({
@@ -1401,53 +2447,35 @@ fn responses_completed_does_not_replay_items_when_terminal_ids_change() {
         events.extend(reducer.map_chunk(&value).unwrap());
     }
 
-    events.extend(
-        reducer
-            .map_chunk(&serde_json::json!({
-                "type": "response.completed",
-                "response": {
-                    "id": "resp_changed_ids",
-                    "status": "completed",
-                    "output": [
-                        {
-                            "id": "reasoning_terminal",
-                            "type": "reasoning",
-                            "summary": [{"type": "summary_text", "text": "Need the file."}]
-                        },
-                        {
-                            "id": "function_terminal",
-                            "type": "function_call",
-                            "call_id": "call_read",
-                            "name": "read",
-                            "arguments": "{\"path\":\"README.md\"}"
-                        }
-                    ]
-                }
-            }))
-            .unwrap(),
-    );
+    let error = reducer
+        .map_chunk(&serde_json::json!({
+            "type": "response.completed",
+            "response": {
+                "id": "resp_changed_ids",
+                "status": "completed",
+                "output": [
+                    {
+                        "id": "reasoning_terminal",
+                        "type": "reasoning",
+                        "summary": [{"type": "summary_text", "text": "Need the file."}]
+                    },
+                    {
+                        "id": "function_terminal",
+                        "type": "function_call",
+                        "call_id": "call_read",
+                        "name": "read",
+                        "arguments": "{\"path\":\"README.md\"}"
+                    }
+                ]
+            }
+        }))
+        .unwrap_err();
 
     assert_eq!(
-        events
-            .iter()
-            .filter(|event| matches!(event, ModelEvent::ToolCallStarted(_)))
-            .count(),
-        1
+        error.code(),
+        tea_provider_openai::OpenAiErrorCode::MalformedResponse
     );
-    assert_eq!(
-        events
-            .iter()
-            .filter(|event| matches!(event, ModelEvent::ToolCallCompleted(_)))
-            .count(),
-        1
-    );
-    let thinking = events
-        .iter()
-        .filter_map(ModelEvent::as_thinking_delta)
-        .collect::<String>();
-    assert_eq!(thinking, "Need the file.");
-    assert!(matches!(events.last(), Some(ModelEvent::Completed(_))));
-    assert!(events_validator_accepts(&events));
+    assert!(error.message().contains("item identity"));
 }
 
 #[test]
@@ -1612,7 +2640,19 @@ fn responses_waits_for_all_searches_before_resolving_citation_identity() {
         reducer
             .map_chunk(&serde_json::json!({
                 "type": "response.completed",
-                "response": {"id": "resp_shared", "status": "completed", "output": []}
+                "response": {
+                    "id": "resp_shared",
+                    "status": "completed",
+                    "output": [
+                        web_search_item("ws_first", url),
+                        web_search_item("ws_second", url),
+                        message_item(
+                            "msg_shared",
+                            "Tea.",
+                            &[citation_annotation(url, 0, 3)]
+                        )
+                    ]
+                }
             }))
             .unwrap(),
     );

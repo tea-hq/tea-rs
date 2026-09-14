@@ -37,7 +37,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .build()
         .await?;
 
-    println!("{}", session.prompt(message).await?.text());
+    println!("{}", session.prompt(message, None).await?.text());
     Ok(())
 }
 

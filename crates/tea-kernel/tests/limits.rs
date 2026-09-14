@@ -2,6 +2,7 @@ use crate::common;
 
 use std::str::FromStr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use serde_json::json;
@@ -51,6 +52,25 @@ impl KernelClock for ImmediateDeadlineClock {
     }
     fn sleep_until(&self, _deadline: ProtocolTimestamp) -> KernelDeadlineFuture<'_> {
         Box::pin(async {})
+    }
+}
+
+#[derive(Debug, Default)]
+struct FailSecondNowClock(AtomicUsize);
+impl KernelClock for FailSecondNowClock {
+    fn now(&self) -> Result<ProtocolTimestamp, KernelError> {
+        if self.0.fetch_add(1, Ordering::SeqCst) == 0 {
+            Ok(timestamp())
+        } else {
+            Err(KernelError::new(
+                KernelErrorCode::ClockFailure,
+                "clock failed",
+            ))
+        }
+    }
+
+    fn sleep_until(&self, _deadline: ProtocolTimestamp) -> KernelDeadlineFuture<'_> {
+        Box::pin(std::future::pending())
     }
 }
 
@@ -144,6 +164,44 @@ async fn assistant_output_limit_interrupts_without_committing_message() {
         snapshot.records().last().unwrap().record(),
         SessionRecord::RunInterrupted { .. }
     ));
+}
+
+#[tokio::test]
+async fn deadline_is_constructed_before_run_started_is_emitted() {
+    let provider = provider([ScriptedModelResponse::text(["unused"])]);
+    let store = store().await;
+    let tools = ToolRegistry::new();
+    let policy = PolicyEngine::new();
+    let events = EventCollector::default();
+
+    let error = AgentKernel::new(
+        &provider,
+        &tools,
+        &policy,
+        &store,
+        &FailSecondNowClock::default(),
+        &TestIds::default(),
+        &events,
+    )
+    .run(
+        session_id(),
+        &config(RunLimits::default()),
+        CancellationScope::new(),
+    )
+    .await
+    .unwrap_err();
+
+    assert_eq!(error.code(), KernelErrorCode::ClockFailure);
+    assert!(events.events().is_empty());
+    assert!(
+        store
+            .load(session_id())
+            .await
+            .unwrap()
+            .state()
+            .run_recovery()
+            .is_empty()
+    );
 }
 
 #[tokio::test]

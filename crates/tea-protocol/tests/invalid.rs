@@ -1,9 +1,35 @@
 use std::str::FromStr;
 
+use serde_json::{Value, json};
 use tea_protocol::{
-    CommandEnvelope, EventEnvelope, ProtocolErrorEnvelope, ProtocolMetadata, ProtocolTimestamp,
-    ProtocolVersion, RecordEnvelope, SessionId, SessionSequence,
+    CommandEnvelope, EventEnvelope, FinalOutputFormat, FinalOutputFormatError,
+    ProtocolErrorEnvelope, ProtocolMetadata, ProtocolTimestamp, ProtocolVersion, RecordEnvelope,
+    SessionId, SessionSequence,
 };
+
+const COMMAND_ID: &str = "0195a0b1-5e3c-70a1-927f-0aa7aa000002";
+const SESSION_ID: &str = "0195a0b1-5e3a-7d72-a902-c4e85d828bf1";
+const MESSAGE_ID: &str = "0195a0b1-5e3d-7bb4-863a-0aa7aa000003";
+const TIMESTAMP: &str = "2026-07-23T09:30:12.124Z";
+
+fn prompt_with_final_output_format(final_output_format: &Value) -> Value {
+    json!({
+        "protocolVersion":"1.0",
+        "type":"prompt",
+        "commandId":COMMAND_ID,
+        "sessionId":SESSION_ID,
+        "timestamp":TIMESTAMP,
+        "payload":{
+            "message":{
+                "id":MESSAGE_ID,
+                "type":"user",
+                "content":[{"type":"text","text":"Return JSON."}],
+                "timestamp":TIMESTAMP
+            },
+            "finalOutputFormat":final_output_format
+        }
+    })
+}
 
 #[test]
 fn invalid_protocol_versions_are_rejected() {
@@ -113,6 +139,84 @@ fn invalid_or_lossy_timestamps_are_rejected() {
         assert!(
             ProtocolTimestamp::from_str(value).is_err(),
             "accepted {value:?}"
+        );
+    }
+}
+
+#[test]
+fn final_output_format_rejects_unknown_or_incomplete_wire_shapes() {
+    for format in [
+        json!({"type":"json_object","unexpected":true}),
+        json!({"type":"json_schema"}),
+        json!({"type":"future_format"}),
+    ] {
+        assert!(
+            serde_json::from_value::<CommandEnvelope>(prompt_with_final_output_format(&format))
+                .is_err()
+        );
+    }
+}
+
+#[test]
+fn final_output_schema_requires_a_bounded_object() {
+    let non_object = json!({"type":"json_schema","schema":["not", "an", "object"]});
+    let invalid_schema = json!({"type":"json_schema","schema":{"type":7}});
+    let oversized = json!({
+        "type":"json_schema",
+        "schema":{"type":"object","description":"x".repeat(256 * 1024)}
+    });
+    let mut deeply_nested_schema = json!({"type":"object"});
+    for _ in 0..40 {
+        deeply_nested_schema = json!({
+            "type":"object",
+            "properties":{"next":deeply_nested_schema}
+        });
+    }
+    let deeply_nested = json!({"type":"json_schema","schema":deeply_nested_schema});
+    for format in [non_object, invalid_schema, oversized, deeply_nested] {
+        assert!(
+            serde_json::from_value::<CommandEnvelope>(prompt_with_final_output_format(&format))
+                .is_err()
+        );
+    }
+}
+
+#[test]
+fn deeply_nested_direct_schema_fails_before_recursive_serialization() {
+    let mut nested = Value::Null;
+    for _ in 0..10_000 {
+        nested = Value::Array(vec![nested]);
+    }
+    let mut schema = serde_json::Map::new();
+    schema.insert("allOf".to_owned(), Value::Array(vec![nested]));
+    let format = FinalOutputFormat::JsonSchema {
+        schema: Value::Object(schema),
+    };
+
+    assert_eq!(
+        format.validate(),
+        Err(FinalOutputFormatError::SchemaOutOfBounds)
+    );
+    // Dropping an adversarially deep serde_json::Value is itself recursive.
+    std::mem::forget(format);
+}
+
+#[test]
+fn final_output_schema_rejects_external_references() {
+    for reference in [
+        "https://schemas.example.test/final-output.json",
+        "http://schemas.example.test/final-output.json",
+        "file:///tmp/final-output.json",
+    ] {
+        let format = json!({
+            "type":"json_schema",
+            "schema":{"$ref":reference}
+        });
+
+        assert!(
+            serde_json::from_value::<CommandEnvelope>(prompt_with_final_output_format(&format))
+                .is_err(),
+            "accepted external schema reference {reference:?}"
         );
     }
 }

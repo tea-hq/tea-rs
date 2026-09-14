@@ -12,8 +12,8 @@ use tea_context::{
 };
 use tea_model::{ModelCapabilities, ModelDisplayName, ModelSpec, ProviderId};
 use tea_protocol::{
-    AgentCommand, BranchId, CommandEnvelope, CommandId, ModelRef, ProtocolMetadata,
-    ProtocolTimestamp, ReasoningEffort, TokenCount,
+    AgentCommand, BranchId, CommandEnvelope, CommandId, FinalOutputFormat, ModelRef,
+    ProtocolMetadata, ProtocolTimestamp, ReasoningEffort, TokenCount,
 };
 use tea_session::InMemorySessionStore;
 use tea_testkit::{ScriptedModelProvider, ScriptedModelResponse};
@@ -60,6 +60,87 @@ fn reasoning_provider(
         vec![model],
         scripts,
     ))
+}
+
+#[tokio::test]
+async fn unsupported_final_output_format_is_rejected_before_user_message_commit() {
+    let provider = common::provider_with([ScriptedModelResponse::text([r#"{"answer":"unused"}"#])]);
+    let runtime = build_runtime(
+        Arc::clone(&provider),
+        Arc::new(TestIds::default()),
+        Arc::new(TestSessionIds::default()),
+    )
+    .unwrap();
+    let session_id = create_session(&runtime, "coding-agent").await;
+
+    let error = runtime
+        .send(envelope(
+            AgentCommand::Prompt {
+                message: user_message("return JSON"),
+                final_output_format: Some(FinalOutputFormat::JsonObject),
+            },
+            Some(session_id),
+        ))
+        .await
+        .unwrap_err();
+
+    assert_eq!(error.code(), RuntimeErrorCode::InvalidRequest);
+    assert!(provider.captured_requests().unwrap().is_empty());
+    assert!(
+        runtime
+            .snapshot(session_id)
+            .await
+            .unwrap()
+            .state()
+            .messages()
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn schema_with_active_tools_is_rejected_before_user_message_commit() {
+    let provider = common::provider_with_capabilities(
+        [ScriptedModelResponse::text([r#"{"answer":"unused"}"#])],
+        ModelCapabilities::text()
+            .with_tools(true)
+            .with_final_json_schema(),
+    );
+    let runtime = build_runtime(
+        Arc::clone(&provider),
+        Arc::new(TestIds::default()),
+        Arc::new(TestSessionIds::default()),
+    )
+    .unwrap();
+    let session_id = create_session(&runtime, "coding-agent").await;
+
+    let error = runtime
+        .send(envelope(
+            AgentCommand::Prompt {
+                message: user_message("return schema-constrained JSON"),
+                final_output_format: Some(FinalOutputFormat::JsonSchema {
+                    schema: serde_json::json!({"type": "object"}),
+                }),
+            },
+            Some(session_id),
+        ))
+        .await
+        .unwrap_err();
+
+    assert_eq!(error.code(), RuntimeErrorCode::InvalidRequest);
+    assert_eq!(
+        error.message(),
+        "model does not support JSON-Schema final output with tools"
+    );
+    assert!(provider.captured_requests().unwrap().is_empty());
+    assert!(
+        runtime
+            .snapshot(session_id)
+            .await
+            .unwrap()
+            .state()
+            .messages()
+            .is_empty()
+    );
 }
 
 #[derive(Debug)]
@@ -171,6 +252,7 @@ async fn context_provider_is_recomputed_per_turn_and_inspection_excludes_content
         .send(envelope(
             AgentCommand::Prompt {
                 message: user_message("first"),
+                final_output_format: None,
             },
             Some(session_id),
         ))
@@ -182,6 +264,7 @@ async fn context_provider_is_recomputed_per_turn_and_inspection_excludes_content
         .send(envelope(
             AgentCommand::Prompt {
                 message: user_message("second"),
+                final_output_format: None,
             },
             Some(session_id),
         ))
@@ -332,6 +415,7 @@ async fn providerless_session_keeps_its_model_until_the_provider_is_registered()
         .send(envelope(
             AgentCommand::Prompt {
                 message: user_message("before registration"),
+                final_output_format: None,
             },
             Some(session_id),
         ))
@@ -356,6 +440,7 @@ async fn providerless_session_keeps_its_model_until_the_provider_is_registered()
         .send(envelope(
             AgentCommand::Prompt {
                 message: user_message("after registration"),
+                final_output_format: None,
             },
             Some(session_id),
         ))
@@ -428,6 +513,7 @@ async fn active_run_finishes_against_its_starting_generation_after_removal() {
                 .send(envelope(
                     AgentCommand::Prompt {
                         message: user_message("use the captured generation"),
+                        final_output_format: None,
                     },
                     Some(session_id),
                 ))
@@ -449,6 +535,7 @@ async fn active_run_finishes_against_its_starting_generation_after_removal() {
         .send(envelope(
             AgentCommand::Prompt {
                 message: user_message("future run"),
+                final_output_format: None,
             },
             Some(session_id),
         ))
@@ -535,6 +622,7 @@ async fn set_model_routes_same_model_id_to_the_selected_provider() {
         .send(envelope(
             AgentCommand::Prompt {
                 message: user_message("route this request"),
+                final_output_format: None,
             },
             Some(session_id),
         ))
@@ -615,6 +703,7 @@ async fn reopened_session_routes_by_persisted_provider_identity() {
         .send(envelope(
             AgentCommand::Prompt {
                 message: user_message("provider is temporarily unavailable"),
+                final_output_format: None,
             },
             Some(session_id),
         ))
@@ -636,6 +725,7 @@ async fn reopened_session_routes_by_persisted_provider_identity() {
         .send(envelope(
             AgentCommand::Prompt {
                 message: user_message("continue after reopen"),
+                final_output_format: None,
             },
             Some(session_id),
         ))
@@ -761,6 +851,7 @@ async fn reasoning_change_is_rejected_while_a_run_is_active() {
                 .send(envelope(
                     AgentCommand::Prompt {
                         message: user_message("keep running"),
+                        final_output_format: None,
                     },
                     Some(session_id),
                 ))

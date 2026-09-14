@@ -54,6 +54,9 @@ const CAP_TOOLS: u16 = 1 << 2;
 const CAP_PARALLEL_TOOLS: u16 = 1 << 3;
 const CAP_USAGE: u16 = 1 << 4;
 const CAP_HOSTED_WEB_SEARCH: u16 = 1 << 5;
+const CAP_FINAL_JSON_OBJECT: u16 = 1 << 6;
+const CAP_FINAL_JSON_SCHEMA: u16 = 1 << 7;
+const CAP_FINAL_JSON_SCHEMA_WITH_TOOLS: u16 = 1 << 8;
 
 /// Provider-neutral capabilities advertised by one model.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -108,6 +111,27 @@ impl ModelCapabilities {
         self
     }
 
+    /// Enables JSON-object final output for this model and endpoint.
+    #[must_use]
+    pub const fn with_final_json_object(mut self) -> Self {
+        self.0 |= CAP_FINAL_JSON_OBJECT;
+        self
+    }
+
+    /// Enables JSON-Schema-constrained final output for this model and endpoint.
+    #[must_use]
+    pub const fn with_final_json_schema(mut self) -> Self {
+        self.0 |= CAP_FINAL_JSON_SCHEMA;
+        self
+    }
+
+    /// Enables JSON-Schema final output combined with model-visible tools.
+    #[must_use]
+    pub const fn with_final_json_schema_with_tools(mut self) -> Self {
+        self.0 |= CAP_FINAL_JSON_SCHEMA | CAP_FINAL_JSON_SCHEMA_WITH_TOOLS;
+        self
+    }
+
     /// Returns whether text input is accepted.
     #[must_use]
     pub const fn accepts_text(self) -> bool {
@@ -150,6 +174,24 @@ impl ModelCapabilities {
         match kind {
             HostedToolKind::WebSearch => self.0 & CAP_HOSTED_WEB_SEARCH != 0,
         }
+    }
+
+    /// Returns whether JSON-object final output is supported.
+    #[must_use]
+    pub const fn supports_final_json_object(self) -> bool {
+        self.0 & CAP_FINAL_JSON_OBJECT != 0
+    }
+
+    /// Returns whether JSON-Schema-constrained final output is supported.
+    #[must_use]
+    pub const fn supports_final_json_schema(self) -> bool {
+        self.0 & CAP_FINAL_JSON_SCHEMA != 0
+    }
+
+    /// Returns whether JSON-Schema final output may be combined with tools.
+    #[must_use]
+    pub const fn supports_final_json_schema_with_tools(self) -> bool {
+        self.0 & CAP_FINAL_JSON_SCHEMA_WITH_TOOLS != 0
     }
 }
 

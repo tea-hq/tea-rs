@@ -33,6 +33,7 @@ tokio = { workspace = true, features = ["time"] }
 uuid.workspace = true
 
 [dev-dependencies]
+tea-provider-anthropic = { version = "=0.1.0", path = "../tea-provider-anthropic" }
 tea-testkit = { version = "=0.1.0", path = "../tea-testkit" }
 
 [lints]

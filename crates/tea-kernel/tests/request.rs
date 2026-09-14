@@ -1,3 +1,5 @@
+use crate::common;
+
 use std::str::FromStr;
 use std::sync::Arc;
 
@@ -7,19 +9,22 @@ use tea_context::{
     PromptModule, PromptModuleId, PromptPriority, PromptProvenance, PromptSegment, PromptSegmentId,
     TrustLevel,
 };
-use tea_kernel::{KernelErrorCode, KernelRunConfig, TurnRequestSnapshot};
+use tea_control::CancellationScope;
+use tea_kernel::{AgentKernel, KernelErrorCode, KernelRunConfig, TurnRequestSnapshot};
 use tea_model::{
     HostedToolKind, HostedToolOptions, ModelCapabilities, ModelDisplayName, ModelProvider,
     ModelSpec, ProviderId, WebSearchOptions,
 };
-use tea_policy::{ActorId, ExecutionSurface, PolicyEnvironment, PolicyExecutionTarget};
-use tea_protocol::{
-    CanonicalMessage, ContentBlock, MessageId, ModelId, ProfileId, ProtocolMetadata,
-    ProtocolTimestamp, ReasoningEffort, RecordEnvelope, RecordId, SessionId, SessionRecord,
-    SessionSequence, StopReason, TokenCount, ToolIdempotency,
+use tea_policy::{
+    ActorId, ExecutionSurface, PolicyEngine, PolicyEnvironment, PolicyExecutionTarget,
 };
-use tea_session::SessionReducer;
-use tea_testkit::{FakeReadTool, ScriptedModelProvider};
+use tea_protocol::{
+    CanonicalMessage, ContentBlock, FINAL_JSON_OBJECT_INSTRUCTION, FinalOutputFormat, MessageId,
+    ModelId, ProfileId, ProtocolMetadata, ProtocolTimestamp, ReasoningEffort, RecordEnvelope,
+    RecordId, SessionId, SessionRecord, SessionSequence, StopReason, TokenCount, ToolIdempotency,
+};
+use tea_session::{SessionReducer, SessionStore};
+use tea_testkit::{FakeReadTool, ScriptedModelProvider, ScriptedModelResponse};
 use tea_tools::{
     StaticResourceResolver, ToolConcurrency, ToolEffect, ToolExecutionSemantics, ToolName,
     ToolRegistry, ToolRetrySafety, ToolRoutePreference, ToolSpec, ToolTimeout, ToolVersion,
@@ -123,6 +128,36 @@ fn advertised_model(provider: &ScriptedModelProvider) -> &ModelSpec {
         .models()
         .first()
         .expect("test provider has a model")
+}
+
+#[test]
+fn prospective_request_validates_committed_and_pending_messages_together() {
+    let state = state(true);
+    let provider = provider();
+    let pending = (0..tea_model::MAX_REQUEST_MESSAGES)
+        .map(|index| {
+            CanonicalMessage::user(
+                MessageId::from_str(&format!("0196a0b1-{index:04x}-7000-8000-000000000001"))
+                    .unwrap(),
+                vec![ContentBlock::text("pending").unwrap()],
+                timestamp(),
+            )
+            .unwrap()
+        })
+        .collect::<Vec<_>>();
+
+    let error = TurnRequestSnapshot::build_with_pending_messages(
+        &state,
+        &pending,
+        &config(),
+        &registry(),
+        advertised_model(&provider),
+    )
+    .unwrap_err();
+
+    assert_eq!(error.code(), KernelErrorCode::InvalidRequest);
+    assert_eq!(error.message(), "model request contains too many messages");
+    assert_eq!(state.messages().len(), 1);
 }
 
 fn registry() -> ToolRegistry {
@@ -256,6 +291,170 @@ fn explicit_session_reasoning_is_frozen_into_the_request() {
             .map(tea_model::ReasoningOptions::effort),
         Some(ReasoningEffort::High)
     );
+}
+
+#[test]
+fn request_snapshot_copies_the_frozen_final_output_format() {
+    let format = FinalOutputFormat::JsonSchema {
+        schema: json!({
+            "type": "object",
+            "properties": {"answer": {"type": "string"}},
+            "required": ["answer"],
+            "additionalProperties": false
+        }),
+    };
+    let provider = provider_with_capabilities(
+        ModelCapabilities::text()
+            .with_tools(false)
+            .with_final_json_schema_with_tools(),
+    );
+    let config = config()
+        .with_final_output_format(Some(format.clone()))
+        .unwrap();
+
+    let snapshot = TurnRequestSnapshot::build(
+        &state(true),
+        &config,
+        &registry(),
+        advertised_model(&provider),
+    )
+    .unwrap();
+
+    assert_eq!(snapshot.request().final_output_format(), Some(&format));
+}
+
+#[test]
+fn json_object_request_includes_the_required_instruction_once() {
+    let provider = provider_with_capabilities(
+        ModelCapabilities::text()
+            .with_tools(false)
+            .with_final_json_object(),
+    );
+    let config = config()
+        .with_final_output_format(Some(FinalOutputFormat::JsonObject))
+        .unwrap();
+    let snapshot = TurnRequestSnapshot::build(
+        &state(true),
+        &config,
+        &registry(),
+        advertised_model(&provider),
+    )
+    .unwrap();
+    let expected = format!("Follow the test contract.\n\n{FINAL_JSON_OBJECT_INSTRUCTION}");
+    assert_eq!(snapshot.request().system_prompt(), Some(expected.as_str()));
+
+    let config_with_instruction = KernelRunConfig::new(
+        ActorId::from_str("user:alice").unwrap(),
+        PolicyEnvironment::new(
+            ExecutionSurface::Test,
+            PolicyExecutionTarget::Native,
+            ProtocolMetadata::default(),
+        ),
+    )
+    .with_system_prompt(expected.clone())
+    .unwrap()
+    .with_final_output_format(Some(FinalOutputFormat::JsonObject))
+    .unwrap();
+    let idempotent = TurnRequestSnapshot::build(
+        &state(true),
+        &config_with_instruction,
+        &registry(),
+        advertised_model(&provider),
+    )
+    .unwrap();
+
+    assert_eq!(
+        idempotent.request().system_prompt(),
+        Some(expected.as_str())
+    );
+    assert_eq!(
+        idempotent
+            .request()
+            .system_prompt()
+            .unwrap()
+            .lines()
+            .filter(|line| *line == FINAL_JSON_OBJECT_INSTRUCTION)
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn invalid_final_output_schema_is_rejected_by_run_config() {
+    let error = config()
+        .with_final_output_format(Some(FinalOutputFormat::JsonSchema {
+            schema: json!({"type": 7}),
+        }))
+        .unwrap_err();
+
+    assert_eq!(error.code(), KernelErrorCode::InvalidRequest);
+}
+
+#[tokio::test]
+async fn unsupported_final_output_fails_before_run_started_or_durable_change() {
+    let provider = provider_with_capabilities(ModelCapabilities::text().with_tools(false));
+    let store = common::store().await;
+    let before = store.load(common::session_id()).await.unwrap();
+    let events = common::EventCollector::default();
+    let tools = ToolRegistry::new();
+    let config = config()
+        .with_final_output_format(Some(FinalOutputFormat::JsonObject))
+        .unwrap();
+
+    let error = AgentKernel::new(
+        &provider,
+        &tools,
+        &PolicyEngine::new(),
+        &store,
+        &common::FixedClock,
+        &common::TestIds::default(),
+        &events,
+    )
+    .run(common::session_id(), &config, CancellationScope::new())
+    .await
+    .unwrap_err();
+
+    assert_eq!(error.code(), KernelErrorCode::InvalidRequest);
+    assert!(events.events().is_empty());
+    assert!(provider.captured_requests().unwrap().is_empty());
+    let after = store.load(common::session_id()).await.unwrap();
+    assert_eq!(after.records(), before.records());
+    assert_eq!(after.state().messages(), before.state().messages());
+}
+
+#[tokio::test]
+async fn provider_preflight_fails_before_run_started_stream_or_durable_change() {
+    let provider = common::RejectingPreflightProvider::new(
+        [ScriptedModelResponse::text(["must not stream"])],
+        1,
+    );
+    let store = common::store().await;
+    let before = store.load(common::session_id()).await.unwrap();
+    let events = common::EventCollector::default();
+    let tools = ToolRegistry::new();
+
+    let error = AgentKernel::new(
+        &provider,
+        &tools,
+        &PolicyEngine::new(),
+        &store,
+        &common::FixedClock,
+        &common::TestIds::default(),
+        &events,
+    )
+    .run(common::session_id(), &config(), CancellationScope::new())
+    .await
+    .unwrap_err();
+
+    assert_eq!(error.code(), KernelErrorCode::InvalidRequest);
+    assert_eq!(provider.validate_calls(), 1);
+    assert!(events.events().is_empty());
+    assert!(provider.captured_requests().is_empty());
+    assert_eq!(provider.remaining_scripts(), 1);
+    let after = store.load(common::session_id()).await.unwrap();
+    assert_eq!(after.journal_revision(), before.journal_revision());
+    assert_eq!(after.records(), before.records());
+    assert_eq!(after.approval_artifacts(), before.approval_artifacts());
 }
 
 #[test]

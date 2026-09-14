@@ -1,7 +1,7 @@
 use serde_json::json;
 use tea_cli::app_server::{
     APP_SERVER_VERSION, AppRequestId, AppServerError, AppServerNotification, AppServerRequest,
-    AppServerResponse, CreateSessionParams, InitializeParams,
+    AppServerResponse, CreateSessionParams, InitializeParams, PromptParams,
 };
 
 #[test]
@@ -59,4 +59,27 @@ fn app_server_notifications_and_errors_are_machine_safe() {
         error,
         json!({"code": -32603, "message": "app-server internal error"})
     );
+}
+
+#[test]
+fn prompt_params_accept_the_shared_final_output_format_shape() {
+    let params: PromptParams = serde_json::from_value(json!({
+        "sessionId": "0195a0b1-5e3a-7d72-a902-c4e85d828bf1",
+        "text": "Return the answer",
+        "finalOutputFormat": {
+            "type": "json_schema",
+            "schema": {
+                "type": "object",
+                "properties": {"answer": {"type": "string"}},
+                "required": ["answer"],
+                "additionalProperties": false
+            }
+        }
+    }))
+    .expect("structured prompt params");
+
+    assert!(matches!(
+        params.final_output_format,
+        Some(tea_protocol::FinalOutputFormat::JsonSchema { .. })
+    ));
 }

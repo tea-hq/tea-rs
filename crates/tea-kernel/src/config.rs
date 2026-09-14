@@ -1,11 +1,29 @@
 use std::time::Duration;
 
 use tea_policy::{ActorId, PolicyEnvironment, WorkspaceId};
-use tea_protocol::ProtocolMetadata;
+use tea_protocol::{FinalOutputFormat, ProtocolMetadata};
+use tea_tools::CompiledToolSchema;
 
 use crate::compaction::{CompactionPolicy, CompactionSummarizer, NeverCompactPolicy};
 use crate::retry::ModelRetryPolicy;
 use crate::{KernelError, KernelErrorCode};
+
+#[derive(Debug, Clone)]
+pub(crate) enum CompiledFinalOutputFormat {
+    JsonObject,
+    JsonSchema(CompiledToolSchema),
+}
+
+impl CompiledFinalOutputFormat {
+    pub(crate) fn as_protocol(&self) -> FinalOutputFormat {
+        match self {
+            Self::JsonObject => FinalOutputFormat::JsonObject,
+            Self::JsonSchema(schema) => FinalOutputFormat::JsonSchema {
+                schema: schema.source().clone(),
+            },
+        }
+    }
+}
 
 /// Hard deterministic limits applied to one kernel run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -102,6 +120,7 @@ pub struct KernelRunConfig {
     environment: PolicyEnvironment,
     system_prompt: Option<String>,
     compiled_prompt: Option<tea_context::CompiledPrompt>,
+    final_output_format: Option<CompiledFinalOutputFormat>,
     request_metadata: ProtocolMetadata,
     approval_ttl: Duration,
     retry_policy: ModelRetryPolicy,
@@ -120,6 +139,7 @@ impl KernelRunConfig {
             environment,
             system_prompt: None,
             compiled_prompt: None,
+            final_output_format: None,
             request_metadata: ProtocolMetadata::default(),
             approval_ttl: Duration::from_mins(10),
             retry_policy: ModelRetryPolicy::default(),
@@ -179,6 +199,38 @@ impl KernelRunConfig {
             ));
         }
         self.compiled_prompt = Some(prompt);
+        Ok(self)
+    }
+
+    /// Freezes an optional structured final-output contract for this run.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a JSON Schema is not an object or cannot be
+    /// compiled as a bounded, self-contained Draft 2020-12 schema.
+    pub fn with_final_output_format(
+        mut self,
+        format: Option<FinalOutputFormat>,
+    ) -> Result<Self, KernelError> {
+        self.final_output_format = match format {
+            None => None,
+            Some(FinalOutputFormat::JsonObject) => Some(CompiledFinalOutputFormat::JsonObject),
+            Some(FinalOutputFormat::JsonSchema { schema }) => {
+                if !schema.is_object() {
+                    return Err(KernelError::new(
+                        KernelErrorCode::InvalidRequest,
+                        "final output schema is invalid",
+                    ));
+                }
+                let schema = CompiledToolSchema::compile(schema).map_err(|_| {
+                    KernelError::new(
+                        KernelErrorCode::InvalidRequest,
+                        "final output schema is invalid",
+                    )
+                })?;
+                Some(CompiledFinalOutputFormat::JsonSchema(schema))
+            }
+        };
         Ok(self)
     }
 
@@ -263,6 +315,16 @@ impl KernelRunConfig {
     #[must_use]
     pub const fn compiled_prompt(&self) -> Option<&tea_context::CompiledPrompt> {
         self.compiled_prompt.as_ref()
+    }
+    /// Returns the provider-neutral final-output contract frozen for this run.
+    #[must_use]
+    pub fn final_output_format(&self) -> Option<FinalOutputFormat> {
+        self.final_output_format
+            .as_ref()
+            .map(CompiledFinalOutputFormat::as_protocol)
+    }
+    pub(crate) const fn compiled_final_output_format(&self) -> Option<&CompiledFinalOutputFormat> {
+        self.final_output_format.as_ref()
     }
     /// Returns model request metadata.
     #[must_use]

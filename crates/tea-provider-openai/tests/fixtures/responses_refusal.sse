@@ -1,0 +1,11 @@
+data: {"type":"response.created","response":{"id":"resp_refusal","model":"gpt-test","status":"in_progress"}}
+
+data: {"type":"response.output_item.added","output_index":0,"item":{"id":"refusal_0","type":"message","role":"assistant","content":[{"type":"refusal","refusal":""}],"status":"in_progress"}}
+
+data: {"type":"response.refusal.delta","item_id":"refusal_0","output_index":0,"content_index":0,"delta":"I cannot comply."}
+
+data: {"type":"response.output_item.done","output_index":0,"item":{"id":"refusal_0","type":"message","role":"assistant","content":[{"type":"refusal","refusal":"I cannot comply."}],"status":"completed"}}
+
+data: {"type":"response.completed","response":{"id":"resp_refusal","model":"gpt-test","status":"completed","output":[{"id":"refusal_0","type":"message","role":"assistant","content":[{"type":"refusal","refusal":"I cannot comply."}],"status":"completed"}],"usage":{"input_tokens":1,"output_tokens":2,"total_tokens":3}}}
+
+data: [DONE]

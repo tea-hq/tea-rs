@@ -12,6 +12,7 @@ use std::time::{Duration, Instant};
 use serde::Deserialize;
 use tea_model::{HostedToolKind, ModelDisplayName, ProviderId, ReasoningProfile};
 use tea_protocol::{ModelId, ReasoningEffort, TokenCount};
+use tea_provider_openai::{OpenAiApiMode, OpenAiCompatibilityProfile};
 
 /// Maximum accepted size of one provider configuration file.
 pub const MAX_PROVIDERS_FILE_BYTES: usize = 256 * 1024;
@@ -72,6 +73,8 @@ pub struct ProviderConfig {
     pub api_key_prefix: Option<String>,
     /// Optional API mode: `chat-completions` or `responses`.
     pub api_mode: Option<String>,
+    /// Exact structured-output dialect; absent means structured output is unsupported.
+    pub compatibility_profile: Option<OpenAiCompatibilityProfile>,
     /// Optional `OpenAI` organization identifier.
     pub org_id: Option<String>,
     /// Optional `OpenAI` project identifier.
@@ -97,6 +100,7 @@ impl fmt::Debug for ProviderConfig {
             .field("api_key_header", &self.api_key_header)
             .field("api_key_prefix", &self.api_key_prefix)
             .field("api_mode", &self.api_mode)
+            .field("compatibility_profile", &self.compatibility_profile)
             .field("org_id", &self.org_id)
             .field("project_id", &self.project_id)
             .field("reasoning_effort", &self.reasoning_effort)
@@ -115,6 +119,10 @@ impl ProviderConfig {
         replace(&mut self.api_key_header, overlay.api_key_header);
         replace(&mut self.api_key_prefix, overlay.api_key_prefix);
         replace(&mut self.api_mode, overlay.api_mode);
+        replace(
+            &mut self.compatibility_profile,
+            overlay.compatibility_profile,
+        );
         replace(&mut self.org_id, overlay.org_id);
         replace(&mut self.project_id, overlay.project_id);
         replace(&mut self.reasoning_effort, overlay.reasoning_effort);
@@ -123,6 +131,32 @@ impl ProviderConfig {
         if !overlay.models.is_empty() {
             self.models = overlay.models;
         }
+    }
+
+    pub(super) fn structured_output_configuration_is_valid(&self) -> bool {
+        let api_mode = match self.api_mode.as_deref() {
+            None | Some("chat-completions") => OpenAiApiMode::ChatCompletions,
+            Some("responses") => OpenAiApiMode::Responses,
+            Some(_) => return false,
+        };
+        let Some(profile) = self.compatibility_profile else {
+            return self.models.iter().all(|model| {
+                !model.capabilities.final_json_object
+                    && !model.capabilities.final_json_schema
+                    && !model.capabilities.final_json_schema_with_tools
+            });
+        };
+        profile.supports_api_mode(api_mode)
+            && self.models.iter().all(|model| {
+                (!model.capabilities.final_json_schema_with_tools
+                    || model.capabilities.final_json_schema)
+                    && (!model.capabilities.final_json_object
+                        || profile.supports_final_json_object(api_mode))
+                    && (!model.capabilities.final_json_schema
+                        || profile.supports_final_json_schema(api_mode))
+                    && (!model.capabilities.final_json_schema_with_tools
+                        || profile.supports_final_json_schema_with_tools(api_mode))
+            })
     }
 }
 
@@ -147,6 +181,15 @@ pub struct ModelDefinition {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ModelCapabilitiesConfig {
+    /// Whether this exact model/endpoint supports schema-less JSON-object output.
+    #[serde(default)]
+    pub final_json_object: bool,
+    /// Whether this exact model/endpoint supports native JSON Schema output.
+    #[serde(default)]
+    pub final_json_schema: bool,
+    /// Whether native JSON Schema output may be combined with model-visible tools.
+    #[serde(default)]
+    pub final_json_schema_with_tools: bool,
     /// Model-specific provider-neutral reasoning support and wire mapping.
     pub reasoning: Option<ModelReasoningConfig>,
     /// Provider-hosted tools supported by this exact model and endpoint.
@@ -359,6 +402,7 @@ fn valid_config(config: &ProvidersConfig) -> bool {
                     .as_deref()
                     .is_none_or(|effort| ReasoningEffort::from_str(effort).is_ok())
                 && provider.timeout_millis.is_none_or(|timeout| timeout > 0)
+                && provider.structured_output_configuration_is_valid()
                 && valid_models(&provider.models)
         })
 }
@@ -375,6 +419,8 @@ fn valid_models(models: &[ModelDefinition]) -> bool {
             && TokenCount::new(context).is_ok()
             && TokenCount::new(output).is_ok()
             && output <= context
+            && (!model.capabilities.final_json_schema_with_tools
+                || model.capabilities.final_json_schema)
             && model
                 .capabilities
                 .reasoning

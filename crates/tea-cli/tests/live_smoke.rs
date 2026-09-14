@@ -226,7 +226,9 @@ async fn live_agent_edits_tests_and_reopens_a_temporary_git_repository() {
         .prompt(
             session_id,
             "Use read to inspect Cargo.toml and src/lib.rs. Use edit (not write) to change answer() so the existing test passes. Use bash to run `cargo test --quiet`. Do not finish before the test passes. End the final response with LIVE_SMOKE_OK.",
+            None,
         )
+        .await
         .unwrap();
 
     let mut approvals = 0;
